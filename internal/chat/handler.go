@@ -52,29 +52,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	ctx := r.Context()
+	// r.Context() isn't reliably cancelled when a WebSocket connection closes
+	// (the HTTP request "completes" at upgrade time), so we drive cancellation
+	// from the read loop below: any wsjson.Read error cancels this ctx, which
+	// aborts any in-flight Pull or Chat goroutines for this connection.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
 	var history []ollama.Message // v1.0 keeps history per-connection only
 
-	// Pre-warm the model so the user sees download progress the moment chat
-	// opens, instead of only after they send their first message. No-op once
-	// the model is on disk.
-	if !h.modelReady {
-		slog.Info("chat: pre-warming model on connect", "model", h.ollama.Model())
-		if err := h.ensureModelPulled(ctx, conn); err != nil {
-			slog.Error("chat: pre-warm failed", "err", err)
-			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: err.Error()})
-			return
-		}
-	}
+	// Pre-warm the model in a background goroutine so we can pull a large
+	// model while simultaneously watching the read side for a client
+	// disconnect. If the client leaves, ctx cancels, Pull aborts.
+	slog.Info("chat: pre-warming model on connect", "model", h.ollama.Model(), "ready", h.modelReady)
+	prewarmDone := make(chan struct{})
+	var prewarmErr error
+	go func() {
+		defer close(prewarmDone)
+		prewarmErr = h.ensureModelPulled(ctx, conn)
+	}()
 
 	for {
 		var msg inboundEvent
 		if err := wsjson.Read(ctx, conn, &msg); err != nil {
-			return
+			slog.Info("chat: ws read ended", "err", err)
+			return // defer cancel() aborts pre-warm/pull
 		}
 		if msg.Type != "user_message" || msg.Content == "" {
 			continue
 		}
+
+		// Don't attempt chat until the model is pulled and ready.
+		select {
+		case <-prewarmDone:
+		case <-ctx.Done():
+			return
+		}
+		if prewarmErr != nil {
+			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: prewarmErr.Error()})
+			return
+		}
+
 		history = append(history, ollama.Message{Role: "user", Content: msg.Content})
 
 		reply, err := h.stream(ctx, conn, history)
@@ -139,13 +157,14 @@ func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) e
 	defer h.modelMu.Unlock()
 
 	if h.modelReady {
+		_ = wsjson.Write(ctx, conn, outboundEvent{Type: "status", Content: "Model ready."})
 		return nil
 	}
 
 	model := h.ollama.Model()
 	if err := wsjson.Write(ctx, conn, outboundEvent{
 		Type:    "status",
-		Content: fmt.Sprintf("Downloading model %s — first chat only, this can take several minutes.", model),
+		Content: fmt.Sprintf("Downloading model %s — this can take several minutes.", model),
 	}); err != nil {
 		slog.Warn("chat: status write failed (intro)", "err", err)
 	}
