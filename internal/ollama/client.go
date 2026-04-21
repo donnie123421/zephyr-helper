@@ -47,9 +47,13 @@ type ChatResult struct {
 	ToolCalls []ToolCall
 }
 
-// PullStatus is one progress update from /api/pull.
+// PullStatus is one progress update from /api/pull. `Error` is populated when
+// Ollama streams a failure frame (e.g. unknown model) — /api/pull still
+// responds 200, then emits `{"error":"..."}` and closes, which is why we need
+// to inspect each frame rather than relying on the HTTP status.
 type PullStatus struct {
 	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
 	Digest    string `json:"digest,omitempty"`
 	Total     int64  `json:"total,omitempty"`
 	Completed int64  `json:"completed,omitempty"`
@@ -230,6 +234,9 @@ func (c *Client) Pull(ctx context.Context, onStatus func(PullStatus)) error {
 		if err := json.Unmarshal(scanner.Bytes(), &s); err != nil {
 			return fmt.Errorf("decode pull status: %w", err)
 		}
+		if s.Error != "" {
+			return fmt.Errorf("ollama pull: %s", s.Error)
+		}
 		if onStatus != nil {
 			onStatus(s)
 		}
@@ -237,5 +244,10 @@ func (c *Client) Pull(ctx context.Context, onStatus func(PullStatus)) error {
 			return nil
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	// Stream closed cleanly without a success frame — treat as a failed pull
+	// so callers don't mark the model ready when nothing was actually fetched.
+	return errors.New("ollama pull: stream ended without success")
 }

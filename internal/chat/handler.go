@@ -103,6 +103,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer close(prewarmDone)
 		prewarmErr = h.ensureModelPulled(ctx, conn)
+		if prewarmErr != nil {
+			// Tell the client immediately — otherwise they'll sit waiting for a
+			// download that never finishes and only see the failure when they
+			// type a message.
+			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: prewarmErr.Error()})
+		}
 	}()
 
 	for {
@@ -122,7 +128,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if prewarmErr != nil {
-			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: prewarmErr.Error()})
+			// Error frame was already sent by the prewarm goroutine when it
+			// failed; just bail so we don't run a chat against an unready model.
 			return
 		}
 
