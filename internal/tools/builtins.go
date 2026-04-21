@@ -68,18 +68,18 @@ func poolStatus(tn *truenas.Client) Tool {
 	return Tool{
 		Def: Definition{
 			Name: "pool_status",
-			Description: "Get detailed status for a single ZFS pool, including health, " +
-				"vdev layout summary, scan progress (scrub/resilver), and error counts. " +
-				"Call list_pools first if you don't know the pool name.",
+			Description: "Get detailed status for ZFS pools (health, vdev layout, " +
+				"scan progress, error counts). Omit pool_name to get detail for " +
+				"every pool on the server — prefer this when you don't already " +
+				"know the exact pool name from list_pools.",
 			Parameters: json.RawMessage(`{
 				"type": "object",
 				"properties": {
 					"pool_name": {
 						"type": "string",
-						"description": "The pool name, e.g. \"tank\"."
+						"description": "Exact pool name as returned by list_pools. Omit this field entirely to get status for all pools."
 					}
 				},
-				"required": ["pool_name"],
 				"additionalProperties": false
 			}`),
 		},
@@ -88,11 +88,28 @@ func poolStatus(tn *truenas.Client) Tool {
 			var a struct {
 				PoolName string `json:"pool_name"`
 			}
-			if err := json.Unmarshal(args, &a); err != nil {
-				return "", fmt.Errorf("bad args: %w", err)
+			// Args may be empty bytes or the literal "null" when the model
+			// calls the tool with no arguments — both are valid now.
+			if len(args) > 0 && string(args) != "null" {
+				if err := json.Unmarshal(args, &a); err != nil {
+					return "", fmt.Errorf("bad args: %w", err)
+				}
 			}
+
 			if a.PoolName == "" {
-				return "", fmt.Errorf("pool_name is required")
+				raw, err := tn.GetRaw(ctx, "/pool")
+				if err != nil {
+					return "", err
+				}
+				var pools []map[string]any
+				if err := json.Unmarshal(raw, &pools); err != nil {
+					return "", fmt.Errorf("decode pools: %w", err)
+				}
+				out := make([]map[string]any, 0, len(pools))
+				for _, p := range pools {
+					out = append(out, projectPoolDetail(p))
+				}
+				return toJSON(map[string]any{"pools": out})
 			}
 
 			// TrueNAS /pool/id/{name} accepts the pool name directly.
@@ -104,16 +121,7 @@ func poolStatus(tn *truenas.Client) Tool {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return "", fmt.Errorf("decode pool: %w", err)
 			}
-
-			out := map[string]any{}
-			copyFields(out, p, "name", "status", "healthy", "size", "allocated", "free")
-			if scan, ok := p["scan"].(map[string]any); ok {
-				out["scan"] = projectScan(scan)
-			}
-			if topo, ok := p["topology"].(map[string]any); ok {
-				out["topology_summary"] = summarizeTopology(topo)
-			}
-			return toJSON(out)
+			return toJSON(projectPoolDetail(p))
 		},
 	}
 }
@@ -270,6 +278,21 @@ func copyFields(dst, src map[string]any, keys ...string) {
 			dst[k] = v
 		}
 	}
+}
+
+// projectPoolDetail projects a single /pool entry down to the fields the LLM
+// can usefully reason about. Shared between pool_status (single pool) and
+// pool_status (all pools) so their output shapes stay identical.
+func projectPoolDetail(p map[string]any) map[string]any {
+	out := map[string]any{}
+	copyFields(out, p, "name", "status", "healthy", "size", "allocated", "free")
+	if scan, ok := p["scan"].(map[string]any); ok {
+		out["scan"] = projectScan(scan)
+	}
+	if topo, ok := p["topology"].(map[string]any); ok {
+		out["topology_summary"] = summarizeTopology(topo)
+	}
+	return out
 }
 
 // projectScan trims the huge raw scan object down to the fields the LLM cares
