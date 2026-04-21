@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // ErrModelMissing is returned by Chat when Ollama reports the model isn't
@@ -56,8 +57,13 @@ type PullStatus struct {
 
 type Client struct {
 	baseURL string
-	model   string
 	http    *http.Client
+
+	// The active model is mutable at runtime so the iOS picker can switch it
+	// without a helper restart. Guarded by mu so concurrent reads during a
+	// switch don't race.
+	mu    sync.RWMutex
+	model string
 }
 
 func NewClient(baseURL, model string) *Client {
@@ -69,8 +75,20 @@ func NewClient(baseURL, model string) *Client {
 	}
 }
 
-// Model returns the configured model name (used for user-facing status text).
-func (c *Client) Model() string { return c.model }
+// Model returns the currently-active model name.
+func (c *Client) Model() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.model
+}
+
+// SetModel swaps the active model. Any in-flight Chat/Pull call continues with
+// the model it captured on entry — the swap only takes effect on the next call.
+func (c *Client) SetModel(model string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.model = model
+}
 
 // Chat runs one streamed chat completion. When tools is non-empty, the model
 // may respond with tool_calls instead of (or in addition to) text; those are
@@ -86,7 +104,7 @@ func (c *Client) Chat(
 	onDelta func(string) error,
 ) (ChatResult, error) {
 	body := map[string]any{
-		"model":    c.model,
+		"model":    c.Model(),
 		"messages": messages,
 		"stream":   true,
 	}
@@ -175,7 +193,7 @@ func (c *Client) Chat(
 // layers and returns success quickly.
 func (c *Client) Pull(ctx context.Context, onStatus func(PullStatus)) error {
 	body, err := json.Marshal(map[string]any{
-		"model":  c.model,
+		"model":  c.Model(),
 		"stream": true,
 	})
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/auth"
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
+	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
@@ -51,12 +52,15 @@ func main() {
 
 	ollamaClient := ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel)
 	chatHandler := chat.NewHandler(ollamaClient, toolRegistry)
+	modelsHandler := models.NewHandler(ollamaClient)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /version", handleVersion)
 	mux.Handle("POST /auth/verify", auth.Require(cfg.PairingToken, http.HandlerFunc(handleAuthVerify)))
 	mux.Handle("GET /chat", auth.Require(cfg.PairingToken, chatHandler))
+	mux.Handle("GET /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleGet)))
+	mux.Handle("POST /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleSet)))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

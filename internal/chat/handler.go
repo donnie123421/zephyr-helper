@@ -56,10 +56,12 @@ type Handler struct {
 	tools  *tools.Registry
 
 	// modelMu serializes the first Pull across concurrent WS connections so we
-	// don't fire N simultaneous downloads. After a successful pull we keep
-	// modelReady=true to skip re-checks on subsequent messages.
+	// don't fire N simultaneous downloads. readyModel holds the name of the
+	// model we've successfully pulled this process — when it differs from the
+	// active model (e.g. after the iOS picker switched), the next chat triggers
+	// a fresh pull.
 	modelMu    sync.Mutex
-	modelReady bool
+	readyModel string
 }
 
 func NewHandler(c *ollama.Client, reg *tools.Registry) *Handler {
@@ -93,7 +95,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// disconnect. If the client leaves, ctx cancels, Pull aborts.
 	slog.Info("chat: pre-warming model on connect",
 		"model", h.ollama.Model(),
-		"ready", h.modelReady,
+		"ready_model", h.readyModelSnapshot(),
 		"tools", !h.tools.Empty(),
 	)
 	prewarmDone := make(chan struct{})
@@ -210,19 +212,28 @@ func (h *Handler) runTurn(ctx context.Context, conn *websocket.Conn, history []o
 	return history, fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
 }
 
-// ensureModelPulled triggers a pull if the model isn't known-ready yet,
-// forwarding progress frames to the iOS client so the UI can render them
-// inline. Serialized across concurrent connections via modelMu.
+// readyModelSnapshot returns the name of the model we've pulled this process,
+// or empty string if none. Takes the modelMu read-lock defensively even though
+// the caller (logging) doesn't strictly need it.
+func (h *Handler) readyModelSnapshot() string {
+	h.modelMu.Lock()
+	defer h.modelMu.Unlock()
+	return h.readyModel
+}
+
+// ensureModelPulled triggers a pull if the currently-active model hasn't been
+// pulled yet in this process. Serialized across concurrent connections via
+// modelMu. Compares the active model to readyModel rather than tracking a bool
+// so a model switch (via POST /model) transparently triggers a new pull.
 func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) error {
 	h.modelMu.Lock()
 	defer h.modelMu.Unlock()
 
-	if h.modelReady {
+	model := h.ollama.Model()
+	if h.readyModel == model {
 		_ = wsjson.Write(ctx, conn, outboundEvent{Type: "status", Content: "Model ready."})
 		return nil
 	}
-
-	model := h.ollama.Model()
 	if err := wsjson.Write(ctx, conn, outboundEvent{
 		Type:    "status",
 		Content: fmt.Sprintf("Downloading model %s — this can take several minutes.", model),
@@ -260,7 +271,7 @@ func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) e
 		return fmt.Errorf("pull: %w", err)
 	}
 
-	h.modelReady = true
+	h.readyModel = model
 	_ = wsjson.Write(ctx, conn, outboundEvent{Type: "status", Content: "Model ready."})
 	return nil
 }
