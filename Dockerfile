@@ -6,8 +6,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG VERSION=dev
+ARG COMMIT=unknown
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X github.com/donnie123421/zephyr-helper/internal/version.Version=${VERSION}" \
+    -ldflags="-s -w -X github.com/donnie123421/zephyr-helper/internal/version.Version=${VERSION} -X github.com/donnie123421/zephyr-helper/internal/version.Commit=${COMMIT}" \
     -o /out/zephyr-helper ./cmd/server
 
 FROM alpine:3.19

@@ -96,7 +96,7 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func handleVersion(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"version":"` + version.Version + `"}`))
+	_, _ = w.Write([]byte(`{"version":"` + version.Version + `","commit":"` + version.Commit + `"}`))
 }
 
 func handleAuthVerify(w http.ResponseWriter, _ *http.Request) {
