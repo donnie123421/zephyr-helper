@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 )
 
@@ -94,7 +95,11 @@ func (c *Client) Chat(ctx context.Context, messages []Message, out chan<- Delta)
 		return ErrModelMissing
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ollama: %s", resp.Status)
+		// Capture Ollama's response body — its error JSON usually has
+		// actionable detail (e.g. "model requires more memory", a file
+		// path that failed to open, etc).
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("ollama: %s: %s", resp.Status, bytes.TrimSpace(body))
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
