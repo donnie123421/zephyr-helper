@@ -5,9 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 )
+
+// ErrModelMissing is returned by Chat when Ollama reports the model isn't
+// pulled yet (HTTP 404 from /api/chat). Callers should invoke Pull and retry.
+var ErrModelMissing = errors.New("ollama: model not found")
 
 type Message struct {
 	Role    string `json:"role"`
@@ -31,6 +36,14 @@ type Delta struct {
 	Done    bool
 }
 
+// PullStatus is one progress update from /api/pull.
+type PullStatus struct {
+	Status    string `json:"status"`
+	Digest    string `json:"digest,omitempty"`
+	Total     int64  `json:"total,omitempty"`
+	Completed int64  `json:"completed,omitempty"`
+}
+
 type Client struct {
 	baseURL string
 	model   string
@@ -45,6 +58,9 @@ func NewClient(baseURL, model string) *Client {
 		http: &http.Client{},
 	}
 }
+
+// Model returns the configured model name (used for user-facing status text).
+func (c *Client) Model() string { return c.model }
 
 // Chat streams a completion for the given messages. Each Delta is sent on out;
 // the channel is closed when the stream ends or on error (the error is also
@@ -74,6 +90,9 @@ func (c *Client) Chat(ctx context.Context, messages []Message, out chan<- Delta)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrModelMissing
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("ollama: %s", resp.Status)
 	}
@@ -94,6 +113,59 @@ func (c *Client) Chat(ctx context.Context, messages []Message, out chan<- Delta)
 		}
 		out <- Delta{Content: chunk.Message.Content, Done: chunk.Done}
 		if chunk.Done {
+			return nil
+		}
+	}
+	return scanner.Err()
+}
+
+// Pull downloads the configured model, invoking onStatus for each progress
+// line. Returns nil on Ollama's terminal {"status":"success"} frame.
+// Safe to call repeatedly — if the model is already present Ollama verifies
+// layers and returns success quickly.
+func (c *Client) Pull(ctx context.Context, onStatus func(PullStatus)) error {
+	body, err := json.Marshal(map[string]any{
+		"model":  c.model,
+		"stream": true,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/api/pull", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("ollama pull: %s", resp.Status)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		var s PullStatus
+		if err := json.Unmarshal(scanner.Bytes(), &s); err != nil {
+			return fmt.Errorf("decode pull status: %w", err)
+		}
+		if onStatus != nil {
+			onStatus(s)
+		}
+		if s.Status == "success" {
 			return nil
 		}
 	}

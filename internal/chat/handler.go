@@ -2,9 +2,12 @@ package chat
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -25,6 +28,12 @@ type outboundEvent struct {
 
 type Handler struct {
 	ollama *ollama.Client
+
+	// modelOnce serializes the first Pull across concurrent WS connections so
+	// we don't fire N simultaneous downloads. After a successful pull we keep
+	// modelReady=true to skip re-checks on subsequent messages.
+	modelMu    sync.Mutex
+	modelReady bool
 }
 
 func NewHandler(c *ollama.Client) *Handler {
@@ -67,6 +76,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) stream(ctx context.Context, conn *websocket.Conn, history []ollama.Message) (string, error) {
+	reply, err := h.runChat(ctx, conn, history)
+	if errors.Is(err, ollama.ErrModelMissing) {
+		if pullErr := h.ensureModelPulled(ctx, conn); pullErr != nil {
+			return "", pullErr
+		}
+		reply, err = h.runChat(ctx, conn, history)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	if err := wsjson.Write(ctx, conn, outboundEvent{Type: "done"}); err != nil {
+		return "", err
+	}
+	return reply, nil
+}
+
+// runChat performs one Chat round, forwarding deltas to the client. Returns
+// the assembled reply text, or ErrModelMissing if the model isn't pulled yet.
+func (h *Handler) runChat(ctx context.Context, conn *websocket.Conn, history []ollama.Message) (string, error) {
 	deltas := make(chan ollama.Delta, 16)
 	errCh := make(chan error, 1)
 
@@ -85,8 +114,53 @@ func (h *Handler) stream(ctx context.Context, conn *websocket.Conn, history []ol
 	if err := <-errCh; err != nil {
 		return "", err
 	}
-	if err := wsjson.Write(ctx, conn, outboundEvent{Type: "done"}); err != nil {
-		return "", err
-	}
 	return buf.String(), nil
+}
+
+// ensureModelPulled triggers a pull if the model isn't known-ready yet,
+// forwarding progress frames to the iOS client so the UI can render them
+// inline. Serialized across concurrent connections via modelMu.
+func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) error {
+	h.modelMu.Lock()
+	defer h.modelMu.Unlock()
+
+	if h.modelReady {
+		return nil
+	}
+
+	model := h.ollama.Model()
+	_ = wsjson.Write(ctx, conn, outboundEvent{
+		Type:    "status",
+		Content: fmt.Sprintf("Downloading model %s — first chat only, this can take several minutes.", model),
+	})
+
+	var lastPct int = -1
+	err := h.ollama.Pull(ctx, func(s ollama.PullStatus) {
+		// Collapse noisy frames: only forward progress updates where the
+		// rounded percent has changed, plus terminal phase transitions.
+		if s.Total > 0 {
+			pct := int((s.Completed * 100) / s.Total)
+			if pct == lastPct {
+				return
+			}
+			lastPct = pct
+			_ = wsjson.Write(ctx, conn, outboundEvent{
+				Type:    "status",
+				Content: fmt.Sprintf("%s (%d%%)", s.Status, pct),
+			})
+			return
+		}
+		// Phase transition without percent (e.g. "verifying sha256 digest").
+		_ = wsjson.Write(ctx, conn, outboundEvent{
+			Type:    "status",
+			Content: s.Status,
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("pull: %w", err)
+	}
+
+	h.modelReady = true
+	_ = wsjson.Write(ctx, conn, outboundEvent{Type: "status", Content: "Model ready."})
+	return nil
 }
