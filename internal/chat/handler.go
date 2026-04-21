@@ -78,9 +78,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) stream(ctx context.Context, conn *websocket.Conn, history []ollama.Message) (string, error) {
 	reply, err := h.runChat(ctx, conn, history)
 	if errors.Is(err, ollama.ErrModelMissing) {
+		slog.Info("chat: model not present, starting pull", "model", h.ollama.Model())
 		if pullErr := h.ensureModelPulled(ctx, conn); pullErr != nil {
 			return "", pullErr
 		}
+		slog.Info("chat: pull complete, retrying chat")
 		reply, err = h.runChat(ctx, conn, history)
 	}
 	if err != nil {
@@ -129,10 +131,12 @@ func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) e
 	}
 
 	model := h.ollama.Model()
-	_ = wsjson.Write(ctx, conn, outboundEvent{
+	if err := wsjson.Write(ctx, conn, outboundEvent{
 		Type:    "status",
 		Content: fmt.Sprintf("Downloading model %s — first chat only, this can take several minutes.", model),
-	})
+	}); err != nil {
+		slog.Warn("chat: status write failed (intro)", "err", err)
+	}
 
 	var lastPct int = -1
 	err := h.ollama.Pull(ctx, func(s ollama.PullStatus) {
@@ -144,17 +148,21 @@ func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) e
 				return
 			}
 			lastPct = pct
-			_ = wsjson.Write(ctx, conn, outboundEvent{
+			if err := wsjson.Write(ctx, conn, outboundEvent{
 				Type:    "status",
 				Content: fmt.Sprintf("%s (%d%%)", s.Status, pct),
-			})
+			}); err != nil {
+				slog.Warn("chat: status write failed (pct)", "err", err, "pct", pct)
+			}
 			return
 		}
 		// Phase transition without percent (e.g. "verifying sha256 digest").
-		_ = wsjson.Write(ctx, conn, outboundEvent{
+		if err := wsjson.Write(ctx, conn, outboundEvent{
 			Type:    "status",
 			Content: s.Status,
-		})
+		}); err != nil {
+			slog.Warn("chat: status write failed (phase)", "err", err, "phase", s.Status)
+		}
 	})
 	if err != nil {
 		return fmt.Errorf("pull: %w", err)
