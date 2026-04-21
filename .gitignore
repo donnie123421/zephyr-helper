@@ -1,0 +1,10 @@
+/zephyr-helper
+/out/
+*.test
+*.out
+/vendor/
+
+.idea/
+.vscode/
+*.swp
+.DS_Store
