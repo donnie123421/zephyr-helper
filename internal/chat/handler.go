@@ -42,6 +42,9 @@ type outboundEvent struct {
 	Type    string `json:"type"`
 	Content string `json:"content,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Name is only populated on `tool_used` frames — the tool the helper just
+	// finished dispatching, so iOS can render a persistent "Checked pools" chip.
+	Name string `json:"name,omitempty"`
 }
 
 type Handler struct {
@@ -173,7 +176,9 @@ func (h *Handler) runTurn(ctx context.Context, conn *websocket.Conn, history []o
 		}
 
 		// Tool calls to dispatch. Emit a user-facing status line for each so
-		// the iOS UI can render "Checking pools…" rather than a silent pause.
+		// the iOS UI can render "Checking pools…" rather than a silent pause,
+		// and a `tool_used` frame once the dispatch completes so the UI can
+		// leave a persistent chip in the chat thread.
 		for _, tc := range result.ToolCalls {
 			_ = wsjson.Write(ctx, conn, outboundEvent{
 				Type:    "status",
@@ -185,6 +190,12 @@ func (h *Handler) runTurn(ctx context.Context, conn *websocket.Conn, history []o
 				"args", string(tc.Function.Arguments),
 			)
 			toolResult := h.tools.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+
+			_ = wsjson.Write(ctx, conn, outboundEvent{
+				Type: "tool_used",
+				Name: tc.Function.Name,
+			})
+
 			history = append(history, ollama.Message{
 				Role:    "tool",
 				Content: toolResult,
