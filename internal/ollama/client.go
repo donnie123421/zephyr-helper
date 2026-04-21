@@ -9,32 +9,41 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // ErrModelMissing is returned by Chat when Ollama reports the model isn't
 // pulled yet (HTTP 404 from /api/chat). Callers should invoke Pull and retry.
 var ErrModelMissing = errors.New("ollama: model not found")
 
+// Message mirrors Ollama's chat message shape. ToolCalls is populated only on
+// assistant messages emitted while tools are in play; the tag is omitempty so
+// plain turns serialize identically to the pre-tools protocol.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
-type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+// ToolCall is one function-call Ollama emits as part of an assistant message.
+// Ollama's shape is `{function: {name, arguments}}` — arguments is a JSON
+// object (not a string like OpenAI), so we keep it as RawMessage and let the
+// tool dispatcher unmarshal into whatever shape each tool expects.
+type ToolCall struct {
+	Function ToolCallFunction `json:"function"`
 }
 
-type chatChunk struct {
-	Message Message `json:"message"`
-	Done    bool    `json:"done"`
+type ToolCallFunction struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
-// Delta is one streaming chunk from Ollama.
-type Delta struct {
-	Content string
-	Done    bool
+// ChatResult is what one call to Chat produces. Message is the full assistant
+// turn (for appending to history); ToolCalls is a convenience alias for
+// Message.ToolCalls so callers don't have to reach through.
+type ChatResult struct {
+	Message   Message
+	ToolCalls []ToolCall
 }
 
 // PullStatus is one progress update from /api/pull.
@@ -63,65 +72,101 @@ func NewClient(baseURL, model string) *Client {
 // Model returns the configured model name (used for user-facing status text).
 func (c *Client) Model() string { return c.model }
 
-// Chat streams a completion for the given messages. Each Delta is sent on out;
-// the channel is closed when the stream ends or on error (the error is also
-// returned). Cancel via ctx.
-func (c *Client) Chat(ctx context.Context, messages []Message, out chan<- Delta) error {
-	defer close(out)
-
-	body, err := json.Marshal(chatRequest{
-		Model:    c.model,
-		Messages: messages,
-		Stream:   true,
-	})
+// Chat runs one streamed chat completion. When tools is non-empty, the model
+// may respond with tool_calls instead of (or in addition to) text; those are
+// collected into the returned ChatResult for the caller to dispatch.
+//
+// onDelta is invoked for each non-empty content token. It's optional — pass
+// nil to skip streaming (the full content still lands in the returned
+// Message). Any error onDelta returns aborts the call.
+func (c *Client) Chat(
+	ctx context.Context,
+	messages []Message,
+	tools []map[string]any,
+	onDelta func(string) error,
+) (ChatResult, error) {
+	body := map[string]any{
+		"model":    c.model,
+		"messages": messages,
+		"stream":   true,
+	}
+	if len(tools) > 0 {
+		body["tools"] = tools
+	}
+	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return ChatResult{}, fmt.Errorf("marshal: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/api/chat", bytes.NewReader(body))
+		c.baseURL+"/api/chat", bytes.NewReader(bodyBytes))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return ChatResult{}, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("ollama: %w", err)
+		return ChatResult{}, fmt.Errorf("ollama: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return ErrModelMissing
+		return ChatResult{}, ErrModelMissing
 	}
 	if resp.StatusCode != http.StatusOK {
-		// Capture Ollama's response body — its error JSON usually has
-		// actionable detail (e.g. "model requires more memory", a file
-		// path that failed to open, etc).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("ollama: %s: %s", resp.Status, bytes.TrimSpace(body))
+		return ChatResult{}, fmt.Errorf("ollama: %s: %s", resp.Status, bytes.TrimSpace(body))
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	// Ollama line payloads carry whole tokens + context — bump from the default 64 KB.
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
+	var content strings.Builder
+	var toolCalls []ToolCall
+
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return ChatResult{}, ctx.Err()
 		default:
 		}
-		var chunk chatChunk
-		if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
-			return fmt.Errorf("decode chunk: %w", err)
+
+		var chunk struct {
+			Message Message `json:"message"`
+			Done    bool    `json:"done"`
 		}
-		out <- Delta{Content: chunk.Message.Content, Done: chunk.Done}
+		if err := json.Unmarshal(scanner.Bytes(), &chunk); err != nil {
+			return ChatResult{}, fmt.Errorf("decode chunk: %w", err)
+		}
+
+		if chunk.Message.Content != "" {
+			content.WriteString(chunk.Message.Content)
+			if onDelta != nil {
+				if err := onDelta(chunk.Message.Content); err != nil {
+					return ChatResult{}, err
+				}
+			}
+		}
+		if len(chunk.Message.ToolCalls) > 0 {
+			toolCalls = append(toolCalls, chunk.Message.ToolCalls...)
+		}
+
 		if chunk.Done {
-			return nil
+			msg := Message{
+				Role:      "assistant",
+				Content:   content.String(),
+				ToolCalls: toolCalls,
+			}
+			return ChatResult{Message: msg, ToolCalls: toolCalls}, nil
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return ChatResult{}, err
+	}
+	// Stream ended without done:true — treat as a truncated response.
+	return ChatResult{}, errors.New("ollama: stream ended without done marker")
 }
 
 // Pull downloads the configured model, invoking onStatus for each progress

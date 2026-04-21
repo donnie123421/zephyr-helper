@@ -6,15 +6,33 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
+	"github.com/donnie123421/zephyr-helper/internal/tools"
 )
 
-// Wire events are simple tagged unions so the iOS client can switch on `type`.
+// maxToolIterations caps the tool-call loop per user message. Six is enough
+// for realistic chains ("list pools" → "pool_status tank" → final answer) and
+// puts a backstop on pathological cases where the model keeps calling tools
+// without ever emitting text.
+const maxToolIterations = 6
+
+// systemPromptBase is the persona for every chat, regardless of whether tools
+// are wired up. Kept short — long system prompts burn context and make 8B
+// models less responsive.
+const systemPromptBase = `You are Zephyr, an AI assistant embedded in the user's TrueNAS Scale server. ` +
+	`Be concise, practical, and grounded in real data. If the user asks something ambiguous, ask a brief follow-up rather than guess.`
+
+// systemPromptWithTools is appended when the tool registry is non-empty.
+const systemPromptWithTools = ` You have tools for querying live NAS state — prefer calling them over guessing. ` +
+	`Call a tool whenever the user asks about pools, disks, apps, alerts, or the system. ` +
+	`After a tool returns, summarize the result in plain English rather than dumping JSON. ` +
+	`If a tool returns an error, explain what likely went wrong and suggest next steps.`
+
+// Wire events — simple tagged unions so the iOS client can switch on `type`.
 type inboundEvent struct {
 	Type    string `json:"type"`
 	Content string `json:"content"`
@@ -28,16 +46,17 @@ type outboundEvent struct {
 
 type Handler struct {
 	ollama *ollama.Client
+	tools  *tools.Registry
 
-	// modelOnce serializes the first Pull across concurrent WS connections so
-	// we don't fire N simultaneous downloads. After a successful pull we keep
+	// modelMu serializes the first Pull across concurrent WS connections so we
+	// don't fire N simultaneous downloads. After a successful pull we keep
 	// modelReady=true to skip re-checks on subsequent messages.
 	modelMu    sync.Mutex
 	modelReady bool
 }
 
-func NewHandler(c *ollama.Client) *Handler {
-	return &Handler{ollama: c}
+func NewHandler(c *ollama.Client, reg *tools.Registry) *Handler {
+	return &Handler{ollama: c, tools: reg}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,12 +78,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	var history []ollama.Message // v1.0 keeps history per-connection only
+	// Seed history with the system prompt so the model knows its role + tools.
+	history := []ollama.Message{{Role: "system", Content: h.systemPrompt()}}
 
 	// Pre-warm the model in a background goroutine so we can pull a large
 	// model while simultaneously watching the read side for a client
 	// disconnect. If the client leaves, ctx cancels, Pull aborts.
-	slog.Info("chat: pre-warming model on connect", "model", h.ollama.Model(), "ready", h.modelReady)
+	slog.Info("chat: pre-warming model on connect",
+		"model", h.ollama.Model(),
+		"ready", h.modelReady,
+		"tools", !h.tools.Empty(),
+	)
 	prewarmDone := make(chan struct{})
 	var prewarmErr error
 	go func() {
@@ -95,58 +119,80 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		history = append(history, ollama.Message{Role: "user", Content: msg.Content})
 
-		reply, err := h.stream(ctx, conn, history)
+		newHistory, err := h.runTurn(ctx, conn, history)
 		if err != nil {
-			slog.Error("stream", "err", err)
+			slog.Error("turn", "err", err)
 			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: err.Error()})
 			return
 		}
-		history = append(history, ollama.Message{Role: "assistant", Content: reply})
+		history = newHistory
+
+		if err := wsjson.Write(ctx, conn, outboundEvent{Type: "done"}); err != nil {
+			slog.Info("chat: done write failed", "err", err)
+			return
+		}
 	}
 }
 
-func (h *Handler) stream(ctx context.Context, conn *websocket.Conn, history []ollama.Message) (string, error) {
-	reply, err := h.runChat(ctx, conn, history)
-	if errors.Is(err, ollama.ErrModelMissing) {
-		slog.Info("chat: model not present, starting pull", "model", h.ollama.Model())
-		if pullErr := h.ensureModelPulled(ctx, conn); pullErr != nil {
-			return "", pullErr
-		}
-		slog.Info("chat: pull complete, retrying chat")
-		reply, err = h.runChat(ctx, conn, history)
+func (h *Handler) systemPrompt() string {
+	if h.tools == nil || h.tools.Empty() {
+		return systemPromptBase
 	}
-	if err != nil {
-		return "", err
-	}
-
-	if err := wsjson.Write(ctx, conn, outboundEvent{Type: "done"}); err != nil {
-		return "", err
-	}
-	return reply, nil
+	return systemPromptBase + systemPromptWithTools
 }
 
-// runChat performs one Chat round, forwarding deltas to the client. Returns
-// the assembled reply text, or ErrModelMissing if the model isn't pulled yet.
-func (h *Handler) runChat(ctx context.Context, conn *websocket.Conn, history []ollama.Message) (string, error) {
-	deltas := make(chan ollama.Delta, 16)
-	errCh := make(chan error, 1)
+// runTurn drives one user-message → assistant-answer cycle, including any
+// intermediate tool calls. Returns the updated history (including the
+// assistant's final message and any tool results) for the caller to keep.
+func (h *Handler) runTurn(ctx context.Context, conn *websocket.Conn, history []ollama.Message) ([]ollama.Message, error) {
+	onDelta := func(delta string) error {
+		return wsjson.Write(ctx, conn, outboundEvent{Type: "delta", Content: delta})
+	}
 
-	go func() { errCh <- h.ollama.Chat(ctx, history, deltas) }()
+	toolDefs := h.tools.Definitions() // empty slice is fine — Chat skips the tools key
 
-	var buf strings.Builder
-	for d := range deltas {
-		if d.Content == "" {
-			continue
+	for iter := 0; iter < maxToolIterations; iter++ {
+		result, err := h.ollama.Chat(ctx, history, toolDefs, onDelta)
+		if errors.Is(err, ollama.ErrModelMissing) {
+			slog.Info("chat: model not present mid-turn, pulling", "model", h.ollama.Model())
+			if pullErr := h.ensureModelPulled(ctx, conn); pullErr != nil {
+				return history, pullErr
+			}
+			// Single retry after a successful pull.
+			result, err = h.ollama.Chat(ctx, history, toolDefs, onDelta)
 		}
-		buf.WriteString(d.Content)
-		if err := wsjson.Write(ctx, conn, outboundEvent{Type: "delta", Content: d.Content}); err != nil {
-			return "", err
+		if err != nil {
+			return history, err
+		}
+
+		history = append(history, result.Message)
+
+		if len(result.ToolCalls) == 0 {
+			// Plain text answer — we already streamed it via onDelta. Done.
+			return history, nil
+		}
+
+		// Tool calls to dispatch. Emit a user-facing status line for each so
+		// the iOS UI can render "Checking pools…" rather than a silent pause.
+		for _, tc := range result.ToolCalls {
+			_ = wsjson.Write(ctx, conn, outboundEvent{
+				Type:    "status",
+				Content: h.tools.StatusLine(tc.Function.Name),
+			})
+
+			slog.Info("chat: dispatching tool",
+				"name", tc.Function.Name,
+				"args", string(tc.Function.Arguments),
+			)
+			toolResult := h.tools.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
+			history = append(history, ollama.Message{
+				Role:    "tool",
+				Content: toolResult,
+			})
 		}
 	}
-	if err := <-errCh; err != nil {
-		return "", err
-	}
-	return buf.String(), nil
+
+	return history, fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
 }
 
 // ensureModelPulled triggers a pull if the model isn't known-ready yet,

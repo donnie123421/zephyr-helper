@@ -14,6 +14,8 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
+	"github.com/donnie123421/zephyr-helper/internal/tools"
+	"github.com/donnie123421/zephyr-helper/internal/truenas"
 	"github.com/donnie123421/zephyr-helper/internal/version"
 )
 
@@ -31,10 +33,24 @@ func main() {
 		"addr", cfg.Addr,
 		"ollama_url", cfg.OllamaURL,
 		"ollama_model", cfg.OllamaModel,
+		"truenas_configured", cfg.TrueNASURL != "" && cfg.TrueNASAPIKey != "",
 	)
 
+	tnClient, err := truenas.NewClient(cfg.TrueNASURL, cfg.TrueNASAPIKey)
+	if err != nil {
+		// Bad URL is a config bug — fail loud rather than silently disable tools.
+		slog.Error("truenas client", "err", err)
+		os.Exit(1)
+	}
+	toolRegistry := tools.New(tnClient)
+	if toolRegistry.Empty() {
+		slog.Warn("tools: registry empty — TRUENAS_URL or TRUENAS_API_KEY missing; chat will run without NAS tools")
+	} else {
+		slog.Info("tools: registered", "count", len(toolRegistry.Definitions()))
+	}
+
 	ollamaClient := ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel)
-	chatHandler := chat.NewHandler(ollamaClient)
+	chatHandler := chat.NewHandler(ollamaClient, toolRegistry)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)

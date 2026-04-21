@@ -26,10 +26,10 @@ Manual install docs land alongside the v1.0 release (Phase E).
 
 ## Roadmap
 
-- [x] **Phase A — scaffolding (current).** HTTP + WebSocket, Ollama bridge, bearer auth, health/version endpoints. No TrueNAS tools yet.
-- [ ] **Phase B — tool palette.** `get_pool_status`, `get_alerts`, `get_disks`, `get_recent_jobs`, `get_reporting`, `get_datasets`, `get_system_info`.
-- [ ] **Phase C — iOS chat UI.** Streaming responses with tool-call indicator.
-- [ ] **Phase D — in-app install + auto-pairing.**
+- [x] **Phase A — scaffolding.** HTTP + WebSocket, Ollama bridge, bearer auth, health/version endpoints.
+- [x] **Phase B — tool palette (current).** Read-only tools: `list_pools`, `pool_status`, `list_apps`, `list_disks`, `list_alerts`, `system_info`. Multi-turn Ollama tool-calling loop. Requires `TRUENAS_URL` + `TRUENAS_API_KEY`.
+- [x] **Phase C — iOS chat UI.** Streaming responses with status indicator during tool calls.
+- [x] **Phase D — in-app install + auto-pairing.** Zephyr iOS app mints a dedicated TrueNAS API key and deploys the helper automatically.
 - [ ] **Phase E — Demo Mode, docs, tagged ghcr.io releases.**
 - [ ] **v1.1 — Smart alerts + event archive.**
 - [ ] **v1.2 — Automation rules.**
