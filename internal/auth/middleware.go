@@ -22,6 +22,12 @@ func Require(expected string, next http.Handler) http.Handler {
 
 func bearerToken(r *http.Request) string {
 	const prefix = "Bearer "
+	// Prefer X-Zephyr-Auth — URLSessionWebSocketTask on iOS strips the standard
+	// Authorization header from WebSocket upgrade handshakes, so clients that
+	// care about WS endpoints send both and we accept either.
+	if h := r.Header.Get("X-Zephyr-Auth"); strings.HasPrefix(h, prefix) {
+		return strings.TrimPrefix(h, prefix)
+	}
 	h := r.Header.Get("Authorization")
 	if !strings.HasPrefix(h, prefix) {
 		return ""
