@@ -44,7 +44,7 @@ Requires Go 1.22+. For chat to work locally you also need an [Ollama](https://ol
 git clone https://github.com/donnie123421/zephyr-helper
 cd zephyr-helper
 go mod tidy
-OLLAMA_MODEL=llama3.1:8b go run ./cmd/server
+OLLAMA_MODEL=qwen2.5:7b-instruct go run ./cmd/server
 ```
 
 On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints it to stderr so you can pair by hand.
@@ -56,7 +56,7 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | `ZEPHYR_ADDR` | `:8080` | Listen address |
 | `PAIRING_TOKEN` | auto-generated on boot | Bearer token; paired client sends `Authorization: Bearer <token>` |
 | `OLLAMA_URL` | `http://ollama:11434` | Ollama HTTP endpoint |
-| `OLLAMA_MODEL` | `llama3.1:8b` | Default model |
+| `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | Default model |
 | `TRUENAS_URL` | — | TrueNAS host (used from Phase B onward) |
 | `TRUENAS_API_KEY` | — | TrueNAS API key (used from Phase B onward) |
 
@@ -96,7 +96,7 @@ Errors terminate the stream:
 docker build -t zephyr-helper:dev .
 docker run --rm -p 8080:8080 \
   -e OLLAMA_URL=http://host.docker.internal:11434 \
-  -e OLLAMA_MODEL=llama3.1:8b \
+  -e OLLAMA_MODEL=qwen2.5:7b-instruct \
   zephyr-helper:dev
 ```
 

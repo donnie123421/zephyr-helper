@@ -21,7 +21,7 @@ func Load() (*Config, error) {
 		Addr:          envOr("ZEPHYR_ADDR", ":8080"),
 		PairingToken:  os.Getenv("PAIRING_TOKEN"),
 		OllamaURL:     envOr("OLLAMA_URL", "http://ollama:11434"),
-		OllamaModel:   envOr("OLLAMA_MODEL", "llama3.1:8b"),
+		OllamaModel:   envOr("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
 		TrueNASURL:    os.Getenv("TRUENAS_URL"),
 		TrueNASAPIKey: os.Getenv("TRUENAS_API_KEY"),
 	}
