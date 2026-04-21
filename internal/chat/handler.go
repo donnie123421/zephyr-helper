@@ -55,6 +55,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var history []ollama.Message // v1.0 keeps history per-connection only
 
+	// Pre-warm the model so the user sees download progress the moment chat
+	// opens, instead of only after they send their first message. No-op once
+	// the model is on disk.
+	if !h.modelReady {
+		slog.Info("chat: pre-warming model on connect", "model", h.ollama.Model())
+		if err := h.ensureModelPulled(ctx, conn); err != nil {
+			slog.Error("chat: pre-warm failed", "err", err)
+			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: err.Error()})
+			return
+		}
+	}
+
 	for {
 		var msg inboundEvent
 		if err := wsjson.Read(ctx, conn, &msg); err != nil {
