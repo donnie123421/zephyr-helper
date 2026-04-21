@@ -17,6 +17,7 @@ import (
 	eventshttp "github.com/donnie123421/zephyr-helper/internal/events/http"
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
+	"github.com/donnie123421/zephyr-helper/internal/pollers"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 	"github.com/donnie123421/zephyr-helper/internal/version"
@@ -65,6 +66,15 @@ func main() {
 	slog.Info("events: store ready", "path", cfg.EventsDBPath)
 	eventsHandler := &eventshttp.Handler{Store: eventsStore}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if tnClient.Configured() {
+		alertsPoller := pollers.NewAlerts(tnClient, eventsStore, pollers.DefaultAlertInterval, pollers.DefaultAlertMergeWindow)
+		go alertsPoller.Run(ctx)
+		slog.Info("alerts poller started", "interval", pollers.DefaultAlertInterval)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /version", handleVersion)
@@ -81,9 +91,6 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

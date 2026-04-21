@@ -17,10 +17,9 @@ type Config struct {
 	// EventsDBPath points to the SQLite file that backs the event store.
 	// Defaults to /tmp/events.db — the compose YAML doesn't mount a volume
 	// yet, so a persistent path would fail to open on existing deploys.
-	// Once the pollers ship we bump this to a bind-mounted /data/events.db
-	// and add the volume to the installer's compose template. For now,
-	// losing history across container restarts is acceptable because the
-	// pollers aren't wired up and nothing is being written.
+	// The alerts poller writes here on every tick; losing history across
+	// container restarts is acceptable until the installer gains a
+	// /data volume mount and we bump the default to /data/events.db.
 	EventsDBPath string
 }
 
