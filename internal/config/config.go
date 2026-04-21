@@ -14,6 +14,14 @@ type Config struct {
 	OllamaModel   string
 	TrueNASURL    string
 	TrueNASAPIKey string
+	// EventsDBPath points to the SQLite file that backs the event store.
+	// Defaults to /tmp/events.db — the compose YAML doesn't mount a volume
+	// yet, so a persistent path would fail to open on existing deploys.
+	// Once the pollers ship we bump this to a bind-mounted /data/events.db
+	// and add the volume to the installer's compose template. For now,
+	// losing history across container restarts is acceptable because the
+	// pollers aren't wired up and nothing is being written.
+	EventsDBPath string
 }
 
 func Load() (*Config, error) {
@@ -24,6 +32,7 @@ func Load() (*Config, error) {
 		OllamaModel:   envOr("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
 		TrueNASURL:    os.Getenv("TRUENAS_URL"),
 		TrueNASAPIKey: os.Getenv("TRUENAS_API_KEY"),
+		EventsDBPath:  envOr("EVENTS_DB_PATH", "/tmp/events.db"),
 	}
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,

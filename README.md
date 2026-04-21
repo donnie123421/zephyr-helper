@@ -59,15 +59,22 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | Default model |
 | `TRUENAS_URL` | — | TrueNAS host (used from Phase B onward) |
 | `TRUENAS_API_KEY` | — | TrueNAS API key (used from Phase B onward) |
+| `EVENTS_DB_PATH` | `/tmp/events.db` | SQLite path for the event store (v1.1). Will move to a bind-mounted `/data/events.db` once the pollers ship. |
 
 ### Endpoints
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | no | Liveness |
-| GET | `/version` | no | Reports running version, for update detection |
+| GET | `/version` | no | Reports running version + commit SHA, for update detection |
 | POST | `/auth/verify` | yes | Token-check round-trip |
 | GET (WS) | `/chat` | yes | Streaming chat |
+| GET | `/model` | yes | Current Ollama model |
+| POST | `/model` | yes | Swap the active model |
+| GET | `/events` | yes | Event feed (v1.1 scaffold — pollers land next) |
+| GET | `/events/{id}` | yes | Single event detail |
+| POST | `/events/{id}/ack` | yes | Acknowledge an event |
+| GET (WS) | `/events/stream` | yes | Live event stream |
 
 ### Wire format
 

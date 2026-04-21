@@ -13,6 +13,8 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/auth"
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
+	"github.com/donnie123421/zephyr-helper/internal/events"
+	eventshttp "github.com/donnie123421/zephyr-helper/internal/events/http"
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
@@ -54,6 +56,15 @@ func main() {
 	chatHandler := chat.NewHandler(ollamaClient, toolRegistry)
 	modelsHandler := models.NewHandler(ollamaClient)
 
+	eventsStore, err := events.Open(cfg.EventsDBPath)
+	if err != nil {
+		slog.Error("events store open", "err", err, "path", cfg.EventsDBPath)
+		os.Exit(1)
+	}
+	defer eventsStore.Close()
+	slog.Info("events: store ready", "path", cfg.EventsDBPath)
+	eventsHandler := &eventshttp.Handler{Store: eventsStore}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /version", handleVersion)
@@ -61,6 +72,9 @@ func main() {
 	mux.Handle("GET /chat", auth.Require(cfg.PairingToken, chatHandler))
 	mux.Handle("GET /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleGet)))
 	mux.Handle("POST /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleSet)))
+	eventsHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
