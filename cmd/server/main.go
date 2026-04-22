@@ -77,6 +77,10 @@ func main() {
 	go scrubCorrelator.Run(ctx)
 	slog.Info("scrub correlator started")
 
+	diskCorrelator := correlators.NewDiskReplacement(eventsStore)
+	go diskCorrelator.Run(ctx)
+	slog.Info("disk correlator started")
+
 	if tnClient.Configured() {
 		alertsPoller := pollers.NewAlerts(tnClient, eventsStore, pollers.DefaultAlertInterval, pollers.DefaultAlertMergeWindow)
 		go alertsPoller.Run(ctx)
