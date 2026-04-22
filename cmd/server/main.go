@@ -14,6 +14,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
 	"github.com/donnie123421/zephyr-helper/internal/events"
+	"github.com/donnie123421/zephyr-helper/internal/events/correlators"
 	eventshttp "github.com/donnie123421/zephyr-helper/internal/events/http"
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
@@ -68,6 +69,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Correlators subscribe to the store and emit narrative parent rows
+	// for child events the pollers ingest. Start them before the
+	// pollers so the first poll's broadcast doesn't slip past.
+	scrubCorrelator := correlators.NewScrubOutcome(eventsStore)
+	go scrubCorrelator.Run(ctx)
+	slog.Info("scrub correlator started")
 
 	if tnClient.Configured() {
 		alertsPoller := pollers.NewAlerts(tnClient, eventsStore, pollers.DefaultAlertInterval, pollers.DefaultAlertMergeWindow)

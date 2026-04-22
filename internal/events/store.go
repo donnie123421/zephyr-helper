@@ -269,6 +269,23 @@ func (s *Store) Ack(ctx context.Context, id string, at time.Time) error {
 	return nil
 }
 
+// SetCorrelation links a child event to a parent. Idempotent —
+// calling twice with the same pair is a no-op beyond the UPDATE. Returns
+// ErrNotFound when the child doesn't exist. The parent is only
+// referenced by id; a dangling parent is treated as application error,
+// not data corruption.
+func (s *Store) SetCorrelation(ctx context.Context, childID, parentID string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE events SET correlates_to = ? WHERE id = ?`, parentID, childID)
+	if err != nil {
+		return fmt.Errorf("set correlation: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Prune deletes events older than `cutoff`. Safe to call concurrently with
 // ingest; SQLite serializes the write. Returns the number of deleted rows
 // so the caller can log it.
