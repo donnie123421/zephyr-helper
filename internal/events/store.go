@@ -269,6 +269,20 @@ func (s *Store) Ack(ctx context.Context, id string, at time.Time) error {
 	return nil
 }
 
+// AckAll marks every un-acked event as acknowledged in a single UPDATE.
+// Returns the number of rows the helper actually flipped so the caller
+// can report it. Safe to call concurrently with ingest — SQLite
+// serializes the write.
+func (s *Store) AckAll(ctx context.Context, at time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE events SET acked_at = ? WHERE acked_at IS NULL`,
+		at.UnixMilli())
+	if err != nil {
+		return 0, fmt.Errorf("ack all: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // SetCorrelation links a child event to a parent. Idempotent —
 // calling twice with the same pair is a no-op beyond the UPDATE. Returns
 // ErrNotFound when the child doesn't exist. The parent is only

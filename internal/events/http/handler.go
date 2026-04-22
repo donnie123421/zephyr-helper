@@ -28,6 +28,7 @@ type Handler struct {
 func (h *Handler) RegisterMux(mux *http.ServeMux, wrap func(http.Handler) http.Handler) {
 	mux.Handle("GET /events", wrap(http.HandlerFunc(h.List)))
 	mux.Handle("GET /events/{id}", wrap(http.HandlerFunc(h.Get)))
+	mux.Handle("POST /events/ack_all", wrap(http.HandlerFunc(h.AckAll)))
 	mux.Handle("POST /events/{id}/ack", wrap(http.HandlerFunc(h.Ack)))
 	mux.Handle("GET /events/stream", wrap(http.HandlerFunc(h.Stream)))
 }
@@ -112,6 +113,18 @@ func (h *Handler) Ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// AckAll flips every un-acked event in one shot. Returns the count so
+// the client can show "Acknowledged N events" feedback.
+func (h *Handler) AckAll(w http.ResponseWriter, r *http.Request) {
+	n, err := h.Store.AckAll(r.Context(), time.Now().UTC())
+	if err != nil {
+		slog.Error("events ack all", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count": n})
 }
 
 // Stream is a WebSocket that pushes newly-ingested events to the caller.
