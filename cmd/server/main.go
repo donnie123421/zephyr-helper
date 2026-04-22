@@ -81,6 +81,10 @@ func main() {
 	go diskCorrelator.Run(ctx)
 	slog.Info("disk correlator started")
 
+	snapshotCorrelator := correlators.NewSnapshotRollup(eventsStore)
+	go snapshotCorrelator.Run(ctx)
+	slog.Info("snapshot correlator started")
+
 	if tnClient.Configured() {
 		alertsPoller := pollers.NewAlerts(tnClient, eventsStore, pollers.DefaultAlertInterval, pollers.DefaultAlertMergeWindow)
 		go alertsPoller.Run(ctx)
