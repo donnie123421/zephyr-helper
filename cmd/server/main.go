@@ -73,6 +73,10 @@ func main() {
 		alertsPoller := pollers.NewAlerts(tnClient, eventsStore, pollers.DefaultAlertInterval, pollers.DefaultAlertMergeWindow)
 		go alertsPoller.Run(ctx)
 		slog.Info("alerts poller started", "interval", pollers.DefaultAlertInterval)
+
+		jobsPoller := pollers.NewJobs(tnClient, eventsStore, pollers.DefaultJobInterval, pollers.DefaultJobMergeWindow)
+		go jobsPoller.Run(ctx)
+		slog.Info("jobs poller started", "interval", pollers.DefaultJobInterval)
 	}
 
 	mux := http.NewServeMux()
