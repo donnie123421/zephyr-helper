@@ -138,13 +138,47 @@ func isTerminalJobState(state string) bool {
 	return false
 }
 
+// jobMethodIsNoise filters scheduled/infrastructure methods that finish
+// successfully in the background and don't represent anything the user
+// cares to see in a feed. Failures for these still surface because a
+// broken cache refresh or failed auto-update is actionable.
+//
+// Any `*_impl` method is dropped because TrueNAS emits both the public
+// method and its private implementation as separate jobs — ingesting
+// both double-counts the same work.
+func jobMethodIsNoise(method string) bool {
+	if strings.HasSuffix(method, "_impl") {
+		return true
+	}
+	switch method {
+	case
+		"directoryservices.cache_refresh",
+		"update.check_available",
+		"update.download",
+		"app.pull_images",
+		"app.redeploy",
+		"app.start",
+		"app.stop",
+		"core.get_jobs":
+		return true
+	}
+	return false
+}
+
 // jobToEvent builds a store row from a /core/get_jobs entry in a
-// terminal state. Unknown/missing state or method → skipped.
+// terminal state. Unknown/missing state or method → skipped. Successful
+// low-signal methods (scheduled cache refreshes, auto update downloads,
+// app lifecycle calls the UI already reflects) are also skipped —
+// failures for those methods still surface because a broken schedule
+// is something the user needs to see.
 func jobToEvent(job map[string]any) (events.Event, bool) {
 	method, _ := job["method"].(string)
 	state, _ := job["state"].(string)
 	upper := strings.ToUpper(state)
 	if method == "" || !isTerminalJobState(upper) {
+		return events.Event{}, false
+	}
+	if upper == "SUCCESS" && jobMethodIsNoise(method) {
 		return events.Event{}, false
 	}
 
