@@ -150,6 +150,12 @@ func jobMethodIsNoise(method string) bool {
 	if strings.HasSuffix(method, "_impl") {
 		return true
 	}
+	// Bulk fan-out jobs are always noise — the individual work items
+	// that matter surface as their own rows (e.g. core.bulk runs a
+	// batch of sibling jobs that each get their own terminal entry).
+	if strings.HasSuffix(method, ".bulk") || strings.Contains(method, ".bulk_") {
+		return true
+	}
 	switch method {
 	case
 		"directoryservices.cache_refresh",
@@ -159,6 +165,12 @@ func jobMethodIsNoise(method string) bool {
 		"app.redeploy",
 		"app.start",
 		"app.stop",
+		"app.upgrade",
+		"app.metadata.generate",
+		"catalog.sync",
+		"certificate.renew_certs",
+		"pool.dataset.sync_db_keys",
+		"zfs.dataset.bulk_process",
 		"core.get_jobs":
 		return true
 	}
