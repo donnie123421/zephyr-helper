@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 )
@@ -19,6 +20,10 @@ func builtins(tn *truenas.Client) []Tool {
 		listDisks(tn),
 		listAlerts(tn),
 		systemInfo(tn),
+		listShares(tn),
+		listDatasets(tn),
+		listSnapshots(tn),
+		listSmartTests(tn),
 	}
 }
 
@@ -267,6 +272,226 @@ func systemInfo(tn *truenas.Client) Tool {
 	}
 }
 
+// ----- list_shares -----------------------------------------------------------
+
+func listShares(tn *truenas.Client) Tool {
+	return Tool{
+		Def: Definition{
+			Name: "list_shares",
+			Description: "List all file-sharing exports on the NAS: SMB (Windows/Mac), " +
+				"NFS (Unix), and iSCSI targets. Each entry includes type, name, path, " +
+				"and enabled state. Use when the user asks 'what am I sharing', 'what " +
+				"SMB/NFS shares do I have', or about network shares generally.",
+			Parameters: noArgs,
+		},
+		StatusLine: "Checking shares…",
+		Handler: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			out := make([]map[string]any, 0)
+
+			// SMB: most home users live here. Surface name + path + enabled
+			// + purpose (e.g. DEFAULT_SHARE vs TIME_MACHINE) so the LLM can
+			// answer "is this Time Machine?" without a follow-up call.
+			if raw, err := tn.GetRaw(ctx, "/sharing/smb"); err == nil {
+				var smb []map[string]any
+				if json.Unmarshal(raw, &smb) == nil {
+					for _, s := range smb {
+						entry := map[string]any{"type": "smb"}
+						copyFields(entry, s, "name", "path", "enabled", "comment", "purpose", "locked")
+						out = append(out, entry)
+					}
+				}
+			}
+
+			// NFS doesn't have a "name" — path is the identifier. Hosts /
+			// networks are the access control so include them.
+			if raw, err := tn.GetRaw(ctx, "/sharing/nfs"); err == nil {
+				var nfs []map[string]any
+				if json.Unmarshal(raw, &nfs) == nil {
+					for _, s := range nfs {
+						entry := map[string]any{"type": "nfs"}
+						copyFields(entry, s, "path", "enabled", "comment", "hosts", "networks", "locked")
+						out = append(out, entry)
+					}
+				}
+			}
+
+			// iSCSI targets are block-level exports — users treat them like
+			// a remote disk. Name = IQN, alias is the friendly label.
+			if raw, err := tn.GetRaw(ctx, "/iscsi/target"); err == nil {
+				var targets []map[string]any
+				if json.Unmarshal(raw, &targets) == nil {
+					for _, t := range targets {
+						entry := map[string]any{"type": "iscsi"}
+						copyFields(entry, t, "name", "alias", "mode")
+						out = append(out, entry)
+					}
+				}
+			}
+
+			return toJSON(map[string]any{"shares": out})
+		},
+	}
+}
+
+// ----- list_datasets ---------------------------------------------------------
+
+func listDatasets(tn *truenas.Client) Tool {
+	return Tool{
+		Def: Definition{
+			Name: "list_datasets",
+			Description: "List ZFS datasets (filesystems and zvols) with name, type, " +
+				"used/available bytes, mountpoint, quota, and encryption state. Use " +
+				"when the user asks about dataset layout, space per dataset, or " +
+				"which datasets are encrypted.",
+			Parameters: noArgs,
+		},
+		StatusLine: "Checking datasets…",
+		Handler: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			raw, err := tn.GetRaw(ctx, "/pool/dataset")
+			if err != nil {
+				return "", err
+			}
+			var datasets []map[string]any
+			if err := json.Unmarshal(raw, &datasets); err != nil {
+				return "", fmt.Errorf("decode datasets: %w", err)
+			}
+
+			out := make([]map[string]any, 0, len(datasets))
+			for _, d := range datasets {
+				entry := map[string]any{}
+				copyFields(entry, d, "name", "type", "pool", "mountpoint", "encrypted", "locked")
+				entry["used_bytes"] = zfsPropBytes(d["used"])
+				entry["available_bytes"] = zfsPropBytes(d["available"])
+				entry["quota_bytes"] = zfsPropBytes(d["quota"])
+				out = append(out, entry)
+			}
+			return toJSON(map[string]any{"datasets": out})
+		},
+	}
+}
+
+// ----- list_snapshots --------------------------------------------------------
+
+func listSnapshots(tn *truenas.Client) Tool {
+	return Tool{
+		Def: Definition{
+			Name: "list_snapshots",
+			Description: "List ZFS snapshots, newest first, capped at 50. Pass " +
+				"dataset to filter to a single dataset (use this when the user " +
+				"names one — the raw snapshot list can run to thousands of rows " +
+				"and the LLM doesn't need that much context).",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"dataset": {
+						"type": "string",
+						"description": "Exact dataset name to filter by, e.g. 'tank/media'. Omit to list recent snapshots across all datasets."
+					}
+				},
+				"additionalProperties": false
+			}`),
+		},
+		StatusLine: "Checking snapshots…",
+		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
+			var a struct {
+				Dataset string `json:"dataset"`
+			}
+			if len(args) > 0 && string(args) != "null" {
+				if err := json.Unmarshal(args, &a); err != nil {
+					return "", fmt.Errorf("bad args: %w", err)
+				}
+			}
+
+			// TrueNAS /zfs/snapshot supports queryset filters + ordering +
+			// limit. Newest-first ordering matters because without it the
+			// middleware returns the oldest 50, which is the opposite of
+			// what a user wants.
+			params := url.Values{}
+			params.Set("limit", "50")
+			params.Set("order_by", "-created")
+			if a.Dataset != "" {
+				params.Set("filters", fmt.Sprintf(`[["dataset","=","%s"]]`, a.Dataset))
+			}
+			path := "/zfs/snapshot?" + params.Encode()
+
+			raw, err := tn.GetRaw(ctx, path)
+			if err != nil {
+				return "", err
+			}
+			var snaps []map[string]any
+			if err := json.Unmarshal(raw, &snaps); err != nil {
+				return "", fmt.Errorf("decode snapshots: %w", err)
+			}
+
+			out := make([]map[string]any, 0, len(snaps))
+			for _, s := range snaps {
+				entry := map[string]any{}
+				copyFields(entry, s, "name", "dataset", "snapshot_name", "created")
+				if props, ok := s["properties"].(map[string]any); ok {
+					entry["used_bytes"] = zfsPropBytes(props["used"])
+					entry["referenced_bytes"] = zfsPropBytes(props["referenced"])
+				}
+				out = append(out, entry)
+			}
+			result := map[string]any{
+				"snapshots": out,
+				"count":     len(out),
+			}
+			if a.Dataset != "" {
+				result["dataset_filter"] = a.Dataset
+			}
+			return toJSON(result)
+		},
+	}
+}
+
+// ----- list_smart_tests ------------------------------------------------------
+
+func listSmartTests(tn *truenas.Client) Tool {
+	return Tool{
+		Def: Definition{
+			Name: "list_smart_tests",
+			Description: "Get SMART self-test results for each physical disk. " +
+				"Each entry lists the disk and its most-recent test type, status, " +
+				"and timestamp. Use when the user asks about disk health, SMART " +
+				"errors, or 'are my drives failing'.",
+			Parameters: noArgs,
+		},
+		StatusLine: "Checking SMART tests…",
+		Handler: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			// /smart/test/results returns [{disk, tests: [...]}] where tests
+			// are newest-first. We project the most recent per disk so the
+			// LLM gets a compact per-disk health view instead of an N×M
+			// history matrix.
+			raw, err := tn.GetRaw(ctx, "/smart/test/results")
+			if err != nil {
+				return "", err
+			}
+			var results []map[string]any
+			if err := json.Unmarshal(raw, &results); err != nil {
+				return "", fmt.Errorf("decode smart results: %w", err)
+			}
+
+			out := make([]map[string]any, 0, len(results))
+			for _, r := range results {
+				entry := map[string]any{}
+				copyFields(entry, r, "disk")
+				tests, _ := r["tests"].([]any)
+				if len(tests) > 0 {
+					if latest, ok := tests[0].(map[string]any); ok {
+						copyFields(entry, latest,
+							"num", "description", "status", "status_verbose",
+							"remaining", "lifetime", "lba_of_first_error")
+					}
+				}
+				entry["test_count"] = len(tests)
+				out = append(out, entry)
+			}
+			return toJSON(map[string]any{"disks": out})
+		},
+	}
+}
+
 // ----- helpers ---------------------------------------------------------------
 
 // copyFields shallow-copies whitelisted keys from src into dst. Keys absent
@@ -341,4 +566,28 @@ func toJSON(v any) (string, error) {
 		return "", fmt.Errorf("marshal: %w", err)
 	}
 	return string(b), nil
+}
+
+// zfsPropBytes extracts a byte count from a ZFS property field. Modern
+// TrueNAS wraps numeric props in {parsed, rawvalue, value, source}, but
+// older versions / absent fields can come through as a bare number,
+// a string, or nil. Returns 0 when we can't derive a number — a missing
+// value is better than a wrong one.
+func zfsPropBytes(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case map[string]any:
+		if p, ok := x["parsed"].(float64); ok {
+			return int64(p)
+		}
+		if rv, ok := x["rawvalue"].(string); ok {
+			if n, err := strconv.ParseInt(rv, 10, 64); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }
