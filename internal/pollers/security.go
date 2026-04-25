@@ -349,15 +349,27 @@ func (s *Security) emitAuditDown(ctx context.Context, reason string) {
 
 // MARK: - Audit field readers
 
-// auditTimestamp pulls the time an audit row occurred, walking the
-// shapes TrueNAS actually returns: `message_timestamp` (unix seconds),
-// `time` ($date millis), or RFC3339 strings.
+// auditTimestamp pulls the time an audit row occurred. /audit/query
+// reports `message_timestamp` as unix *seconds* (a JSON number) — note
+// this differs from /alert/list's MongoDB-style `{"$date": <millis>}`
+// wrapper, which is why we don't reuse parseTrueNASTime for the
+// numeric path. Falls back to `time` / `@timestamp` for resilience.
 func auditTimestamp(entry map[string]any) time.Time {
-	if t := parseTrueNASTime(entry["message_timestamp"]); !t.IsZero() {
-		return t
-	}
-	if v, ok := entry["message_timestamp"].(float64); ok {
+	switch v := entry["message_timestamp"].(type) {
+	case float64:
 		return time.Unix(int64(v), 0).UTC()
+	case int64:
+		return time.Unix(v, 0).UTC()
+	case string:
+		if parsed, err := time.Parse(time.RFC3339, v); err == nil {
+			return parsed.UTC()
+		}
+	case map[string]any:
+		// Defensive: handle the alert-style wrapper if it ever shows up
+		// here too.
+		if ms, ok := v["$date"].(float64); ok {
+			return time.UnixMilli(int64(ms)).UTC()
+		}
 	}
 	if t := parseTrueNASTime(entry["time"]); !t.IsZero() {
 		return t

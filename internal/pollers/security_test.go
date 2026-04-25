@@ -365,6 +365,65 @@ func TestHandleEntrySkipsAPIKeyAuthentication(t *testing.T) {
 	}
 }
 
+func TestAuditTimestampInterpretsSeconds(t *testing.T) {
+	// Real audit row from /audit/query: message_timestamp is unix seconds
+	// (not milliseconds). A 1.7e9 value must come back as a 2024+ time —
+	// not Jan 21 1970, which is what we'd get if it were misread as ms.
+	now := time.Now().UTC().Unix()
+	entry := map[string]any{
+		"message_timestamp": float64(now),
+	}
+	got := auditTimestamp(entry)
+	if got.IsZero() {
+		t.Fatal("expected non-zero time")
+	}
+	delta := got.Unix() - now
+	if delta < -1 || delta > 1 {
+		t.Errorf("got %v (unix %d), expected ~%d", got, got.Unix(), now)
+	}
+	if got.Year() < 2020 {
+		t.Errorf("year = %d, expected post-2020 — likely seconds-as-ms regression", got.Year())
+	}
+}
+
+func TestAuditTimestampHandlesShapes(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []struct {
+		name  string
+		entry map[string]any
+		ok    func(time.Time) bool
+	}{
+		{
+			name:  "unix seconds as float",
+			entry: map[string]any{"message_timestamp": float64(now.Unix())},
+			ok:    func(t time.Time) bool { return t.Year() >= 2020 },
+		},
+		{
+			name:  "rfc3339 string",
+			entry: map[string]any{"message_timestamp": now.Format(time.RFC3339)},
+			ok:    func(t time.Time) bool { return t.Year() >= 2020 },
+		},
+		{
+			name: "mongo-style wrapper as fallback",
+			entry: map[string]any{
+				"message_timestamp": map[string]any{"$date": float64(now.UnixMilli())},
+			},
+			ok: func(t time.Time) bool { return t.Year() >= 2020 },
+		},
+		{
+			name:  "missing field returns zero",
+			entry: map[string]any{},
+			ok:    func(t time.Time) bool { return t.IsZero() },
+		},
+	}
+	for _, c := range cases {
+		got := auditTimestamp(c.entry)
+		if !c.ok(got) {
+			t.Errorf("%s: got %v", c.name, got)
+		}
+	}
+}
+
 func TestIsAPIKeyAuthentication(t *testing.T) {
 	cases := []struct {
 		name  string
