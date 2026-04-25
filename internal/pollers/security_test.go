@@ -45,14 +45,33 @@ func TestIsPublicIP(t *testing.T) {
 }
 
 func TestIsAuditUnavailable(t *testing.T) {
-	if !isAuditUnavailable(errors.New("truenas 404 Not Found: ...")) {
-		t.Error("404 should be treated as unavailable")
+	// 4xx variants must all be silent — they indicate our request is
+	// wrong (endpoint absent, role denied, body shape mismatch) rather
+	// than audit being broken.
+	silent := []string{
+		"truenas 404 Not Found: ...",
+		"truenas 405 Method Not Allowed: ...",
+		"truenas 401 Unauthorized: ...",
+		"truenas 403 Forbidden: ...",
+		"truenas 422 Unprocessable Entity: ...",
 	}
-	if isAuditUnavailable(errors.New("truenas 500 Internal Server Error")) {
-		t.Error("500 must NOT be treated as unavailable — should fire audit-down")
+	for _, msg := range silent {
+		if !isAuditUnavailable(errors.New(msg)) {
+			t.Errorf("expected %q to be treated as unavailable", msg)
+		}
 	}
-	if isAuditUnavailable(errors.New("dial tcp: connection refused")) {
-		t.Error("connection-refused should NOT mask audit-down")
+	// 5xx + network failures must surface so consecutive-failure
+	// counting can fire the audit-down event.
+	loud := []string{
+		"truenas 500 Internal Server Error",
+		"truenas 503 Service Unavailable",
+		"dial tcp: connection refused",
+		"context deadline exceeded",
+	}
+	for _, msg := range loud {
+		if isAuditUnavailable(errors.New(msg)) {
+			t.Errorf("expected %q to surface, not be swallowed", msg)
+		}
 	}
 }
 

@@ -44,6 +44,12 @@ var privilegedUsers = map[string]struct{}{
 	"truenas_admin": {},
 }
 
+// auditDownFailureThreshold is how many consecutive poll failures must
+// occur before we emit a critical "audit unreachable" event. A single
+// transient blip shouldn't paint the feed red. With a 2-min poll
+// cadence this is roughly six minutes of sustained breakage.
+const auditDownFailureThreshold = 3
+
 // Security polls /audit/query every interval, applies deterministic
 // rules, and ingests one events row per detection.
 //
@@ -51,13 +57,16 @@ var privilegedUsers = map[string]struct{}{
 //   - seenAuditIDs: bounded to the most recent poll's payload so failed
 //     logins aren't double-counted.
 //   - failedLogins: rolling window per user|ip used for the spike rule.
+//   - consecutiveFailures: gates the audit-down event behind the
+//     auditDownFailureThreshold so transient errors stay silent.
 type Security struct {
 	tn       *truenas.Client
 	store    *events.Store
 	interval time.Duration
 
-	seenAuditIDs map[string]bool
-	failedLogins map[string][]time.Time
+	seenAuditIDs        map[string]bool
+	failedLogins        map[string][]time.Time
+	consecutiveFailures int
 }
 
 // NewSecurity builds a poller. Use DefaultSecurityInterval for the
@@ -89,20 +98,39 @@ func (s *Security) Run(ctx context.Context) {
 }
 
 func (s *Security) poll(ctx context.Context) {
-	// limit=200 covers ~hours of activity on a normal home NAS even when
-	// the audit log is chatty (smb mounts, snapshot tasks, etc.).
-	raw, err := s.tn.GetRaw(ctx, "/audit/query?limit=200")
+	// /audit/query is a POST endpoint that takes a query-filter array
+	// and an options map. limit=200 covers ~hours of activity on a
+	// normal home NAS even when the audit log is chatty (smb mounts,
+	// snapshot tasks, etc.).
+	body := map[string]any{
+		"query-filters": []any{},
+		"query-options": map[string]any{
+			"limit": 200,
+			"order_by": []string{"-message_timestamp"},
+		},
+	}
+	raw, err := s.tn.PostRaw(ctx, "/audit/query", body)
 	if err != nil {
-		// 404 = pre-25.04 server with no audit subsystem. Fail silently
-		// per the plan. Anything else means audit is configured but the
-		// helper can't read it — emit one critical "we're blind" event.
+		// Any 4xx means our REQUEST is wrong — endpoint absent
+		// (pre-25.04 servers, TrueNAS 26 with REST removed), method
+		// not allowed, role denied, or audit not enabled. None of
+		// those are "audit is broken"; fail silently and reset the
+		// failure counter so we don't fire spurious recovery events.
 		if isAuditUnavailable(err) {
+			s.consecutiveFailures = 0
 			return
 		}
-		slog.Warn("security: audit poll", "err", err)
-		s.emitAuditDown(ctx, err.Error())
+		// 5xx or network error: audit might really be down. Only
+		// surface the critical event after sustained failure to ride
+		// out transient hiccups.
+		s.consecutiveFailures++
+		slog.Warn("security: audit poll", "err", err, "consecutive_failures", s.consecutiveFailures)
+		if s.consecutiveFailures >= auditDownFailureThreshold {
+			s.emitAuditDown(ctx, err.Error())
+		}
 		return
 	}
+	s.consecutiveFailures = 0
 
 	var entries []map[string]any
 	if err := json.Unmarshal(raw, &entries); err != nil {
@@ -565,11 +593,34 @@ func mustCIDR(s string) *net.IPNet {
 }
 
 // isAuditUnavailable returns true when the error from /audit/query
-// indicates the endpoint isn't present (pre-25.04 servers). Other HTTP
-// errors should surface as audit-down events.
+// indicates the endpoint isn't usable from our request shape, which is
+// a "client/server mismatch" rather than "audit is broken." Covers:
+//
+//   - 404 / Not Found: pre-25.04 server with no audit endpoint, or
+//     TrueNAS 26 where REST has been removed entirely
+//   - 405 Method Not Allowed: server expects a different HTTP verb
+//   - 401 / 403: API key lacks the audit role (silent rather than
+//     painting the feed red on every poll)
+//   - 422: request body shape doesn't match what the server expects
+//
+// 5xx errors and network failures are NOT swallowed here — those go
+// through the consecutive-failure counter and surface as audit-down
+// once they persist.
 func isAuditUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
 	msg := err.Error()
-	return strings.Contains(msg, "404") || strings.Contains(msg, "Not Found")
+	for _, pat := range []string{
+		"truenas 401", "truenas 403", "truenas 404",
+		"truenas 405", "truenas 422",
+		"Not Found", "Method Not Allowed", "Unprocessable",
+	} {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 // MARK: - Misc helpers

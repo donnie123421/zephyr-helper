@@ -96,3 +96,36 @@ func (c *Client) GetRaw(ctx context.Context, path string) (json.RawMessage, erro
 	}
 	return raw, nil
 }
+
+// PostRaw performs a POST against /api/v2.0/<path> with the given JSON
+// body and returns the raw response. TrueNAS's filterable query
+// endpoints (e.g. /audit/query) require POST with a body of the form
+// `{"query-filters": [...], "query-options": {...}}`.
+func (c *Client) PostRaw(ctx context.Context, path string, body any) (json.RawMessage, error) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("encode body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/v2.0"+path, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("truenas: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("truenas %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
+	}
+	return json.RawMessage(respBody), nil
+}
