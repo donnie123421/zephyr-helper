@@ -36,6 +36,7 @@ const (
 	KindDisk     Kind = "disk"
 	KindPool     Kind = "pool"
 	KindSnapshot Kind = "snapshot"
+	KindSecurity Kind = "security"
 )
 
 // Event is one row in the store. `Body` holds the original TrueNAS
