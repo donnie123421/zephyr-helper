@@ -27,12 +27,6 @@ const (
 	// Audit-down events are urgent; merge tightly so a flapping audit
 	// service still produces visible churn but doesn't quadruple-fire.
 	securityAuditDownMergeWindow = 5 * time.Minute
-	// Failed-login spike rule: ≥N failures from one user|ip in window
-	// rolls up into one row. Threshold/window kept conservative — too
-	// noisy and the feature gets muted (see noisy-baseline tradeoff).
-	securityFailSpikeWindow      = 10 * time.Minute
-	securityFailSpikeThreshold   = 5
-	securityFailSpikeMergeWindow = 30 * time.Minute
 )
 
 // privilegedUsers are the canonical "everything-as-root" account names
@@ -54,9 +48,8 @@ const auditDownFailureThreshold = 3
 // rules, and ingests one events row per detection.
 //
 // State held between ticks:
-//   - seenAuditIDs: bounded to the most recent poll's payload so failed
-//     logins aren't double-counted.
-//   - failedLogins: rolling window per user|ip used for the spike rule.
+//   - seenAuditIDs: bounded to the most recent poll's payload so the
+//     same row isn't dispatched twice across overlapping polls.
 //   - consecutiveFailures: gates the audit-down event behind the
 //     auditDownFailureThreshold so transient errors stay silent.
 type Security struct {
@@ -65,7 +58,6 @@ type Security struct {
 	interval time.Duration
 
 	seenAuditIDs        map[string]bool
-	failedLogins        map[string][]time.Time
 	consecutiveFailures int
 }
 
@@ -77,7 +69,6 @@ func NewSecurity(tn *truenas.Client, store *events.Store, interval time.Duration
 		store:        store,
 		interval:     interval,
 		seenAuditIDs: make(map[string]bool),
-		failedLogins: make(map[string][]time.Time),
 	}
 }
 
@@ -138,8 +129,9 @@ func (s *Security) poll(ctx context.Context) {
 		return
 	}
 
-	// Process oldest-first so the spike-rule rolling window accumulates
-	// in chronological order. /audit/query returns newest-first.
+	// /audit/query returns newest-first; iterate in reverse so events
+	// are dispatched in chronological order. Keeps room for any future
+	// rule that depends on row ordering without restructuring the loop.
 	current := make(map[string]bool, len(entries))
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
@@ -153,13 +145,17 @@ func (s *Security) poll(ctx context.Context) {
 		s.handleEntry(ctx, entry)
 	}
 	s.seenAuditIDs = current
-	s.pruneFailedLogins(time.Now().UTC())
 }
 
 // handleEntry dispatches one audit row to the rule(s) it matches.
 // Entries can match more than one rule (e.g. a successful root login
 // from a new public IP fires both rules); handlers are independent and
 // safe to call together because the events store dedupes per-rule.
+//
+// Failed authentications aren't dispatched here: TrueNAS doesn't write
+// failed sign-ins to /audit/query, so any spike rule would have no
+// signal to read. If we ever pivot to syslog we can reintroduce that
+// branch.
 func (s *Security) handleEntry(ctx context.Context, entry map[string]any) {
 	occurred := auditTimestamp(entry)
 	if occurred.IsZero() {
@@ -167,18 +163,30 @@ func (s *Security) handleEntry(ctx context.Context, entry map[string]any) {
 	}
 	username := readUsername(entry)
 	address := readAddress(entry)
-	success := readSuccess(entry)
 	event := strings.ToUpper(strings.TrimSpace(asString(entry["event"])))
 
-	switch {
-	case isAuthenticationEvent(event):
-		s.handleAuthentication(ctx, entry, occurred, username, address, success)
-	case isShareCreateEvent(event):
-		s.emitShareCreated(ctx, entry, occurred, username)
-	case isUserCreateEvent(event):
-		s.emitUserCreated(ctx, entry, occurred, username)
-	case isPrivilegeGrantEvent(event):
-		s.emitPrivilegeGranted(ctx, entry, occurred, username)
+	switch event {
+	case "AUTHENTICATION", "LOGIN":
+		// Programmatic API key auths (this helper, scripts, other tools)
+		// are not interactive sign-ins. Skip them so the helper's own
+		// poll-driven authentications don't loop back into the feed.
+		if isAPIKeyAuthentication(entry) {
+			return
+		}
+		s.handleAuthentication(ctx, entry, occurred, username, address)
+	case "METHOD_CALL":
+		// Real schema: dispatch on event_data.method, not on the
+		// top-level event field. The actual TrueNAS method names are
+		// dotted (sharing.smb.create, user.create, privilege.create).
+		method := readMethod(entry)
+		switch {
+		case isShareCreateMethod(method):
+			s.emitShareCreated(ctx, entry, occurred, username)
+		case isUserCreateMethod(method):
+			s.emitUserCreated(ctx, entry, occurred, username)
+		case isPrivilegeGrantMethod(method):
+			s.emitPrivilegeGranted(ctx, entry, occurred, username)
+		}
 	}
 }
 
@@ -187,83 +195,15 @@ func (s *Security) handleAuthentication(
 	entry map[string]any,
 	occurred time.Time,
 	username, address string,
-	success bool,
 ) {
-	if !success {
-		s.recordFailedLogin(ctx, entry, occurred, username, address)
-		return
-	}
-
-	// Successful login. Check rules in order; one entry can fire more
-	// than one (e.g. root login from a new public IP).
+	// One entry can fire more than one rule (e.g. root login from a new
+	// public IP).
 	if address != "" && isPublicIP(address) {
 		s.emitNewPublicIPLogin(ctx, entry, occurred, username, address)
 	}
 	if _, privileged := privilegedUsers[strings.ToLower(username)]; privileged {
 		s.emitPrivilegedLogin(ctx, entry, occurred, username, address)
 	}
-}
-
-// recordFailedLogin appends to the rolling window and emits a spike
-// event when the threshold is crossed. After emission the bucket is
-// reset so a sustained attack produces one event per merge window
-// rather than one per failed attempt.
-func (s *Security) recordFailedLogin(
-	ctx context.Context,
-	entry map[string]any,
-	occurred time.Time,
-	username, address string,
-) {
-	bucket := username + "|" + address
-	if username == "" && address == "" {
-		bucket = "unknown"
-	}
-	cutoff := occurred.Add(-securityFailSpikeWindow)
-	window := s.failedLogins[bucket]
-	// Drop expired timestamps before append.
-	pruned := window[:0]
-	for _, t := range window {
-		if t.After(cutoff) {
-			pruned = append(pruned, t)
-		}
-	}
-	pruned = append(pruned, occurred)
-	s.failedLogins[bucket] = pruned
-
-	if len(pruned) < securityFailSpikeThreshold {
-		return
-	}
-
-	body, _ := json.Marshal(map[string]any{
-		"username":   username,
-		"address":    address,
-		"count":      len(pruned),
-		"window_min": int(securityFailSpikeWindow / time.Minute),
-		"sample":     entry,
-	})
-
-	title := fmt.Sprintf("%d failed sign-ins from %s", len(pruned), authorOrUnknown(username, address))
-	summary := fmt.Sprintf(
-		"%d failed sign-in attempts from %s in the last %d minutes — possible password attack.",
-		len(pruned), authorOrUnknown(username, address), int(securityFailSpikeWindow/time.Minute),
-	)
-
-	ev := events.Event{
-		OccurredAt: occurred,
-		Kind:       events.KindSecurity,
-		Severity:   events.SeverityWarning,
-		Title:      title,
-		Summary:    summary,
-		Body:       body,
-		DedupeKey:  fmt.Sprintf("security|failed-login-spike|%s", bucket),
-	}
-	if _, err := s.store.Ingest(ctx, ev, securityFailSpikeMergeWindow); err != nil {
-		slog.Warn("security: spike ingest", "err", err)
-		return
-	}
-	// Reset bucket so the next emission requires a fresh threshold-worth
-	// of failures rather than tripping on every subsequent attempt.
-	s.failedLogins[bucket] = nil
 }
 
 func (s *Security) emitNewPublicIPLogin(
@@ -407,23 +347,6 @@ func (s *Security) emitAuditDown(ctx context.Context, reason string) {
 	}
 }
 
-func (s *Security) pruneFailedLogins(now time.Time) {
-	cutoff := now.Add(-securityFailSpikeWindow)
-	for k, ts := range s.failedLogins {
-		pruned := ts[:0]
-		for _, t := range ts {
-			if t.After(cutoff) {
-				pruned = append(pruned, t)
-			}
-		}
-		if len(pruned) == 0 {
-			delete(s.failedLogins, k)
-		} else {
-			s.failedLogins[k] = pruned
-		}
-	}
-}
-
 // MARK: - Audit field readers
 
 // auditTimestamp pulls the time an audit row occurred, walking the
@@ -480,26 +403,6 @@ func readAddress(entry map[string]any) string {
 	return ""
 }
 
-func readSuccess(entry map[string]any) bool {
-	if v, ok := entry["success"].(bool); ok {
-		return v
-	}
-	if data, ok := entry["event_data"].(map[string]any); ok {
-		if v, ok := data["success"].(bool); ok {
-			return v
-		}
-		// AUTHENTICATION events sometimes encode failure as
-		// event_data.error_msg or event_data.result == "FAIL".
-		if asString(data["error_msg"]) != "" {
-			return false
-		}
-		if strings.EqualFold(asString(data["result"]), "FAIL") {
-			return false
-		}
-	}
-	return true
-}
-
 func readShareName(entry map[string]any) string {
 	if data, ok := entry["event_data"].(map[string]any); ok {
 		if v := asString(data["name"]); v != "" {
@@ -527,27 +430,70 @@ func readTargetUsername(entry map[string]any) string {
 	return "(unknown)"
 }
 
-// MARK: - Event-name predicates
+// MARK: - Method dispatch helpers
 
-func isAuthenticationEvent(event string) bool {
-	return event == "AUTHENTICATION" || event == "LOGIN"
+// readMethod returns the JSON-RPC method name carried by a METHOD_CALL
+// audit row (e.g. "sharing.smb.create"). Empty when the entry isn't a
+// METHOD_CALL or the field is missing.
+func readMethod(entry map[string]any) string {
+	if data, ok := entry["event_data"].(map[string]any); ok {
+		return asString(data["method"])
+	}
+	return ""
 }
 
-func isShareCreateEvent(event string) bool {
-	switch event {
-	case "SHARE_CREATE", "EXPORT_CREATE", "SMB_SHARE_CREATE", "NFS_SHARE_CREATE":
+// isAPIKeyAuthentication reports whether an AUTHENTICATION row was
+// driven by an API key rather than an interactive sign-in. Skipping
+// these prevents the helper's own /audit/query poll from generating an
+// authentication event that the next poll then re-reads — and also
+// keeps unrelated tool/script auths out of the feed, since "another
+// program logged in" is not what users want to be notified about.
+func isAPIKeyAuthentication(entry map[string]any) bool {
+	data, ok := entry["event_data"].(map[string]any)
+	if !ok {
+		return false
+	}
+	creds, ok := data["credentials"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if t := strings.ToUpper(asString(creds["credentials_type"])); t == "API_KEY" {
+		return true
+	}
+	// Some payloads put the discriminator one level deeper inside
+	// credentials_data, where the key shape is { "api_key": {...} }.
+	if cd, ok := creds["credentials_data"].(map[string]any); ok {
+		if _, hasKey := cd["api_key"]; hasKey {
+			return true
+		}
+	}
+	return false
+}
+
+// isShareCreateMethod matches the methods TrueNAS emits when an admin
+// creates a share. iSCSI targets are functionally a share for our
+// threat model — they expose data over the network — so they belong in
+// the same rule.
+func isShareCreateMethod(method string) bool {
+	switch method {
+	case "sharing.smb.create",
+		"sharing.nfs.create",
+		"sharing.iscsi.target.create":
 		return true
 	}
 	return false
 }
 
-func isUserCreateEvent(event string) bool {
-	return event == "USER_CREATE" || event == "ACCOUNT_CREATE"
+func isUserCreateMethod(method string) bool {
+	return method == "user.create"
 }
 
-func isPrivilegeGrantEvent(event string) bool {
-	switch event {
-	case "PRIVILEGE_GRANT", "ROLE_GRANT", "GROUP_MEMBERSHIP_ADD":
+// isPrivilegeGrantMethod stays narrow on purpose: user.update /
+// group.update fire on too many benign edits to use without inspecting
+// params. If we miss a real escalation here we can broaden later.
+func isPrivilegeGrantMethod(method string) bool {
+	switch method {
+	case "privilege.create", "privilege.update":
 		return true
 	}
 	return false
@@ -637,16 +583,4 @@ func displayUser(u string) string {
 		return "Someone"
 	}
 	return u
-}
-
-func authorOrUnknown(user, addr string) string {
-	switch {
-	case user != "" && addr != "":
-		return user + "@" + addr
-	case user != "":
-		return user
-	case addr != "":
-		return addr
-	}
-	return "an unknown source"
 }
