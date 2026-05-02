@@ -21,6 +21,24 @@ type Config struct {
 	// container restarts is acceptable until the installer gains a
 	// /data volume mount and we bump the default to /data/events.db.
 	EventsDBPath string
+
+	// TSAuthKey is an optional Tailscale auth key. When set, the helper
+	// joins the user's tailnet on boot via tsnet, which lets it resolve
+	// the user's actual MagicDNS hostname for the iOS Add Tailscale flow
+	// (and gives us a tailnet-native identity for future push relay
+	// work). Empty string disables tsnet entirely — the helper runs
+	// exactly as it does today.
+	TSAuthKey string
+	// TSHostname is the machine name the helper advertises on the
+	// tailnet. Defaults to "zephyr-helper" so the tailnet admin
+	// console doesn't show an unhelpful container hash.
+	TSHostname string
+	// TSStateDir is where tsnet persists its node key and state.
+	// Without a volume mount the helper re-registers as a fresh
+	// device on every restart, which still works but pollutes the
+	// admin console's device list. Defaults to /tmp/tsnet so it
+	// survives `tailscale up` restarts within a container lifetime.
+	TSStateDir string
 }
 
 func Load() (*Config, error) {
@@ -32,6 +50,9 @@ func Load() (*Config, error) {
 		TrueNASURL:    os.Getenv("TRUENAS_URL"),
 		TrueNASAPIKey: os.Getenv("TRUENAS_API_KEY"),
 		EventsDBPath:  envOr("EVENTS_DB_PATH", "/tmp/events.db"),
+		TSAuthKey:     os.Getenv("TS_AUTHKEY"),
+		TSHostname:    envOr("TS_HOSTNAME", "zephyr-helper"),
+		TSStateDir:    envOr("TS_STATE_DIR", "/tmp/tsnet"),
 	}
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,

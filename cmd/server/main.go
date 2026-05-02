@@ -20,6 +20,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/pollers"
 	"github.com/donnie123421/zephyr-helper/internal/remoteaccess"
+	"github.com/donnie123421/zephyr-helper/internal/tailnet"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 	"github.com/donnie123421/zephyr-helper/internal/version"
@@ -100,7 +101,26 @@ func main() {
 		slog.Info("security poller started", "interval", pollers.DefaultSecurityInterval)
 	}
 
-	remoteHandler := &remoteaccess.Handler{TN: tnClient, Log: slog.Default()}
+	// Optional: join the user's tailnet so /remote-access can resolve
+	// the actual MagicDNS hostname for the iOS Add Tailscale flow.
+	// Bring it up before the HTTP server starts so the first /remote-
+	// access call from the app already has a primed status. tsnet
+	// registration takes a few hundred ms on first run; we cap at
+	// 30s so a misconfigured key doesn't stall startup forever.
+	tsServer := tailnet.New(cfg.TSAuthKey, cfg.TSHostname, cfg.TSStateDir, slog.Default())
+	if tsServer.Available() {
+		startCtx, startCancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := tsServer.Start(startCtx); err != nil {
+			// Don't fail the whole helper — the tailnet is a nice-to-
+			// have. Log and continue; /remote-access falls back to
+			// chart-scrape + NAS hostname suggestion.
+			slog.Warn("tsnet: start failed; continuing without tailnet", "err", err)
+		}
+		startCancel()
+	}
+	defer tsServer.Stop()
+
+	remoteHandler := &remoteaccess.Handler{TN: tnClient, Tailnet: tsServer, Log: slog.Default()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)

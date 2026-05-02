@@ -19,13 +19,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/donnie123421/zephyr-helper/internal/tailnet"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 )
 
 // Handler serves the read-only `GET /remote-access` endpoint.
 type Handler struct {
-	TN  *truenas.Client
-	Log *slog.Logger
+	TN      *truenas.Client
+	// Tailnet is optional. When the helper joined the tailnet via
+	// tsnet at startup, the handler upgrades the response with the
+	// authoritative MagicDNS hostname instead of guessing.
+	Tailnet *tailnet.Server
+	Log     *slog.Logger
 }
 
 // Response is the outer envelope returned to the iOS app. New
@@ -47,6 +52,12 @@ type Tailscale struct {
 	Installed bool   `json:"installed"`
 	State     string `json:"state,omitempty"`    // RUNNING / STOPPED / DEPLOYING / etc.
 	Hostname  string `json:"hostname,omitempty"` // best-effort tailnet hostname
+	IPv4      string `json:"ipv4,omitempty"`     // 100.x.y.z when known via tsnet
+	// Source labels how confident the hostname is. iOS uses this
+	// to choose between "Detected via tailnet" (highest confidence,
+	// from the helper's own tsnet status) and "Found in chart"
+	// (compose-env scrape, less reliable).
+	Source string `json:"source,omitempty"` // "tailnet" / "chart" / ""
 	// Human-readable hint when we know it's installed but couldn't
 	// pin down the hostname — surfaced in the iOS sheet so the user
 	// knows where to look.
@@ -63,8 +74,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	ts := h.detectTailscale(ctx)
+	// If the helper itself joined the tailnet, the local Tailscale
+	// API is the authoritative source for the hostname / IP — far
+	// better than the chart-scrape best-effort. Override the
+	// hostname when we have one.
+	if h.Tailnet != nil && h.Tailnet.Available() {
+		if self, ok := h.Tailnet.Status(ctx); ok && self.HostName != "" {
+			if ts == nil {
+				// Helper is on the tailnet but the user hasn't
+				// installed the Tailscale TrueNAS app — still
+				// report what we know so iOS can offer the
+				// helper's own tailnet identity.
+				ts = &Tailscale{Installed: false}
+			}
+			// Strip the trailing dot tsnet appends (DNS form).
+			host := strings.TrimSuffix(self.DNSName, ".")
+			if host == "" {
+				host = self.HostName
+			}
+			ts.Hostname = host
+			ts.Source = "tailnet"
+			if len(self.TailscaleIPs) > 0 {
+				ts.IPv4 = self.TailscaleIPs[0]
+			}
+		}
+	} else if ts != nil && ts.Hostname != "" {
+		// Chart scrape did find something — label it so iOS knows
+		// to be slightly less confident than a tsnet result.
+		ts.Source = "chart"
+	}
+
 	resp := Response{
-		Tailscale:   h.detectTailscale(ctx),
+		Tailscale:   ts,
 		NASHostname: h.fetchNASHostname(ctx),
 	}
 	_ = json.NewEncoder(w).Encode(resp)
