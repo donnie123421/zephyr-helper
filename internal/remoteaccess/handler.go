@@ -33,6 +33,12 @@ type Handler struct {
 // pointer fields here as the helper learns to introspect them.
 type Response struct {
 	Tailscale *Tailscale `json:"tailscale,omitempty"`
+	// NASHostname is the TrueNAS system hostname. Tailscale defaults
+	// its machine name to the OS hostname when no TS_HOSTNAME env
+	// override is set in the chart, so iOS can suggest
+	// `<nasHostname>.<tailnet>.ts.net` as a prefill candidate even
+	// when the chart values don't expose anything Tailscale-specific.
+	NASHostname string `json:"nasHostname,omitempty"`
 }
 
 // Tailscale carries everything the iOS prefill flow needs about the
@@ -58,9 +64,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	resp := Response{
-		Tailscale: h.detectTailscale(ctx),
+		Tailscale:   h.detectTailscale(ctx),
+		NASHostname: h.fetchNASHostname(ctx),
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// fetchNASHostname reads /system/general for the NAS's hostname.
+// Returns empty string on any failure — this is purely a UX hint, a
+// missing hostname just means iOS falls back to the manual paste
+// flow it already supports.
+func (h *Handler) fetchNASHostname(ctx context.Context) string {
+	if h.TN == nil || !h.TN.Configured() {
+		return ""
+	}
+	raw, err := h.TN.GetRaw(ctx, "/system/general")
+	if err != nil {
+		h.logf("remote-access: system/general failed", "err", err)
+		return ""
+	}
+	var general struct {
+		Hostname string `json:"hostname"`
+	}
+	if err := json.Unmarshal(raw, &general); err != nil {
+		// Older builds nest hostname under config — try again.
+		var nested struct {
+			Config struct {
+				Hostname string `json:"hostname"`
+			} `json:"config"`
+		}
+		if err := json.Unmarshal(raw, &nested); err == nil {
+			return strings.TrimSpace(nested.Config.Hostname)
+		}
+		h.logf("remote-access: decode system/general failed", "err", err)
+		return ""
+	}
+	return strings.TrimSpace(general.Hostname)
 }
 
 func (h *Handler) detectTailscale(ctx context.Context) *Tailscale {
