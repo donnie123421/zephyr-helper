@@ -53,6 +53,18 @@ type SelfStatus struct {
 	BackendState    string   `json:"backendState,omitempty"`    // "Running" / "NeedsLogin" / etc.
 }
 
+// PeerInfo carries just enough of an ipnstate.PeerStatus for the
+// /remote-access handler to identify the NAS in the tailnet and
+// hand iOS a reachable hostname + IP. We deliberately don't ship
+// the full PeerStatus over the wire — most of it is debugging
+// metadata iOS has no use for.
+type PeerInfo struct {
+	HostName     string   `json:"hostname,omitempty"`
+	DNSName      string   `json:"dnsName,omitempty"`
+	TailscaleIPs []string `json:"tailscaleIPs,omitempty"`
+	Online       bool     `json:"online,omitempty"`
+}
+
 // New builds a Server. Callers must call Start() before Status().
 // When authKey is empty the returned Server is inert — every
 // method is a no-op and Available() returns false.
@@ -141,6 +153,70 @@ func (s *Server) Status(ctx context.Context) (SelfStatus, bool) {
 		s.lastSelf = selfFromStatus(status)
 	}
 	return s.lastSelf, true
+}
+
+// FindPeerByHostname walks the tailnet peer list looking for a node
+// whose HostName or short DNS label matches `hostname` (case-
+// insensitive). Used by /remote-access to locate the user's NAS in
+// the tailnet — the helper's own Self identity is unhelpful as an
+// endpoint because the iPhone needs to reach TrueNAS at port 443,
+// which lives on the NAS host, not on the helper container.
+//
+// Returns (zero, false) when no match is found, the helper isn't
+// on the tailnet, or hostname is empty.
+func (s *Server) FindPeerByHostname(ctx context.Context, hostname string) (PeerInfo, bool) {
+	if !s.Available() || s.local == nil {
+		return PeerInfo{}, false
+	}
+	target := strings.ToLower(strings.TrimSpace(hostname))
+	if target == "" {
+		return PeerInfo{}, false
+	}
+	status, err := s.local.Status(ctx)
+	if err != nil || status == nil {
+		return PeerInfo{}, false
+	}
+	for _, peer := range status.Peer {
+		if peer == nil {
+			continue
+		}
+		if peerMatches(peer, target) {
+			info := PeerInfo{
+				HostName: peer.HostName,
+				DNSName:  strings.TrimSuffix(peer.DNSName, "."),
+				Online:   peer.Online,
+			}
+			for _, ip := range peer.TailscaleIPs {
+				info.TailscaleIPs = append(info.TailscaleIPs, ip.String())
+			}
+			return info, true
+		}
+	}
+	return PeerInfo{}, false
+}
+
+// peerMatches checks both the bare HostName field and the short
+// label of the DNSName (everything before the first dot). Tailscale
+// sometimes puts the user-friendly hostname in DNSName but a
+// generated name in HostName for non-Linux peers, so checking both
+// is the safe move.
+func peerMatches(peer *ipnstate.PeerStatus, target string) bool {
+	if peer == nil {
+		return false
+	}
+	if strings.EqualFold(peer.HostName, target) {
+		return true
+	}
+	if peer.DNSName != "" {
+		label := peer.DNSName
+		if dot := strings.IndexByte(label, '.'); dot > 0 {
+			label = label[:dot]
+		}
+		if strings.EqualFold(label, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func selfFromStatus(status *ipnstate.Status) SelfStatus {

@@ -75,28 +75,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	ts := h.detectTailscale(ctx)
-	// If the helper itself joined the tailnet, the local Tailscale
-	// API is the authoritative source for the hostname / IP — far
-	// better than the chart-scrape best-effort. Override the
-	// hostname when we have one.
-	if h.Tailnet != nil && h.Tailnet.Available() {
-		if self, ok := h.Tailnet.Status(ctx); ok && self.HostName != "" {
+	nasHostname := h.fetchNASHostname(ctx)
+
+	// If the helper joined the tailnet, ask its local API for the
+	// NAS *peer* (not the helper's own Self). The iPhone needs to
+	// reach TrueNAS at port 443 — which runs on the NAS host, not
+	// inside the helper container — so the only useful tailnet
+	// identity here is the one registered by the Tailscale TrueNAS
+	// app on the NAS itself.
+	//
+	// We look up that peer by the NAS's system hostname. When the
+	// match succeeds the response is upgraded with the
+	// authoritative MagicDNS name + 100.x.y.z IP and labelled
+	// `source: "tailnet"` so iOS treats it as high-confidence.
+	if h.Tailnet != nil && h.Tailnet.Available() && nasHostname != "" {
+		if peer, ok := h.Tailnet.FindPeerByHostname(ctx, nasHostname); ok {
 			if ts == nil {
-				// Helper is on the tailnet but the user hasn't
-				// installed the Tailscale TrueNAS app — still
-				// report what we know so iOS can offer the
-				// helper's own tailnet identity.
 				ts = &Tailscale{Installed: false}
 			}
-			// Strip the trailing dot tsnet appends (DNS form).
-			host := strings.TrimSuffix(self.DNSName, ".")
-			if host == "" {
-				host = self.HostName
+			if peer.DNSName != "" {
+				ts.Hostname = peer.DNSName
+			} else if peer.HostName != "" {
+				ts.Hostname = peer.HostName
 			}
-			ts.Hostname = host
 			ts.Source = "tailnet"
-			if len(self.TailscaleIPs) > 0 {
-				ts.IPv4 = self.TailscaleIPs[0]
+			if len(peer.TailscaleIPs) > 0 {
+				ts.IPv4 = peer.TailscaleIPs[0]
 			}
 		}
 	} else if ts != nil && ts.Hostname != "" {
@@ -107,7 +111,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp := Response{
 		Tailscale:   ts,
-		NASHostname: h.fetchNASHostname(ctx),
+		NASHostname: nasHostname,
 	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
