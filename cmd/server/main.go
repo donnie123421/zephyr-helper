@@ -19,6 +19,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/pollers"
+	"github.com/donnie123421/zephyr-helper/internal/remoteaccess"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 	"github.com/donnie123421/zephyr-helper/internal/version"
@@ -99,6 +100,8 @@ func main() {
 		slog.Info("security poller started", "interval", pollers.DefaultSecurityInterval)
 	}
 
+	remoteHandler := &remoteaccess.Handler{TN: tnClient, Log: slog.Default()}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /version", handleVersion)
@@ -106,6 +109,7 @@ func main() {
 	mux.Handle("GET /chat", auth.Require(cfg.PairingToken, chatHandler))
 	mux.Handle("GET /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleGet)))
 	mux.Handle("POST /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleSet)))
+	mux.Handle("GET /remote-access", auth.Require(cfg.PairingToken, remoteHandler))
 	eventsHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
