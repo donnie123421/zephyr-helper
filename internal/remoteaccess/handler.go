@@ -116,36 +116,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// fetchNASHostname reads /system/general for the NAS's hostname.
-// Returns empty string on any failure — this is purely a UX hint, a
-// missing hostname just means iOS falls back to the manual paste
-// flow it already supports.
+// fetchNASHostname returns the TrueNAS system hostname. In Scale
+// the hostname is a *network* setting (set per-interface alongside
+// IPv4/IPv6 config), not a system one — `system.general` carries
+// timezone/UI port/etc but not the hostname. Try the network
+// endpoint first, then fall back to system/general for older
+// builds that exposed it there.
 func (h *Handler) fetchNASHostname(ctx context.Context) string {
 	if h.TN == nil || !h.TN.Configured() {
 		return ""
 	}
-	raw, err := h.TN.GetRaw(ctx, "/system/general")
+	if name := h.tryHostname(ctx, "/network/configuration"); name != "" {
+		return name
+	}
+	if name := h.tryHostname(ctx, "/system/general"); name != "" {
+		return name
+	}
+	return ""
+}
+
+// tryHostname pulls the JSON at `path` and digs for a hostname.
+// Tolerant decode: accepts both the flat shape and the legacy
+// `{config: {hostname: ...}}` nesting some older builds use.
+func (h *Handler) tryHostname(ctx context.Context, path string) string {
+	raw, err := h.TN.GetRaw(ctx, path)
 	if err != nil {
-		h.logf("remote-access: system/general failed", "err", err)
+		h.logf("remote-access: hostname fetch failed", "path", path, "err", err)
 		return ""
 	}
-	var general struct {
+	var flat struct {
 		Hostname string `json:"hostname"`
 	}
-	if err := json.Unmarshal(raw, &general); err != nil {
-		// Older builds nest hostname under config — try again.
-		var nested struct {
-			Config struct {
-				Hostname string `json:"hostname"`
-			} `json:"config"`
-		}
-		if err := json.Unmarshal(raw, &nested); err == nil {
-			return strings.TrimSpace(nested.Config.Hostname)
-		}
-		h.logf("remote-access: decode system/general failed", "err", err)
-		return ""
+	if err := json.Unmarshal(raw, &flat); err == nil && flat.Hostname != "" {
+		return strings.TrimSpace(flat.Hostname)
 	}
-	return strings.TrimSpace(general.Hostname)
+	var nested struct {
+		Config struct {
+			Hostname string `json:"hostname"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &nested); err == nil && nested.Config.Hostname != "" {
+		return strings.TrimSpace(nested.Config.Hostname)
+	}
+	return ""
 }
 
 func (h *Handler) detectTailscale(ctx context.Context) *Tailscale {
