@@ -145,6 +145,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if len(peer.TailscaleIPs) > 0 {
 				ts.IPv4 = peer.TailscaleIPs[0]
 			}
+			// Tailnet match supplied an authoritative hostname — drop
+			// the chart-scrape hint that suggests otherwise. Leaving
+			// it in confuses iOS into showing "no hostname configured"
+			// next to a perfectly-resolved hostname.
+			ts.Hint = ""
 			matchedHostname = ts.Hostname
 		}
 
