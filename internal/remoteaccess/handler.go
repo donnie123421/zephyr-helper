@@ -62,6 +62,24 @@ type Tailscale struct {
 	// pin down the hostname — surfaced in the iOS sheet so the user
 	// knows where to look.
 	Hint string `json:"hint,omitempty"`
+	// Peers is the full list of online tailnet members the helper
+	// can see (excluding its own Self). Always populated when the
+	// helper is on the tailnet; iOS uses it to drive a picker when
+	// the auto-match is wrong or ambiguous (e.g. multiple TrueNAS-
+	// like devices on the same tailnet).
+	Peers []TailscalePeer `json:"peers,omitempty"`
+}
+
+// TailscalePeer mirrors tailnet.PeerInfo on the wire. Lives in this
+// package so the iOS decoder doesn't have to import the tailnet
+// types directly.
+type TailscalePeer struct {
+	Hostname     string   `json:"hostname,omitempty"`
+	DNSName      string   `json:"dnsName,omitempty"`
+	TailscaleIPs []string `json:"tailscaleIPs,omitempty"`
+	// LikelyMatch is true when this peer is the one the auto-match
+	// picked (or would have, if iOS supports the picker fallback).
+	LikelyMatch bool `json:"likelyMatch,omitempty"`
 }
 
 // ServeHTTP implements net/http.Handler. The endpoint is gated by
@@ -88,7 +106,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// match succeeds the response is upgraded with the
 	// authoritative MagicDNS name + 100.x.y.z IP and labelled
 	// `source: "tailnet"` so iOS treats it as high-confidence.
-	if h.Tailnet != nil && h.Tailnet.Available() && nasHostname != "" {
+	// We always also include the full peer list so iOS can fall
+	// back to a picker when our auto-match is wrong (Tailscale
+	// device named differently than the OS hostname).
+	if h.Tailnet != nil && h.Tailnet.Available() {
+		var matchedHostname string
 		if peer, ok := h.Tailnet.FindPeerByHostname(ctx, nasHostname); ok {
 			if ts == nil {
 				ts = &Tailscale{Installed: false}
@@ -101,6 +123,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ts.Source = "tailnet"
 			if len(peer.TailscaleIPs) > 0 {
 				ts.IPv4 = peer.TailscaleIPs[0]
+			}
+			matchedHostname = ts.Hostname
+		}
+
+		// Peer list is useful even when the auto-match succeeded —
+		// the iOS picker can offer alternatives if the user wants
+		// to override (e.g. they want to reach a different NAS in
+		// the same tailnet).
+		peers := h.Tailnet.ListOnlinePeers(ctx)
+		if len(peers) > 0 {
+			if ts == nil {
+				ts = &Tailscale{Installed: false}
+			}
+			for _, p := range peers {
+				wirePeer := TailscalePeer{
+					Hostname: p.HostName,
+					DNSName:  p.DNSName,
+				}
+				wirePeer.TailscaleIPs = append(wirePeer.TailscaleIPs, p.TailscaleIPs...)
+				if matchedHostname != "" && p.DNSName == matchedHostname {
+					wirePeer.LikelyMatch = true
+				}
+				ts.Peers = append(ts.Peers, wirePeer)
 			}
 		}
 	} else if ts != nil && ts.Hostname != "" {

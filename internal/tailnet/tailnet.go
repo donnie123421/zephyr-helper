@@ -22,6 +22,7 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/key"
 )
 
 // Server wraps a *tsnet.Server with the small surface the rest of
@@ -165,12 +166,18 @@ func (s *Server) Status(ctx context.Context) (SelfStatus, bool) {
 	return s.lastSelf, true
 }
 
-// FindPeerByHostname walks the tailnet peer list looking for a node
-// whose HostName or short DNS label matches `hostname` (case-
-// insensitive). Used by /remote-access to locate the user's NAS in
-// the tailnet — the helper's own Self identity is unhelpful as an
-// endpoint because the iPhone needs to reach TrueNAS at port 443,
-// which lives on the NAS host, not on the helper container.
+// FindPeerByHostname walks the tailnet peer list looking for the
+// node that best matches `hostname`. Used by /remote-access to
+// locate the user's NAS — the helper's own Self identity is
+// unhelpful as an endpoint because the iPhone needs to reach
+// TrueNAS at port 443, which lives on the NAS host, not on the
+// helper container.
+//
+// Match priority (best first):
+//  1. Exact case-insensitive match on HostName or DNS label
+//  2. Token match — `truenas` finds `truenas-scale` because it
+//     appears as a hyphen-separated token. Symmetric: a NAS named
+//     `truenas-scale` also finds a peer just named `truenas`.
 //
 // Returns (zero, false) when no match is found, the helper isn't
 // on the tailnet, or hostname is empty.
@@ -186,47 +193,126 @@ func (s *Server) FindPeerByHostname(ctx context.Context, hostname string) (PeerI
 	if err != nil || status == nil {
 		return PeerInfo{}, false
 	}
-	for _, peer := range status.Peer {
-		if peer == nil {
-			continue
-		}
-		if peerMatches(peer, target) {
-			info := PeerInfo{
-				HostName: peer.HostName,
-				DNSName:  strings.TrimSuffix(peer.DNSName, "."),
-				Online:   peer.Online,
-			}
-			for _, ip := range peer.TailscaleIPs {
-				info.TailscaleIPs = append(info.TailscaleIPs, ip.String())
-			}
-			return info, true
-		}
+	// Two-pass scan so an exact match always wins over a token match
+	// even when they appear later in the peer list.
+	if peer := scanPeers(status.Peer, target, peerMatchesExact); peer != nil {
+		return peerInfoFrom(peer), true
+	}
+	if peer := scanPeers(status.Peer, target, peerMatchesToken); peer != nil {
+		return peerInfoFrom(peer), true
 	}
 	return PeerInfo{}, false
 }
 
-// peerMatches checks both the bare HostName field and the short
-// label of the DNSName (everything before the first dot). Tailscale
-// sometimes puts the user-friendly hostname in DNSName but a
-// generated name in HostName for non-Linux peers, so checking both
-// is the safe move.
-func peerMatches(peer *ipnstate.PeerStatus, target string) bool {
+// ListOnlinePeers returns every reachable tailnet peer. Used by
+// /remote-access to give iOS a picker when auto-match is wrong or
+// ambiguous (multiple TrueNAS-like devices on the same tailnet).
+// Excludes the helper's own Self entry — that's never a useful
+// endpoint for the iPhone to talk to.
+func (s *Server) ListOnlinePeers(ctx context.Context) []PeerInfo {
+	if !s.Available() || s.local == nil {
+		return nil
+	}
+	status, err := s.local.Status(ctx)
+	if err != nil || status == nil {
+		return nil
+	}
+	var out []PeerInfo
+	for _, peer := range status.Peer {
+		if peer == nil || !peer.Online {
+			continue
+		}
+		out = append(out, peerInfoFrom(peer))
+	}
+	return out
+}
+
+func scanPeers(
+	peers map[key.NodePublic]*ipnstate.PeerStatus,
+	target string,
+	matcher func(*ipnstate.PeerStatus, string) bool,
+) *ipnstate.PeerStatus {
+	for _, peer := range peers {
+		if peer == nil {
+			continue
+		}
+		if matcher(peer, target) {
+			return peer
+		}
+	}
+	return nil
+}
+
+func peerInfoFrom(peer *ipnstate.PeerStatus) PeerInfo {
+	info := PeerInfo{
+		HostName: peer.HostName,
+		DNSName:  strings.TrimSuffix(peer.DNSName, "."),
+		Online:   peer.Online,
+	}
+	for _, ip := range peer.TailscaleIPs {
+		info.TailscaleIPs = append(info.TailscaleIPs, ip.String())
+	}
+	return info
+}
+
+// peerMatchesExact wins over peerMatchesToken — exact hostname
+// equality is always more confident than a token-level match.
+func peerMatchesExact(peer *ipnstate.PeerStatus, target string) bool {
 	if peer == nil {
 		return false
 	}
 	if strings.EqualFold(peer.HostName, target) {
 		return true
 	}
-	if peer.DNSName != "" {
-		label := peer.DNSName
-		if dot := strings.IndexByte(label, '.'); dot > 0 {
-			label = label[:dot]
-		}
-		if strings.EqualFold(label, target) {
-			return true
+	return strings.EqualFold(dnsLabel(peer.DNSName), target)
+}
+
+// peerMatchesToken catches the common case where a Tailscale device
+// is named differently from its OS hostname — e.g. OS reports
+// `truenas` but the tailnet device is `truenas-scale` (because the
+// user customised it or Tailscale auto-uniqued a duplicate).
+//
+// We tokenize both sides on hyphen / underscore / dot and check
+// for any token-equal pair. Symmetry handles both directions:
+// `truenas` matches `truenas-scale` AND a NAS reporting
+// `truenas-scale` matches a peer simply named `truenas`.
+func peerMatchesToken(peer *ipnstate.PeerStatus, target string) bool {
+	if peer == nil {
+		return false
+	}
+	targetTokens := tokenize(target)
+	if len(targetTokens) == 0 {
+		return false
+	}
+	candidates := []string{peer.HostName, dnsLabel(peer.DNSName)}
+	for _, c := range candidates {
+		ct := tokenize(strings.ToLower(c))
+		for _, t := range targetTokens {
+			for _, x := range ct {
+				if t == x && t != "" {
+					return true
+				}
+			}
 		}
 	}
 	return false
+}
+
+func tokenize(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' '
+	})
+}
+
+func dnsLabel(dns string) string {
+	if dns == "" {
+		return ""
+	}
+	label := dns
+	if dot := strings.IndexByte(label, '.'); dot > 0 {
+		label = label[:dot]
+	}
+	return label
 }
 
 func selfFromStatus(status *ipnstate.Status) SelfStatus {
