@@ -44,6 +44,27 @@ type Response struct {
 	// `<nasHostname>.<tailnet>.ts.net` as a prefill candidate even
 	// when the chart values don't expose anything Tailscale-specific.
 	NASHostname string `json:"nasHostname,omitempty"`
+	// Helper carries the helper container's *own* tailnet identity
+	// (separate from `tailscale` which describes the NAS peer). When
+	// populated, iOS can route helper API traffic over the tailnet
+	// directly to the helper rather than going via the NAS host's
+	// port mapping — eliminates the 30080 port-forward requirement
+	// for tailnet-only setups and gives the helper its own ACL
+	// surface.
+	Helper *Helper `json:"helper,omitempty"`
+}
+
+// Helper carries the helper container's tailnet membership info.
+// Distinct from the Tailscale block (which is the NAS peer) — this
+// is the tsnet Self identity, only useful when the helper joined
+// the user's tailnet via TS_AUTHKEY.
+type Helper struct {
+	TailnetHostname string `json:"tailnetHostname,omitempty"` // "zephyr-helper.tail-scale.ts.net"
+	TailnetIPv4     string `json:"tailnetIPv4,omitempty"`     // 100.x.y.z
+	// Port the helper listens on inside its container. Always 8080
+	// — exposed here so iOS doesn't have to hardcode it and can
+	// pick up future port changes without an app update.
+	Port int `json:"port,omitempty"`
 }
 
 // Tailscale carries everything the iOS prefill flow needs about the
@@ -157,8 +178,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp := Response{
 		Tailscale:   ts,
 		NASHostname: nasHostname,
+		Helper:      h.helperIdentity(ctx),
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// helperIdentity returns the helper's own tailnet identity when it
+// joined the tailnet via tsnet. Used by iOS to route helper API
+// traffic directly over the tailnet without going through the NAS
+// host's port mapping. Returns nil when the helper isn't on the
+// tailnet — iOS falls back to the existing port-mapped path.
+func (h *Handler) helperIdentity(ctx context.Context) *Helper {
+	if h.Tailnet == nil || !h.Tailnet.Available() {
+		return nil
+	}
+	self, ok := h.Tailnet.Status(ctx)
+	if !ok || self.HostName == "" {
+		return nil
+	}
+	hostname := strings.TrimSuffix(self.DNSName, ".")
+	if hostname == "" {
+		hostname = self.HostName
+	}
+	out := &Helper{
+		TailnetHostname: hostname,
+		Port:            8080,
+	}
+	if len(self.TailscaleIPs) > 0 {
+		out.TailnetIPv4 = self.TailscaleIPs[0]
+	}
+	return out
 }
 
 // fetchNASHostname returns the TrueNAS system hostname. In Scale
