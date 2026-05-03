@@ -1,131 +1,95 @@
-// Package truenas is a tiny REST client for TrueNAS Scale's /api/v2.0
-// endpoints. It's deliberately minimal — no generic "do request" surface,
-// just the handful of calls the tool registry needs.
+// Package truenas talks to a single TrueNAS host over JSON-RPC 2.0
+// (WebSocket) to /api/current. The package was REST-only until this
+// migration; the GetRaw / PostRaw signatures are kept so every
+// existing call site (pollers, tools, remoteaccess handler) keeps
+// working — only the underlying transport changed.
 //
-// TrueNAS typically uses self-signed certificates, so the client skips TLS
-// verification by default (matching the iOS app's behavior).
+// Why the migration: TrueNAS Scale 26.04 removes the REST API
+// entirely. The deprecation alert started firing weeks before the
+// helper got close to the deadline; this rewrite gets us off the
+// retired surface.
 package truenas
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
+	"log/slog"
 	"strings"
-	"time"
 )
 
-// Client talks to a single TrueNAS host's REST API.
+// Client talks to a single TrueNAS host's JSON-RPC API. Public API
+// (GetRaw/PostRaw) is unchanged from the REST era so existing
+// callers don't need to know about the transport switch.
 type Client struct {
+	rpc    *rpcClient
+	apiKey string
 	base   string
-	token  string
-	http   *http.Client
 }
 
 // NewClient builds a client against the given base URL (e.g.
-// "https://host.docker.internal"). The "/api/v2.0" prefix is appended
-// automatically. The API key is sent as a Bearer token on every request.
+// "https://host.docker.internal"). The /api/v2.0 path that REST
+// used is dropped; we always talk JSON-RPC at /api/current. The API
+// key is sent via auth.login_with_api_key on first connect.
 func NewClient(baseURL, apiKey string) (*Client, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, errors.New("truenas: empty base url")
 	}
-	if _, err := url.Parse(baseURL); err != nil {
-		return nil, fmt.Errorf("truenas: invalid base url: %w", err)
+	wsURL, err := rpcURLFromBase(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("truenas: derive ws url: %w", err)
 	}
+	rpc := newRPCClient(wsURL, apiKey, slog.Default())
 	return &Client{
-		base:  strings.TrimRight(baseURL, "/"),
-		token: apiKey,
-		http: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // TrueNAS self-signed
-			},
-		},
+		rpc:    rpc,
+		apiKey: apiKey,
+		base:   strings.TrimRight(baseURL, "/"),
 	}, nil
 }
 
-// Configured reports whether the client has non-empty base URL + API key.
-// Callers use this to decide whether to register TrueNAS-backed tools.
+// Configured reports whether the client has non-empty base URL + API
+// key. Callers use this to decide whether to register TrueNAS-backed
+// tools / pollers.
 func (c *Client) Configured() bool {
-	return c != nil && c.base != "" && c.token != ""
+	return c != nil && c.base != "" && c.apiKey != ""
 }
 
-// getJSON performs a GET /api/v2.0/<path> and decodes the response into v.
-// Paths must start with a leading slash.
-func (c *Client) getJSON(ctx context.Context, path string, v any) error {
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
+// Close releases the underlying WebSocket connection. Safe to call
+// multiple times. Helper main.go defers this on shutdown.
+func (c *Client) Close() {
+	if c == nil || c.rpc == nil {
+		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/v2.0"+path, nil)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("truenas: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20)) // 4 MiB cap
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("truenas %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	if v == nil {
-		return nil
-	}
-	if err := json.Unmarshal(body, v); err != nil {
-		return fmt.Errorf("decode %s: %w", path, err)
-	}
-	return nil
+	c.rpc.Close()
 }
 
-// GetRaw returns the raw JSON bytes of a GET call. Useful for tool handlers
-// that just want to pass the response straight back to the LLM without
-// re-marshaling through a typed struct.
+// GetRaw replaces a REST GET. Routes through the mapper, hits
+// JSON-RPC, returns the raw result bytes — same shape callers got
+// back from the old HTTP path so JSON unmarshal sites don't change.
 func (c *Client) GetRaw(ctx context.Context, path string) (json.RawMessage, error) {
-	var raw json.RawMessage
-	if err := c.getJSON(ctx, path, &raw); err != nil {
-		return nil, err
+	m, err := mapREST("GET", path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("truenas GET %s: %w", path, err)
 	}
-	return raw, nil
+	result, err := c.rpc.Call(ctx, m.method, m.params)
+	if err != nil {
+		return nil, fmt.Errorf("truenas %s: %w", m.method, err)
+	}
+	return result, nil
 }
 
-// PostRaw performs a POST against /api/v2.0/<path> with the given JSON
-// body and returns the raw response. TrueNAS's filterable query
-// endpoints (e.g. /audit/query) require POST with a body of the form
-// `{"query-filters": [...], "query-options": {...}}`.
+// PostRaw replaces a REST POST. The body is forwarded as the first
+// positional JSON-RPC param after any /id/X segment in the path
+// (none of the helper's POST endpoints use /id/X today).
 func (c *Client) PostRaw(ctx context.Context, path string, body any) (json.RawMessage, error) {
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-	bodyBytes, err := json.Marshal(body)
+	m, err := mapREST("POST", path, body)
 	if err != nil {
-		return nil, fmt.Errorf("encode body: %w", err)
+		return nil, fmt.Errorf("truenas POST %s: %w", path, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/v2.0"+path, strings.NewReader(string(bodyBytes)))
+	result, err := c.rpc.Call(ctx, m.method, m.params)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("truenas %s: %w", m.method, err)
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("truenas: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("truenas %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
-	}
-	return json.RawMessage(respBody), nil
+	return result, nil
 }

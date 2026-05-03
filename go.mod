@@ -2,7 +2,7 @@ module github.com/donnie123421/zephyr-helper
 
 go 1.26.1
 
-require github.com/coder/websocket v1.8.12
+require github.com/coder/websocket v1.8.14
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect

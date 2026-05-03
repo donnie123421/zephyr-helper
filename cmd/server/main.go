@@ -49,6 +49,7 @@ func main() {
 		slog.Error("truenas client", "err", err)
 		os.Exit(1)
 	}
+	defer tnClient.Close()
 	toolRegistry := tools.New(tnClient)
 	if toolRegistry.Empty() {
 		slog.Warn("tools: registry empty — TRUENAS_URL or TRUENAS_API_KEY missing; chat will run without NAS tools")
