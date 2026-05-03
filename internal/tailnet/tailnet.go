@@ -100,12 +100,22 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	s.srv = &tsnet.Server{
-		Hostname:     s.hostname,
-		Dir:          s.stateDir,
-		AuthKey:      s.authKey,
-		Ephemeral:    false,
-		Logf:         s.tsnetLogf,
-		UserLogf:     s.tsnetLogf,
+		Hostname: s.hostname,
+		Dir:      s.stateDir,
+		AuthKey:  s.authKey,
+		// Mark the node ephemeral so Tailscale auto-removes it from
+		// the admin console ~5 min after the container goes away.
+		// The helper has no persistent state directory by default
+		// (TS_STATE_DIR=/tmp/tsnet) so every container restart
+		// registers a fresh node anyway — without ephemeral the
+		// admin console fills up with zephyr-helper-1, zephyr-helper-2,
+		// etc. as the user redeploys. Operators who *do* mount a
+		// persistent volume keep getting the same identity back
+		// because the node key on disk wins; ephemeral only applies
+		// to truly-offline nodes.
+		Ephemeral: true,
+		Logf:      s.tsnetLogf,
+		UserLogf:  s.tsnetLogf,
 	}
 
 	// Up returns once the node has registered. The local client we
