@@ -156,45 +156,47 @@ func mappedQuery(method string, idValue any, query string) mapped {
 }
 
 // bareParams builds the params for a bare RPC method that accepts
-// optional query-options. Most bare methods take {} or no args; the
-// /core/get_jobs?limit=100 case proves we sometimes need to forward
-// limit/offset.
+// optional query-options. TrueNAS query-style methods (`core.get_jobs`,
+// `alert.list`, etc.) take exactly two positional args when any are
+// supplied — `(filters, options)` — even when one side is empty.
+// `core.get_jobs?limit=100` rejected `[options]` with -32602 because
+// it expected `[[], options]`. We always emit both when *either*
+// side is non-empty so TrueNAS sees the shape it expects.
+//
+// Returns nil when the call has no query string at all — most bare
+// methods (system.info, alert.list with no filter, smart.test.results)
+// take no arguments and choke on a spurious empty filter list.
 func bareParams(query string) []any {
 	options := parseOptions(query)
 	filters := parseFilters(query)
 	if len(filters) == 0 && len(options) == 0 {
 		return nil
 	}
-	if len(options) == 0 {
-		return []any{filters}
+	if filters == nil {
+		filters = []any{}
 	}
-	if len(filters) == 0 {
-		return []any{options}
+	if options == nil {
+		options = map[string]any{}
 	}
 	return []any{filters, options}
 }
 
-// auditQueryParams unpacks the legacy REST audit.query body shape
-// into the two positional args TrueNAS's JSON-RPC method expects.
-// Falls back gracefully when callers pre-shaped the body as
-// [filters, options] (rare; documents the contract for callers
-// migrated post-rewrite).
+// auditQueryParams forwards the body to TrueNAS's audit.query as a
+// single positional dict — that's the shape the JSON-RPC method
+// expects (verified empirically: positional [filters, options]
+// returns -32602 Invalid params, while [body] works).
+//
+// The helper's pollers/security.go already builds the right dict
+// shape: {query-filters: [...], query-options: {...}}. We just
+// wrap it in a one-element params array.
 func auditQueryParams(body any) []any {
-	if dict, ok := body.(map[string]any); ok {
-		filters := dict["query-filters"]
-		options := dict["query-options"]
-		if filters == nil {
-			filters = []any{}
-		}
-		if options == nil {
-			options = map[string]any{}
-		}
-		return []any{filters, options}
+	if body == nil {
+		return []any{map[string]any{
+			"query-filters": []any{},
+			"query-options": map[string]any{},
+		}}
 	}
-	if arr, ok := body.([]any); ok && len(arr) == 2 {
-		return arr
-	}
-	return []any{[]any{}, map[string]any{}}
+	return []any{body}
 }
 
 // actionParams packs (id?, body?) into positional JSON-RPC params.
