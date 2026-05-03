@@ -13,7 +13,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates \
-    && adduser -D -u 10001 zephyr
+    && adduser -D -u 10001 zephyr \
+    # Pre-create the tsnet state dir owned by zephyr so the named
+    # docker volume mounted at /tmp/tsnet inherits this ownership
+    # on first mount. Without it, the volume comes up owned by
+    # root and tsnet can't write its node key — registration silently
+    # fails and the helper never joins the tailnet.
+    && mkdir -p /tmp/tsnet \
+    && chown -R zephyr:zephyr /tmp/tsnet
 USER zephyr
 COPY --from=builder /out/zephyr-helper /usr/local/bin/zephyr-helper
 EXPOSE 8080
