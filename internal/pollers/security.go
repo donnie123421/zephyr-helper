@@ -551,15 +551,25 @@ func mustCIDR(s string) *net.IPNet {
 }
 
 // isAuditUnavailable returns true when the error from /audit/query
-// indicates the endpoint isn't usable from our request shape, which is
-// a "client/server mismatch" rather than "audit is broken." Covers:
+// indicates the endpoint isn't usable from our request shape, which
+// is a "client/server mismatch" rather than "audit is broken." We
+// match both the legacy REST status codes and the JSON-RPC error
+// codes the new transport surfaces:
 //
-//   - 404 / Not Found: pre-25.04 server with no audit endpoint, or
-//     TrueNAS 26 where REST has been removed entirely
-//   - 405 Method Not Allowed: server expects a different HTTP verb
-//   - 401 / 403: API key lacks the audit role (silent rather than
-//     painting the feed red on every poll)
-//   - 422: request body shape doesn't match what the server expects
+//   REST era:
+//   - 404 / Not Found / Method Not Allowed: pre-25.04 or TrueNAS 26
+//   - 401 / 403: API key lacks the audit role
+//   - 422: body shape mismatch
+//
+//   JSON-RPC era (post REST→RPC migration):
+//   - -32601 (method not found): pre-25.04 server doesn't have
+//     audit.query; same effective state as the old 404
+//   - -32602 (invalid params): body shape we send doesn't match
+//     what TrueNAS expects for this version; same as 422
+//   - -32001 (method call error): the method ran but TrueNAS
+//     errored internally — most often "no audit role on this API
+//     key" or "audit not enabled." Painting the feed red on every
+//     poll is exactly what users were reporting; swallow silently.
 //
 // 5xx errors and network failures are NOT swallowed here — those go
 // through the consecutive-failure counter and surface as audit-down
@@ -570,9 +580,15 @@ func isAuditUnavailable(err error) bool {
 	}
 	msg := err.Error()
 	for _, pat := range []string{
+		// REST status codes (kept so an older helper-on-old-NAS
+		// still matches if anyone runs that combo).
 		"truenas 401", "truenas 403", "truenas 404",
 		"truenas 405", "truenas 422",
 		"Not Found", "Method Not Allowed", "Unprocessable",
+		// JSON-RPC error codes — the live transport.
+		"rpc error -32601",
+		"rpc error -32602",
+		"rpc error -32001",
 	} {
 		if strings.Contains(msg, pat) {
 			return true
