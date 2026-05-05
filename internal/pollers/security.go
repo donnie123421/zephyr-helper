@@ -89,11 +89,15 @@ func (s *Security) Run(ctx context.Context) {
 }
 
 func (s *Security) poll(ctx context.Context) {
-	// /audit/query is a POST endpoint that takes a query-filter array
-	// and an options map. limit=200 covers ~hours of activity on a
-	// normal home NAS even when the audit log is chatty (smb mounts,
-	// snapshot tasks, etc.).
+	// audit.query in 25.04+ takes a `services` field that scopes
+	// which audit backends to read from. MIDDLEWARE catches the
+	// system-level events we care about (login, API key use, role
+	// changes, share mount/unmount). Without an explicit services
+	// list TrueNAS errors with -32001 'Method call error' on
+	// JSON-RPC. The legacy REST shape happened to default this on
+	// the server side; the JSON-RPC method requires it explicitly.
 	body := map[string]any{
+		"services": []string{"MIDDLEWARE"},
 		"query-filters": []any{},
 		"query-options": map[string]any{
 			"limit": 200,
