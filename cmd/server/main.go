@@ -19,6 +19,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/pollers"
+	"github.com/donnie123421/zephyr-helper/internal/push"
 	"github.com/donnie123421/zephyr-helper/internal/remoteaccess"
 	"github.com/donnie123421/zephyr-helper/internal/tailnet"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
@@ -100,6 +101,23 @@ func main() {
 		securityPoller := pollers.NewSecurity(tnClient, eventsStore, pollers.DefaultSecurityInterval)
 		go securityPoller.Run(ctx)
 		slog.Info("security poller started", "interval", pollers.DefaultSecurityInterval)
+	}
+
+	// Push notifier: subscribes to eventsStore and POSTs critical
+	// events to the zephyr-push-relay Cloudflare Worker, which proxies
+	// to OneSignal → APNs → the paired iPhone. No-op when any of the
+	// three PUSH_* env vars is missing (e.g. iOS install where the
+	// user denied notification permission).
+	pushNotifier := push.New(
+		eventsStore,
+		cfg.PushRelayURL,
+		cfg.PushSubscriptionID,
+		cfg.PushInstallToken,
+		slog.Default(),
+	)
+	go pushNotifier.Run(ctx)
+	if cfg.PushRelayURL != "" {
+		slog.Info("push notifier started", "relay", cfg.PushRelayURL)
 	}
 
 	// Optional: join the user's tailnet so /remote-access can resolve

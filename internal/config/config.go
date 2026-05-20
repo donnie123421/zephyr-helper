@@ -39,20 +39,42 @@ type Config struct {
 	// admin console's device list. Defaults to /tmp/tsnet so it
 	// survives `tailscale up` restarts within a container lifetime.
 	TSStateDir string
+
+	// PushRelayURL is the base URL of the zephyr-push-relay
+	// Cloudflare Worker (e.g. "https://push.zephyrtech.com.au").
+	// When non-empty alongside PushSubscriptionID + PushInstallToken,
+	// the helper starts a goroutine that forwards push-worthy events
+	// (critical alerts, pool degradations, security events) to the
+	// relay, which proxies them to OneSignal → APNs → the paired
+	// iPhone. Empty disables push entirely; the helper still surfaces
+	// events in-app via the existing /events stream.
+	PushRelayURL string
+	// PushSubscriptionID is the OneSignal subscription id the iOS
+	// app registered with the relay at pair time. The relay uses it
+	// to target the right device.
+	PushSubscriptionID string
+	// PushInstallToken is a 32-byte secret shared with the relay's
+	// allowlist for this subscription. The relay rejects /push calls
+	// whose token doesn't match the one iOS registered — so a leaked
+	// helper from another user can't push to this device.
+	PushInstallToken string
 }
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Addr:          envOr("ZEPHYR_ADDR", ":8080"),
-		PairingToken:  os.Getenv("PAIRING_TOKEN"),
-		OllamaURL:     envOr("OLLAMA_URL", "http://ollama:11434"),
-		OllamaModel:   envOr("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
-		TrueNASURL:    os.Getenv("TRUENAS_URL"),
-		TrueNASAPIKey: os.Getenv("TRUENAS_API_KEY"),
-		EventsDBPath:  envOr("EVENTS_DB_PATH", "/tmp/events.db"),
-		TSAuthKey:     os.Getenv("TS_AUTHKEY"),
-		TSHostname:    envOr("TS_HOSTNAME", "zephyr-helper"),
-		TSStateDir:    envOr("TS_STATE_DIR", "/tmp/tsnet"),
+		Addr:               envOr("ZEPHYR_ADDR", ":8080"),
+		PairingToken:       os.Getenv("PAIRING_TOKEN"),
+		OllamaURL:          envOr("OLLAMA_URL", "http://ollama:11434"),
+		OllamaModel:        envOr("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+		TrueNASURL:         os.Getenv("TRUENAS_URL"),
+		TrueNASAPIKey:      os.Getenv("TRUENAS_API_KEY"),
+		EventsDBPath:       envOr("EVENTS_DB_PATH", "/tmp/events.db"),
+		TSAuthKey:          os.Getenv("TS_AUTHKEY"),
+		TSHostname:         envOr("TS_HOSTNAME", "zephyr-helper"),
+		TSStateDir:         envOr("TS_STATE_DIR", "/tmp/tsnet"),
+		PushRelayURL:       os.Getenv("PUSH_RELAY_URL"),
+		PushSubscriptionID: os.Getenv("PUSH_SUBSCRIPTION_ID"),
+		PushInstallToken:   os.Getenv("PUSH_INSTALL_TOKEN"),
 	}
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,

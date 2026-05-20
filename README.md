@@ -60,6 +60,9 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | `TRUENAS_URL` | — | TrueNAS host (used from Phase B onward) |
 | `TRUENAS_API_KEY` | — | TrueNAS API key (used from Phase B onward) |
 | `EVENTS_DB_PATH` | `/tmp/events.db` | SQLite path for the event store (v1.1). Will move to a bind-mounted `/data/events.db` once the pollers ship. |
+| `PUSH_RELAY_URL` | — | Base URL of the zephyr-push-relay Worker. Set by the iOS installer. Empty = push disabled. |
+| `PUSH_SUBSCRIPTION_ID` | — | OneSignal subscription id for the paired iPhone. Set by the iOS installer. |
+| `PUSH_INSTALL_TOKEN` | — | Per-device secret the relay's allowlist validates. Set by the iOS installer. |
 
 ### Endpoints
 
