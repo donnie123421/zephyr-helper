@@ -40,6 +40,60 @@ func TestJobToEventSuccess(t *testing.T) {
 	}
 }
 
+func TestJobToEventSuccessFiltering(t *testing.T) {
+	cases := []struct {
+		method  string
+		surface bool
+	}{
+		// Routine internal / boot successes — dropped.
+		{"smb.configure", false},
+		{"smb.synchronize_passdb", false},
+		{"service.control", false},
+		{"directoryservices.setup", false},
+		{"initshutdownscript.execute_init_tasks", false},
+		{"pool.dataset.unlock", false},
+		{"pool.scrub_impl", false}, // private impl never surfaces
+		{"core.bulk", false},
+		// Correlator-fed — kept so the parent narrative row can form.
+		{"pool.scrub", true},
+		{"pool.snapshottask.run", true},
+		{"zettarepl.replicate", true},
+		// User-meaningful standalone operations — kept.
+		{"update.run", true},
+		{"replication.run", true},
+		{"cloudsync.sync", true},
+		{"pool.create", true},
+	}
+	for _, tc := range cases {
+		j := map[string]any{
+			"id":            float64(1),
+			"method":        tc.method,
+			"state":         "SUCCESS",
+			"time_finished": map[string]any{"$date": float64(1714000000000)},
+		}
+		if _, ok := jobToEvent(j); ok != tc.surface {
+			t.Errorf("jobToEvent(SUCCESS %s) surfaced=%v, want %v", tc.method, ok, tc.surface)
+		}
+	}
+}
+
+// A failure surfaces no matter how routine the method is — the success filter
+// must not swallow actionable failures.
+func TestJobToEventFailureAlwaysSurfaces(t *testing.T) {
+	for _, method := range []string{"smb.configure", "service.control", "pool.dataset.unlock"} {
+		j := map[string]any{
+			"id":            float64(1),
+			"method":        method,
+			"state":         "FAILED",
+			"error":         "boom",
+			"time_finished": map[string]any{"$date": float64(1714000000000)},
+		}
+		if _, ok := jobToEvent(j); !ok {
+			t.Errorf("jobToEvent(FAILED %s) should surface", method)
+		}
+	}
+}
+
 func TestJobToEventFailedIncludesError(t *testing.T) {
 	raw := `{
 		"id": 456,
@@ -70,9 +124,9 @@ func TestJobToEventFailedIncludesError(t *testing.T) {
 
 func TestJobToEventAborted(t *testing.T) {
 	j := map[string]any{
-		"id":       float64(789),
-		"method":   "cloud_sync.sync",
-		"state":    "ABORTED",
+		"id":            float64(789),
+		"method":        "cloud_sync.sync",
+		"state":         "ABORTED",
 		"time_finished": map[string]any{"$date": float64(1714000000000)},
 	}
 	ev, ok := jobToEvent(j)

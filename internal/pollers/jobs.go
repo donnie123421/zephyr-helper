@@ -138,51 +138,57 @@ func isTerminalJobState(state string) bool {
 	return false
 }
 
-// jobMethodIsNoise filters scheduled/infrastructure methods that finish
-// successfully in the background and don't represent anything the user
-// cares to see in a feed. Failures for these still surface because a
-// broken cache refresh or failed auto-update is actionable.
+// jobSuccessIsSurfaceworthy reports whether a SUCCESSFUL job is worth a feed
+// row. TrueNAS fires dozens of internal/config/boot jobs at every startup
+// (smb.configure, service.control, directoryservices.setup, init scripts,
+// dataset unlocks, …) that all succeed and mean nothing to a user. Denylisting
+// them is a losing game against the sheer variety of middleware methods, so we
+// invert it: surface a success only when it is either
 //
-// Any `*_impl` method is dropped because TrueNAS emits both the public
-// method and its private implementation as separate jobs — ingesting
-// both double-counts the same work.
-func jobMethodIsNoise(method string) bool {
-	if strings.HasSuffix(method, "_impl") {
+//	(a) consumed by a correlator, which rolls the raw job into a richer parent
+//	    row (scrub completion, snapshot/replication rollups, resilver) and hides
+//	    the child — drop it here and the correlator never sees its child; or
+//	(b) a user-meaningful standalone operation worth an archive entry.
+//
+// FAILED/ABORTED jobs never reach here — the caller surfaces every non-success
+// terminal state regardless of method, because a failure is always actionable.
+func jobSuccessIsSurfaceworthy(method string) bool {
+	// TrueNAS emits both the public method and its private *_impl as separate
+	// jobs, and bulk fan-out jobs alongside their work items — both
+	// double-count, so never surface them (checked first so e.g.
+	// zettarepl.*_impl doesn't slip through the prefix match below).
+	if strings.HasSuffix(method, "_impl") ||
+		strings.HasSuffix(method, ".bulk") || strings.Contains(method, ".bulk_") {
+		return false
+	}
+	// (a) Correlator-consumed methods. These must keep flowing or the scrub /
+	// snapshot / disk correlators never see their child event and can't emit
+	// the narrative parent. Keep in sync with internal/events/correlators/*.
+	if method == "pool.scrub" ||
+		strings.HasPrefix(method, "pool.snapshottask.") ||
+		strings.HasPrefix(method, "zettarepl.") ||
+		strings.Contains(method, "resilver") {
 		return true
 	}
-	// Bulk fan-out jobs are always noise — the individual work items
-	// that matter surface as their own rows (e.g. core.bulk runs a
-	// batch of sibling jobs that each get their own terminal entry).
-	if strings.HasSuffix(method, ".bulk") || strings.Contains(method, ".bulk_") {
-		return true
-	}
+	// (b) Meaningful standalone operations with no correlator of their own:
+	// system updates installed, backup / replication / sync tasks completing,
+	// and pool lifecycle milestones.
 	switch method {
-	case
-		"directoryservices.cache_refresh",
-		"update.check_available",
-		"update.download",
-		"app.pull_images",
-		"app.redeploy",
-		"app.start",
-		"app.stop",
-		"app.upgrade",
-		"app.metadata.generate",
-		"catalog.sync",
-		"certificate.renew_certs",
-		"pool.dataset.sync_db_keys",
-		"zfs.dataset.bulk_process",
-		"core.get_jobs":
+	case "update.run", "update.update",
+		"replication.run", "replication.run_onetime",
+		"cloudsync.sync", "cloud_backup.sync", "rsynctask.run",
+		"pool.create", "pool.export", "pool.import_pool", "pool.expand":
 		return true
 	}
 	return false
 }
 
 // jobToEvent builds a store row from a /core/get_jobs entry in a
-// terminal state. Unknown/missing state or method → skipped. Successful
-// low-signal methods (scheduled cache refreshes, auto update downloads,
-// app lifecycle calls the UI already reflects) are also skipped —
-// failures for those methods still surface because a broken schedule
-// is something the user needs to see.
+// terminal state. Unknown/missing state or method → skipped. A SUCCESS is
+// surfaced only when jobSuccessIsSurfaceworthy allows it (correlator-fed or
+// user-meaningful) — the flood of routine internal successes TrueNAS fires at
+// boot is dropped. FAILED/ABORTED always surface: a failure is actionable
+// regardless of method.
 func jobToEvent(job map[string]any) (events.Event, bool) {
 	method, _ := job["method"].(string)
 	state, _ := job["state"].(string)
@@ -190,7 +196,7 @@ func jobToEvent(job map[string]any) (events.Event, bool) {
 	if method == "" || !isTerminalJobState(upper) {
 		return events.Event{}, false
 	}
-	if upper == "SUCCESS" && jobMethodIsNoise(method) {
+	if upper == "SUCCESS" && !jobSuccessIsSurfaceworthy(method) {
 		return events.Event{}, false
 	}
 
