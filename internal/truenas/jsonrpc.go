@@ -253,13 +253,38 @@ func (c *rpcClient) authenticate(ctx context.Context, conn *websocket.Conn) erro
 		if resp.Error != nil {
 			return resp.Error
 		}
-		// Result should be a bool; treat false as auth failure.
-		var ok bool
-		if err := json.Unmarshal(resp.Result, &ok); err == nil && !ok {
-			return errors.New("auth.login_with_api_key returned false")
+		if !loginResultOK(resp.Result) {
+			return errors.New("auth.login_with_api_key: authentication failed")
 		}
 		return nil
 	}
+}
+
+// loginResultOK reports whether an auth.login_* result indicates success.
+// TrueNAS changed the result shape across versions: pre-25.10.3 returned a
+// bare bool, while 25.10.3+ (and 26) return an auth.login_ex-style object
+// {response_type: "SUCCESS"|"AUTH_ERR"|...}. Accept either positive shape and
+// treat everything else — including an unparseable or unknown result — as a
+// failure, so an expired or invalid key fails loudly instead of silently
+// being treated as authenticated (the old bool-only cast returned success for
+// any non-bool result, i.e. every 25.10.3+ response). Mirrors the iOS
+// WebSocketClient.authenticate logic.
+func loginResultOK(raw json.RawMessage) bool {
+	// Object shape: {response_type: "SUCCESS", ...}. Checked first because
+	// unmarshalling an object into a bool fails, but unmarshalling a bare
+	// bool into this struct also fails — so the two checks don't overlap.
+	var obj struct {
+		ResponseType string `json:"response_type"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.ResponseType != "" {
+		return strings.EqualFold(obj.ResponseType, "SUCCESS")
+	}
+	// Bare bool shape (pre-25.10.3).
+	var ok bool
+	if err := json.Unmarshal(raw, &ok); err == nil {
+		return ok
+	}
+	return false
 }
 
 // readLoop owns the connection's read side. Routes every response

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
@@ -402,31 +403,49 @@ func listSnapshots(tn *truenas.Client) Tool {
 				}
 			}
 
-			// TrueNAS /zfs/snapshot supports queryset filters + ordering +
-			// limit. Newest-first ordering matters because without it the
-			// middleware returns the oldest 50, which is the opposite of
-			// what a user wants.
-			params := url.Values{}
-			params.Set("limit", "50")
-			params.Set("order_by", "-created")
+			// pool.snapshot.query — zfs.snapshot.query was removed in TrueNAS
+			// 25.10+ (the REST /zfs/snapshot path that mapped to it is gone in
+			// 26). Newest-first matters because a bare limit returns the OLDEST
+			// rows, but pool.snapshot.query exposes the creation time only as
+			// the nested `properties.creation` property, not a top-level
+			// column. Order server-side by that nested rawvalue (epoch seconds
+			// — a fixed-width string, so lexical order matches numeric) so the
+			// transfer stays bounded to 50 rows. Some builds reject ordering by
+			// a nested key; fall back to an unordered page, and sort
+			// client-side either way so the output is always newest-first.
+			q := url.Values{}
+			q.Set("limit", "50")
 			if a.Dataset != "" {
-				params.Set("filters", fmt.Sprintf(`[["dataset","=","%s"]]`, a.Dataset))
+				q.Set("filters", fmt.Sprintf(`[["dataset","=","%s"]]`, a.Dataset))
 			}
-			path := "/zfs/snapshot?" + params.Encode()
+			unordered := q.Encode()
+			q.Set("order_by", "-properties.creation.rawvalue")
+			ordered := q.Encode()
 
-			raw, err := tn.GetRaw(ctx, path)
+			raw, err := tn.GetRaw(ctx, "/pool/snapshot?"+ordered)
 			if err != nil {
-				return "", err
+				if raw, err = tn.GetRaw(ctx, "/pool/snapshot?"+unordered); err != nil {
+					return "", err
+				}
 			}
 			var snaps []map[string]any
 			if err := json.Unmarshal(raw, &snaps); err != nil {
 				return "", fmt.Errorf("decode snapshots: %w", err)
 			}
 
+			// Guarantee newest-first regardless of whether the server honoured
+			// the nested order_by.
+			sort.SliceStable(snaps, func(i, j int) bool {
+				return snapCreation(snaps[i]) > snapCreation(snaps[j])
+			})
+
 			out := make([]map[string]any, 0, len(snaps))
 			for _, s := range snaps {
 				entry := map[string]any{}
-				copyFields(entry, s, "name", "dataset", "snapshot_name", "created")
+				copyFields(entry, s, "name", "dataset", "snapshot_name")
+				if c := snapCreation(s); c > 0 {
+					entry["created"] = c
+				}
 				if props, ok := s["properties"].(map[string]any); ok {
 					entry["used_bytes"] = zfsPropBytes(props["used"])
 					entry["referenced_bytes"] = zfsPropBytes(props["referenced"])
@@ -566,6 +585,19 @@ func toJSON(v any) (string, error) {
 		return "", fmt.Errorf("marshal: %w", err)
 	}
 	return string(b), nil
+}
+
+// snapCreation pulls a snapshot's creation time (epoch seconds) out of the
+// pool.snapshot.query `properties.creation` object. Returns 0 when absent so
+// callers treat "unknown" as oldest. Reuses zfsPropBytes's tolerant number
+// extraction — creation's rawvalue is an epoch-seconds string, and `parsed`
+// is the numeric form on builds that include it.
+func snapCreation(s map[string]any) int64 {
+	props, ok := s["properties"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	return zfsPropBytes(props["creation"])
 }
 
 // zfsPropBytes extracts a byte count from a ZFS property field. Modern

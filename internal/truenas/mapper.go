@@ -45,14 +45,14 @@ type override struct {
 // helper's actual REST surface.
 var overrides = map[string]override{
 	// Bare GETs that are NOT .query
-	"/system/info":         {"system.info", kindBare},
-	"/alert/list":          {"alert.list", kindBare},
-	"/smart/test/results":  {"smart.test.results", kindBare},
-	"/core/get_jobs":       {"core.get_jobs", kindBare},
+	"/system/info":        {"system.info", kindBare},
+	"/alert/list":         {"alert.list", kindBare},
+	"/smart/test/results": {"smart.test.results", kindBare},
+	"/core/get_jobs":      {"core.get_jobs", kindBare},
 
 	// Config singletons
-	"/system/general":         {"system.general", kindConfig},
-	"/network/configuration":  {"network.configuration", kindConfig},
+	"/system/general":        {"system.general", kindConfig},
+	"/network/configuration": {"network.configuration", kindConfig},
 
 	// Action POSTs
 	"/audit/query": {"audit.query", kindAction},
@@ -151,6 +151,15 @@ func mappedQuery(method string, idValue any, query string) mapped {
 	}
 	if len(options) == 0 {
 		return mapped{method: method, params: []any{filters}}
+	}
+	// Options present but no filters: TrueNAS expects the filters arg to be a
+	// list, not null. parseFilters returns nil when there's no `filters=`
+	// query param, so normalise to an empty list — matches the iOS adapter,
+	// which always sends `[[], options]`. Without this, a query with options
+	// but no filters (e.g. /pool/snapshot?limit=50&order_by=...) marshals to
+	// `[null, {...}]` and the middleware rejects the null filters arg.
+	if filters == nil {
+		filters = []any{}
 	}
 	return mapped{method: method, params: []any{filters, options}}
 }
