@@ -74,6 +74,37 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Retention: prune events older than the configured window, once at
+	// boot and then daily. Without this the archive grows unbounded now
+	// that the DB lives on a persistent volume.
+	if cfg.EventsRetentionDays > 0 {
+		retention := time.Duration(cfg.EventsRetentionDays) * 24 * time.Hour
+		go func() {
+			prune := func() {
+				n, err := eventsStore.Prune(ctx, time.Now().Add(-retention))
+				if err != nil {
+					slog.Warn("events prune", "err", err)
+					return
+				}
+				if n > 0 {
+					slog.Info("events pruned", "deleted", n, "retention_days", cfg.EventsRetentionDays)
+				}
+			}
+			prune()
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					prune()
+				}
+			}
+		}()
+		slog.Info("events retention active", "days", cfg.EventsRetentionDays)
+	}
+
 	// Correlators subscribe to the store and emit narrative parent rows
 	// for child events the pollers ingest. Start them before the
 	// pollers so the first poll's broadcast doesn't slip past.
@@ -103,6 +134,13 @@ func main() {
 		slog.Info("security poller started", "interval", pollers.DefaultSecurityInterval)
 	}
 
+	// Push prefs: the iOS-synced muted categories, persisted next to
+	// the events DB. Consulted by the notifier below and exposed to the
+	// app via GET/POST /push/prefs so the in-app toggles govern APNs
+	// pushes, not just local notifications.
+	pushPrefs := push.NewPrefsStore(cfg.PushPrefsPath)
+	pushPrefsHandler := &push.PrefsHandler{Store: pushPrefs}
+
 	// Push notifier: subscribes to eventsStore and POSTs critical
 	// events to the zephyr-push-relay Cloudflare Worker, which proxies
 	// to OneSignal → APNs → the paired iPhone. No-op when any of the
@@ -113,6 +151,7 @@ func main() {
 		cfg.PushRelayURL,
 		cfg.PushSubscriptionID,
 		cfg.PushInstallToken,
+		pushPrefs,
 		slog.Default(),
 	)
 	go pushNotifier.Run(ctx)
@@ -150,6 +189,9 @@ func main() {
 	mux.Handle("POST /model", auth.Require(cfg.PairingToken, http.HandlerFunc(modelsHandler.HandleSet)))
 	mux.Handle("GET /remote-access", auth.Require(cfg.PairingToken, remoteHandler))
 	eventsHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
+	pushPrefsHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
 

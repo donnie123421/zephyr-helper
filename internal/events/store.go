@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_dedupe ON events(dedupe_key, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_feed   ON events(occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_parent ON events(correlates_to);
+CREATE TABLE IF NOT EXISTS push_log (
+    event_id  TEXT PRIMARY KEY,
+    pushed_at INTEGER NOT NULL
+);
 `
 	_, err := s.db.Exec(schema)
 	if err != nil {
@@ -302,14 +306,57 @@ func (s *Store) SetCorrelation(ctx context.Context, childID, parentID string) er
 
 // Prune deletes events older than `cutoff`. Safe to call concurrently with
 // ingest; SQLite serializes the write. Returns the number of deleted rows
-// so the caller can log it.
+// so the caller can log it. Push-log rows age out on the same cutoff —
+// they're only needed for the notifier's dedupe window (hours), so any
+// retention cutoff (days) more than covers them.
 func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM events WHERE occurred_at < ?`, cutoff.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("prune: %w", err)
 	}
 	n, _ := res.RowsAffected()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM push_log WHERE pushed_at < ?`, cutoff.UnixMilli()); err != nil {
+		return n, fmt.Errorf("prune push_log: %w", err)
+	}
 	return n, nil
+}
+
+// RecordPush remembers that the push notifier delivered a notification
+// for this event id. Persisted so a helper restart doesn't re-push
+// every unresolved alert the pollers immediately re-ingest.
+func (s *Store) RecordPush(ctx context.Context, eventID string, at time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO push_log (event_id, pushed_at) VALUES (?, ?)
+		 ON CONFLICT(event_id) DO UPDATE SET pushed_at = excluded.pushed_at`,
+		eventID, at.UnixMilli())
+	if err != nil {
+		return fmt.Errorf("record push: %w", err)
+	}
+	return nil
+}
+
+// RecentPushes returns event id → pushed-at for every push delivered
+// since `since`. Used by the notifier to rehydrate its dedupe state on
+// startup.
+func (s *Store) RecentPushes(ctx context.Context, since time.Time) (map[string]time.Time, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT event_id, pushed_at FROM push_log WHERE pushed_at >= ?`,
+		since.UnixMilli())
+	if err != nil {
+		return nil, fmt.Errorf("recent pushes: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]time.Time)
+	for rows.Next() {
+		var id string
+		var ms int64
+		if err := rows.Scan(&id, &ms); err != nil {
+			return nil, fmt.Errorf("recent pushes scan: %w", err)
+		}
+		out[id] = time.UnixMilli(ms).UTC()
+	}
+	return out, rows.Err()
 }
 
 // Subscribe returns a channel that receives every newly-ingested event.

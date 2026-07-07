@@ -20,7 +20,13 @@ RUN apk add --no-cache ca-certificates \
     # root and tsnet can't write its node key — registration silently
     # fails and the helper never joins the tailnet.
     && mkdir -p /tmp/tsnet \
-    && chown -R zephyr:zephyr /tmp/tsnet
+    && chown -R zephyr:zephyr /tmp/tsnet \
+    # Same trick for /data (events DB + push prefs): the iOS installer
+    # mounts a named volume here, and pre-creating the dir hands the
+    # volume zephyr ownership on first mount. Deploys without the mount
+    # still get a writable-but-ephemeral /data inside the container FS.
+    && mkdir -p /data \
+    && chown -R zephyr:zephyr /data
 USER zephyr
 COPY --from=builder /out/zephyr-helper /usr/local/bin/zephyr-helper
 EXPOSE 8080

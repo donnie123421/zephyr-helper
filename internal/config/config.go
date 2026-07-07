@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 )
 
 type Config struct {
@@ -14,13 +16,25 @@ type Config struct {
 	OllamaModel   string
 	TrueNASURL    string
 	TrueNASAPIKey string
+	// DataDir is the directory for everything that should survive
+	// container restarts: the events DB and push prefs. The iOS
+	// installer mounts a named volume at /data; the Dockerfile
+	// pre-creates the directory owned by the app user so the volume
+	// inherits sane ownership on first mount. On deploys that predate
+	// the volume mount, /data still exists inside the container FS —
+	// writable but ephemeral, i.e. exactly the durability we had when
+	// everything lived in /tmp.
+	DataDir string
 	// EventsDBPath points to the SQLite file that backs the event store.
-	// Defaults to /tmp/events.db — the compose YAML doesn't mount a volume
-	// yet, so a persistent path would fail to open on existing deploys.
-	// The alerts poller writes here on every tick; losing history across
-	// container restarts is acceptable until the installer gains a
-	// /data volume mount and we bump the default to /data/events.db.
+	// Defaults to {DataDir}/events.db; EVENTS_DB_PATH overrides for
+	// tests and manual deploys with their own layout.
 	EventsDBPath string
+	// PushPrefsPath is the JSON file holding the iOS-synced notification
+	// preferences (muted push categories). Lives next to the events DB.
+	PushPrefsPath string
+	// EventsRetentionDays bounds the events archive; a daily pruner
+	// deletes rows older than this. 0 disables pruning entirely.
+	EventsRetentionDays int
 
 	// TSAuthKey is an optional Tailscale auth key. When set, the helper
 	// joins the user's tailnet on boot via tsnet, which lets it resolve
@@ -62,20 +76,33 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Addr:               envOr("ZEPHYR_ADDR", ":8080"),
-		PairingToken:       os.Getenv("PAIRING_TOKEN"),
-		OllamaURL:          envOr("OLLAMA_URL", "http://ollama:11434"),
-		OllamaModel:        envOr("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
-		TrueNASURL:         os.Getenv("TRUENAS_URL"),
-		TrueNASAPIKey:      os.Getenv("TRUENAS_API_KEY"),
-		EventsDBPath:       envOr("EVENTS_DB_PATH", "/tmp/events.db"),
-		TSAuthKey:          os.Getenv("TS_AUTHKEY"),
-		TSHostname:         envOr("TS_HOSTNAME", "zephyr-helper"),
-		TSStateDir:         envOr("TS_STATE_DIR", "/tmp/tsnet"),
-		PushRelayURL:       os.Getenv("PUSH_RELAY_URL"),
-		PushSubscriptionID: os.Getenv("PUSH_SUBSCRIPTION_ID"),
-		PushInstallToken:   os.Getenv("PUSH_INSTALL_TOKEN"),
+		Addr:                envOr("ZEPHYR_ADDR", ":8080"),
+		PairingToken:        os.Getenv("PAIRING_TOKEN"),
+		OllamaURL:           envOr("OLLAMA_URL", "http://ollama:11434"),
+		OllamaModel:         envOr("OLLAMA_MODEL", "qwen2.5:7b-instruct"),
+		TrueNASURL:          os.Getenv("TRUENAS_URL"),
+		TrueNASAPIKey:       os.Getenv("TRUENAS_API_KEY"),
+		DataDir:             envOr("DATA_DIR", "/data"),
+		EventsRetentionDays: envIntOr("EVENTS_RETENTION_DAYS", 90),
+		TSAuthKey:           os.Getenv("TS_AUTHKEY"),
+		TSHostname:          envOr("TS_HOSTNAME", "zephyr-helper"),
+		TSStateDir:          envOr("TS_STATE_DIR", "/tmp/tsnet"),
+		PushRelayURL:        os.Getenv("PUSH_RELAY_URL"),
+		PushSubscriptionID:  os.Getenv("PUSH_SUBSCRIPTION_ID"),
+		PushInstallToken:    os.Getenv("PUSH_INSTALL_TOKEN"),
 	}
+
+	// Ensure the data dir exists and is writable before deriving paths
+	// from it. The Dockerfile pre-creates /data, but a manual deploy
+	// with a custom DATA_DIR (or a hostile mount) can hand us a dir we
+	// can't write — fall back to /tmp rather than crash-looping, since
+	// an ephemeral event store is strictly better than no helper.
+	if err := ensureWritableDir(cfg.DataDir); err != nil {
+		fmt.Fprintf(os.Stderr, "data dir %q not writable (%v); falling back to /tmp — event history will not survive restarts\n", cfg.DataDir, err)
+		cfg.DataDir = "/tmp"
+	}
+	cfg.EventsDBPath = envOr("EVENTS_DB_PATH", filepath.Join(cfg.DataDir, "events.db"))
+	cfg.PushPrefsPath = filepath.Join(cfg.DataDir, "push_prefs.json")
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,
 	// mint one and print it so the operator can pair by hand.
@@ -91,11 +118,35 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+func ensureWritableDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	probe, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return err
+	}
+	probe.Close()
+	return os.Remove(probe.Name())
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+func envIntOr(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func randomToken(n int) (string, error) {

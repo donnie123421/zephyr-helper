@@ -70,7 +70,7 @@ func TestCategoryFor(t *testing.T) {
 // markIfFresh must suppress a second push of the same id within the
 // dedupe window, and the timestamp record must be atomic with the check.
 func TestMarkIfFresh(t *testing.T) {
-	n := New(nil, "https://relay.test", "sub", "tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	n := New(nil, "https://relay.test", "sub", "tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil, nil)
 
 	if !n.markIfFresh("event-1") {
 		t.Fatal("first markIfFresh should return true")

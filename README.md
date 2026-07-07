@@ -59,7 +59,9 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | Default model |
 | `TRUENAS_URL` | — | TrueNAS host (used from Phase B onward) |
 | `TRUENAS_API_KEY` | — | TrueNAS API key (used from Phase B onward) |
-| `EVENTS_DB_PATH` | `/tmp/events.db` | SQLite path for the event store (v1.1). Will move to a bind-mounted `/data/events.db` once the pollers ship. |
+| `DATA_DIR` | `/data` | Directory for persistent state (events DB, push prefs). The iOS installer mounts a named volume here; falls back to `/tmp` if unwritable. |
+| `EVENTS_DB_PATH` | `{DATA_DIR}/events.db` | SQLite path for the event store. Override for tests/manual layouts. |
+| `EVENTS_RETENTION_DAYS` | `90` | Daily pruner deletes events older than this. `0` disables pruning. |
 | `PUSH_RELAY_URL` | — | Base URL of the zephyr-push-relay Worker. Set by the iOS installer. Empty = push disabled. |
 | `PUSH_SUBSCRIPTION_ID` | — | OneSignal subscription id for the paired iPhone. Set by the iOS installer. |
 | `PUSH_INSTALL_TOKEN` | — | Per-device secret the relay's allowlist validates. Set by the iOS installer. |
@@ -77,7 +79,10 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | GET | `/events` | yes | Event feed (v1.1 scaffold — pollers land next) |
 | GET | `/events/{id}` | yes | Single event detail |
 | POST | `/events/{id}/ack` | yes | Acknowledge an event |
+| POST | `/events/ack_all` | yes | Acknowledge every un-acked event; returns the count |
 | GET (WS) | `/events/stream` | yes | Live event stream |
+| GET | `/push/prefs` | yes | Muted push categories (iOS-synced) |
+| POST | `/push/prefs` | yes | Replace muted categories: `{"muted_categories": ["ALERT_WARNING"]}` |
 
 ### Wire format
 

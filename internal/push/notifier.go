@@ -32,8 +32,11 @@ type Notifier struct {
 	relayURL       string
 	subscriptionID string
 	installToken   string
-	httpClient     *http.Client
-	log            *slog.Logger
+	// prefs holds the iOS-synced muted categories; nil means "nothing
+	// muted" (manual deploys that never wire a store).
+	prefs      *PrefsStore
+	httpClient *http.Client
+	log        *slog.Logger
 
 	// dedupeWindow is how long we suppress repeat pushes for the same
 	// event id. The events.Store re-broadcasts on every merge (poller
@@ -52,6 +55,7 @@ type Notifier struct {
 func New(
 	store *events.Store,
 	relayURL, subscriptionID, installToken string,
+	prefs *PrefsStore,
 	log *slog.Logger,
 ) *Notifier {
 	if log == nil {
@@ -62,6 +66,7 @@ func New(
 		relayURL:       relayURL,
 		subscriptionID: subscriptionID,
 		installToken:   installToken,
+		prefs:          prefs,
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -79,6 +84,21 @@ func (n *Notifier) Run(ctx context.Context) {
 	if n.relayURL == "" || n.subscriptionID == "" || n.installToken == "" {
 		n.log.Info("notifier disabled (missing config)")
 		return
+	}
+
+	// Rehydrate dedupe state from the store so a restart doesn't
+	// re-push every unresolved alert the pollers re-ingest on boot.
+	// Best-effort: an empty map just means we risk one duplicate per
+	// live alert, which is the pre-persistence behavior.
+	if recent, err := n.store.RecentPushes(ctx, time.Now().Add(-n.dedupeWindow)); err != nil {
+		n.log.Warn("dedupe rehydrate failed", "err", err)
+	} else if len(recent) > 0 {
+		n.mu.Lock()
+		for id, t := range recent {
+			n.lastPushed[id] = t
+		}
+		n.mu.Unlock()
+		n.log.Info("dedupe rehydrated", "entries", len(recent))
 	}
 
 	feed, cancel := n.store.Subscribe(64)
@@ -120,6 +140,16 @@ func (n *Notifier) handle(ctx context.Context, ev events.Event) {
 	if !shouldPush(ev) {
 		return
 	}
+	// Mute check runs before the dedupe mark on purpose: a muted period
+	// must not record dedupe entries, so un-muting lets the very next
+	// re-broadcast of a still-live event push normally.
+	if n.prefs != nil {
+		if category := categoryFor(ev); n.prefs.IsMuted(category) {
+			n.log.Debug("push muted by prefs",
+				"event_id", ev.ID, "category", category)
+			return
+		}
+	}
 	if !n.markIfFresh(ev.ID) {
 		// Suppressed — same event re-broadcast from a store merge
 		// within the dedupe window.
@@ -136,6 +166,11 @@ func (n *Notifier) handle(ctx context.Context, ev events.Event) {
 	} else {
 		n.log.Debug("push sent",
 			"event_id", ev.ID, "kind", ev.Kind, "severity", ev.Severity)
+		// Persist so the dedupe survives a restart. Failure is
+		// non-fatal — worst case is one duplicate after a restart.
+		if err := n.store.RecordPush(ctx, ev.ID, time.Now().UTC()); err != nil {
+			n.log.Warn("push record failed", "err", err, "event_id", ev.ID)
+		}
 	}
 }
 
