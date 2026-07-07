@@ -140,9 +140,10 @@ func (n *Notifier) handle(ctx context.Context, ev events.Event) {
 	if !shouldPush(ev) {
 		return
 	}
-	// Mute check runs before the dedupe mark on purpose: a muted period
-	// must not record dedupe entries, so un-muting lets the very next
-	// re-broadcast of a still-live event push normally.
+	// Mute + quiet-hours checks run before the dedupe mark on purpose:
+	// a suppressed period must not record dedupe entries, so un-muting
+	// (or the window ending) lets the very next re-broadcast of a
+	// still-live event push normally.
 	if n.prefs != nil {
 		if category := categoryFor(ev); n.prefs.IsMuted(category) {
 			n.log.Debug("push muted by prefs",
@@ -150,13 +151,20 @@ func (n *Notifier) handle(ctx context.Context, ev events.Event) {
 			return
 		}
 	}
+	quiet := n.prefs != nil && n.prefs.InQuietHours(time.Now())
+	if quiet && ev.Severity != events.SeverityCritical {
+		// Warnings can wait for morning; they stay in the in-app feed.
+		// Criticals still go out below, delivered passively.
+		n.log.Debug("push deferred by quiet hours", "event_id", ev.ID)
+		return
+	}
 	if !n.markIfFresh(ev.ID) {
 		// Suppressed — same event re-broadcast from a store merge
 		// within the dedupe window.
 		return
 	}
 
-	payload := buildPayload(ev)
+	payload := buildPayload(ev, quiet)
 	if err := n.send(ctx, payload); err != nil {
 		n.log.Warn("push send failed",
 			"err", err, "event_id", ev.ID, "kind", ev.Kind)
@@ -198,7 +206,7 @@ func shouldPush(ev events.Event) bool {
 // buildPayload maps an event into the relay's push payload shape. The
 // category aligns with the UNNotificationCategory ids iOS registers in
 // NotificationManager, so iOS can render with the right action set + sound.
-func buildPayload(ev events.Event) pushPayload {
+func buildPayload(ev events.Event, quiet bool) pushPayload {
 	category := categoryFor(ev)
 	// ThreadID groups related notifications in iOS Notification Center.
 	// Per-kind threading is cheap and gives reasonable visual grouping
@@ -209,10 +217,11 @@ func buildPayload(ev events.Event) pushPayload {
 		SubscriptionID: "", // filled by Notifier.send
 		InstallToken:   "",
 		Payload: payloadBody{
-			Title:    ev.Title,
-			Body:     ev.Summary,
-			Category: category,
-			ThreadID: thread,
+			Title:             ev.Title,
+			Body:              ev.Summary,
+			Category:          category,
+			ThreadID:          thread,
+			InterruptionLevel: interruptionLevelFor(ev, quiet),
 			Data: map[string]any{
 				"event_id": ev.ID,
 				"kind":     string(ev.Kind),
@@ -220,6 +229,21 @@ func buildPayload(ev events.Event) pushPayload {
 			},
 		},
 	}
+}
+
+// interruptionLevelFor picks the APNs interruption level. Criticals are
+// time-sensitive (break through Focus modes — a dead pool shouldn't wait
+// behind a work Focus), demoted to passive during quiet hours (listed in
+// Notification Center, no wake or sound). Everything else keeps the
+// default level, expressed as empty so the relay omits the field.
+func interruptionLevelFor(ev events.Event, quiet bool) string {
+	if ev.Severity != events.SeverityCritical {
+		return ""
+	}
+	if quiet {
+		return "passive"
+	}
+	return "time-sensitive"
 }
 
 func categoryFor(ev events.Event) string {
@@ -343,9 +367,13 @@ type pushPayload struct {
 }
 
 type payloadBody struct {
-	Title    string         `json:"title"`
-	Body     string         `json:"body"`
-	Category string         `json:"category,omitempty"`
-	ThreadID string         `json:"threadId,omitempty"`
-	Data     map[string]any `json:"data,omitempty"`
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	Category string `json:"category,omitempty"`
+	ThreadID string `json:"threadId,omitempty"`
+	// InterruptionLevel is the APNs level ("time-sensitive", "passive",
+	// "active") the relay maps to OneSignal's ios_interruption_level.
+	// Empty = platform default.
+	InterruptionLevel string         `json:"interruptionLevel,omitempty"`
+	Data              map[string]any `json:"data,omitempty"`
 }

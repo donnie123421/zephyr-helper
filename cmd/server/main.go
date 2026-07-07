@@ -9,6 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	// Embed tzdata so quiet-hours windows resolve IANA zones inside the
+	// alpine container (which ships no /usr/share/zoneinfo).
+	_ "time/tzdata"
 
 	"github.com/donnie123421/zephyr-helper/internal/auth"
 	"github.com/donnie123421/zephyr-helper/internal/chat"
