@@ -24,6 +24,12 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/events"
 )
 
+// pushQueueDepth bounds the backlog the notifier holds while the relay is
+// slow or unreachable. 256 is many minutes of headroom at any plausible NAS
+// event rate, and caps what a wedged relay can cost us in memory. Past it we
+// drop with a warning rather than grow without limit.
+const pushQueueDepth = 256
+
 // Notifier subscribes to an events.Store and POSTs push-worthy events
 // to the relay. Safe to run as a single long-lived goroutine; relies
 // on Store.Subscribe's fan-out, so it doesn't poll.
@@ -104,6 +110,21 @@ func (n *Notifier) Run(ctx context.Context) {
 	feed, cancel := n.store.Subscribe(64)
 	defer cancel()
 
+	// Delivery runs on its own goroutine. A send can take ~35s in the worst
+	// case (two 15s attempts either side of a 5s backoff), and while this
+	// loop was blocked inside handle() it wasn't draining `feed` — so
+	// Store.broadcast, which drops frames for a backed-up subscriber rather
+	// than blocking every other writer, silently threw away pushes during
+	// exactly the relay outage you'd most want to be told about. Receiving
+	// and sending are now decoupled: this loop only classifies and enqueues.
+	queue := make(chan events.Event, pushQueueDepth)
+	workerDone := make(chan struct{})
+	go n.deliverLoop(ctx, queue, workerDone)
+	defer func() {
+		close(queue)
+		<-workerDone
+	}()
+
 	// Periodic prune of the dedupe map — keeps it bounded on
 	// long-running helpers without an LRU dependency. 1h cadence
 	// means at most ~6h × event_rate entries hang around between
@@ -124,8 +145,38 @@ func (n *Notifier) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			n.handle(ctx, ev)
+			// Cheap, event-intrinsic filter here so the queue only holds
+			// push-worthy events. Time-dependent policy (mutes, quiet hours,
+			// dedupe) stays in handle() where it's evaluated at send time,
+			// not enqueue time — un-muting while a backlog drains should
+			// take effect.
+			if !shouldPush(ev) {
+				continue
+			}
+			select {
+			case queue <- ev:
+			default:
+				// Queue full: the relay has been unreachable long enough to
+				// back up pushQueueDepth events. Drop loudly — a silent drop
+				// here is what this whole change exists to prevent.
+				n.log.Warn("push queue full, dropping event",
+					"event_id", ev.ID, "kind", ev.Kind, "severity", ev.Severity,
+					"queue_depth", pushQueueDepth)
+			}
 		}
+	}
+}
+
+// deliverLoop owns every outbound push. Single goroutine on purpose: sends
+// stay serialized, so the dedupe map and the relay's per-subscription rate
+// budget behave exactly as they did when delivery was inline.
+//
+// Ranges to completion so a shutdown drains whatever is already queued; those
+// sends fail fast because ctx is already cancelled.
+func (n *Notifier) deliverLoop(ctx context.Context, queue <-chan events.Event, done chan<- struct{}) {
+	defer close(done)
+	for ev := range queue {
+		n.handle(ctx, ev)
 	}
 }
 
@@ -137,9 +188,10 @@ func (n *Notifier) handle(ctx context.Context, ev events.Event) {
 		}
 	}()
 
-	if !shouldPush(ev) {
-		return
-	}
+	// shouldPush already ran at enqueue time — this is the time-dependent
+	// half of the policy, deliberately evaluated now rather than then so a
+	// backlog draining after an outage reflects current mutes and window.
+	//
 	// Mute + quiet-hours checks run before the dedupe mark on purpose:
 	// a suppressed period must not record dedupe entries, so un-muting
 	// (or the window ending) lets the very next re-broadcast of a

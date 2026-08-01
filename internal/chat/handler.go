@@ -134,6 +134,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		history = append(history, ollama.Message{Role: "user", Content: msg.Content})
+		// Bound the replayed conversation before it goes back to Ollama —
+		// otherwise a long session eventually overruns the model's context
+		// window and the system prompt is the first thing the server drops.
+		if trimmed := trimHistory(history); len(trimmed) != len(history) {
+			slog.Info("chat: history trimmed",
+				"from_messages", len(history), "to_messages", len(trimmed))
+			history = trimmed
+		}
 
 		newHistory, err := h.runTurn(ctx, conn, history)
 		if err != nil {

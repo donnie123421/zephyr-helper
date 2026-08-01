@@ -391,6 +391,15 @@ func (s *Store) Subscribe(buffer int) (<-chan Event, func()) {
 	return ch, cancel
 }
 
+// SubscriberCount reports how many live subscribers the store fans out to.
+// Useful for diagnostics, and lets tests synchronise on a subscriber having
+// registered rather than sleeping and hoping.
+func (s *Store) SubscriberCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.subs)
+}
+
 func (s *Store) broadcast(e Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
