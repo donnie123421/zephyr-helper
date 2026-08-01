@@ -60,13 +60,14 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
+      # The action runs its own checkout and setup-go, so adding either here
+      # just duplicates work. go-version-input must be blanked explicitly:
+      # it defaults to 'stable', and setup-go ignores go-version-file whenever
+      # go-version is also set — which silently scanned against a different
+      # toolchain than the one go.mod pins for GO-2026-5856.
       - uses: golang/govulncheck-action@v1
         with:
+          go-version-input: ''
           go-version-file: go.mod
 
   publish:
