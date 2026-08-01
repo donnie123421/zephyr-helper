@@ -86,6 +86,42 @@ func TestIngestMergesWithinWindow(t *testing.T) {
 	}
 }
 
+// A merge writes the incoming body to the row, so the event handed back to
+// callers (and broadcast to /events/stream subscribers, the correlators and
+// the push notifier) must carry that same body. Regression: this used to
+// return the *previous* body while the DB held the new one.
+func TestIngestMergeReturnsStoredBody(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	first := baseEvent()
+	first.Body = json.RawMessage(`{"klass":"ZfsDegraded","state":"DEGRADED"}`)
+	stored, err := s.Ingest(ctx, first, time.Hour)
+	if err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+
+	dup := baseEvent()
+	dup.OccurredAt = stored.OccurredAt.Add(5 * time.Minute)
+	dup.Body = json.RawMessage(`{"klass":"ZfsDegraded","state":"FAULTED"}`)
+
+	merged, err := s.Ingest(ctx, dup, time.Hour)
+	if err != nil {
+		t.Fatalf("merged ingest: %v", err)
+	}
+	if string(merged.Body) != string(dup.Body) {
+		t.Errorf("returned body = %s, want the incoming %s", merged.Body, dup.Body)
+	}
+
+	fromDB, err := s.Get(ctx, merged.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(fromDB.Body) != string(merged.Body) {
+		t.Errorf("returned body %s disagrees with stored body %s", merged.Body, fromDB.Body)
+	}
+}
+
 func TestIngestOutsideWindowCreatesNewRow(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

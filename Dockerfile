@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X github.com/donnie123421/zephyr-helper/internal/version.Version=${VERSION} -X github.com/donnie123421/zephyr-helper/internal/version.Commit=${COMMIT}" \
     -o /out/zephyr-helper ./cmd/server
 
-FROM alpine:3.19
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates \
     && adduser -D -u 10001 zephyr \
     # Pre-create the tsnet state dir owned by zephyr so the named

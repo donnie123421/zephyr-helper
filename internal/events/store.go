@@ -171,15 +171,21 @@ func (s *Store) Ingest(ctx context.Context, in Event, mergeWindow time.Duration)
 			t := time.UnixMilli(existingAckedMs.Int64).UTC()
 			existing.AckedAt = &t
 		}
+		// The merge writes the *incoming* body — it's the fresher payload for
+		// the same logical event. Capture it before `in` is replaced so the
+		// returned (and broadcast) event matches what's now in the row;
+		// returning `existing.Body` here handed every live subscriber the
+		// previous poll's payload.
+		mergedBody := in.Body
 		_, err := tx.ExecContext(ctx, `
             UPDATE events SET count = ?, last_seen = ?, body = ?
             WHERE id = ?
-        `, existing.Count, existing.LastSeen.UnixMilli(), []byte(in.Body), existing.ID)
+        `, existing.Count, existing.LastSeen.UnixMilli(), []byte(mergedBody), existing.ID)
 		if err != nil {
 			return Event{}, fmt.Errorf("merge update: %w", err)
 		}
 		in = existing
-		in.Body = json.RawMessage(in.Body)
+		in.Body = mergedBody
 
 	default:
 		return Event{}, fmt.Errorf("dedupe lookup: %w", err)

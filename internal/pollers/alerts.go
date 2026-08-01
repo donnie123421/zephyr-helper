@@ -96,20 +96,28 @@ func (a *Alerts) poll(ctx context.Context) {
 			continue
 		}
 		fp := fingerprintAlert(al)
-		current[uuid] = fp
 
 		if prev, ok := a.seen[uuid]; ok && prev == fp {
+			current[uuid] = fp
 			continue
 		}
 
 		ev, ok := alertToEvent(al)
 		if !ok {
+			// Deterministic conversion failure (no message text at all) —
+			// record it so we don't rebuild the same unusable row every tick.
+			current[uuid] = fp
 			continue
 		}
 		if _, err := a.store.Ingest(ctx, ev, a.merge); err != nil {
+			// Deliberately NOT recorded in `current`: the fingerprint won't
+			// change until the alert re-fires, so marking it seen here would
+			// drop this occurrence permanently. Leaving it unmarked makes the
+			// next poll retry, and Ingest's dedupe absorbs the repeat.
 			slog.Warn("alerts: ingest", "err", err, "uuid", uuid)
 			continue
 		}
+		current[uuid] = fp
 		ingested++
 	}
 

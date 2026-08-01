@@ -97,20 +97,26 @@ func (j *Jobs) poll(ctx context.Context) {
 		if !isTerminalJobState(upper) {
 			continue
 		}
-		current[id] = upper
-
 		if prev, already := j.seen[id]; already && prev == upper {
+			current[id] = upper
 			continue
 		}
 
 		ev, ok := jobToEvent(job)
 		if !ok {
+			// Filtered out on purpose (routine success, unknown method) —
+			// record it so the same job isn't re-evaluated every tick.
+			current[id] = upper
 			continue
 		}
 		if _, err := j.store.Ingest(ctx, ev, j.merge); err != nil {
+			// Not recorded: the job's terminal state is final, so marking it
+			// seen after a failed ingest would drop it for good. Retry next
+			// poll instead — Ingest's merge window absorbs the duplicate.
 			slog.Warn("jobs: ingest", "err", err, "id", id)
 			continue
 		}
+		current[id] = upper
 		ingested++
 	}
 

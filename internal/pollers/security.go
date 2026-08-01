@@ -140,27 +140,34 @@ func (s *Security) poll(ctx context.Context) {
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
 		id, _ := entry["audit_id"].(string)
-		if id != "" {
+		if id != "" && s.seenAuditIDs[id] {
 			current[id] = true
-			if s.seenAuditIDs[id] {
-				continue
-			}
+			continue
 		}
-		s.handleEntry(ctx, entry)
+		// Only mark the row seen once every rule it matched actually landed.
+		// Recording it up-front would drop the detection permanently on a
+		// transient store error, since the row never changes and would be
+		// skipped on every later poll. Re-dispatching a partially-ingested
+		// row is safe — the store dedupes each rule by its own key.
+		if s.handleEntry(ctx, entry) && id != "" {
+			current[id] = true
+		}
 	}
 	s.seenAuditIDs = current
 }
 
-// handleEntry dispatches one audit row to the rule(s) it matches.
-// Entries can match more than one rule (e.g. a successful root login
-// from a new public IP fires both rules); handlers are independent and
-// safe to call together because the events store dedupes per-rule.
+// handleEntry dispatches one audit row to the rule(s) it matches, and
+// reports whether every rule it fired was ingested successfully. A false
+// return tells the caller not to mark the row seen, so the next poll
+// retries it. Entries can match more than one rule (e.g. a successful
+// root login from a new public IP fires both); handlers are independent
+// and safe to call together because the events store dedupes per-rule.
 //
 // Failed authentications aren't dispatched here: TrueNAS doesn't write
 // failed sign-ins to /audit/query, so any spike rule would have no
 // signal to read. If we ever pivot to syslog we can reintroduce that
 // branch.
-func (s *Security) handleEntry(ctx context.Context, entry map[string]any) {
+func (s *Security) handleEntry(ctx context.Context, entry map[string]any) bool {
 	occurred := auditTimestamp(entry)
 	if occurred.IsZero() {
 		occurred = time.Now().UTC()
@@ -175,9 +182,9 @@ func (s *Security) handleEntry(ctx context.Context, entry map[string]any) {
 		// are not interactive sign-ins. Skip them so the helper's own
 		// poll-driven authentications don't loop back into the feed.
 		if isAPIKeyAuthentication(entry) {
-			return
+			return true
 		}
-		s.handleAuthentication(ctx, entry, occurred, username, address)
+		return s.handleAuthentication(ctx, entry, occurred, username, address)
 	case "METHOD_CALL":
 		// Real schema: dispatch on event_data.method, not on the
 		// top-level event field. The actual TrueNAS method names are
@@ -185,13 +192,15 @@ func (s *Security) handleEntry(ctx context.Context, entry map[string]any) {
 		method := readMethod(entry)
 		switch {
 		case isShareCreateMethod(method):
-			s.emitShareCreated(ctx, entry, occurred, username)
+			return s.emitShareCreated(ctx, entry, occurred, username)
 		case isUserCreateMethod(method):
-			s.emitUserCreated(ctx, entry, occurred, username)
+			return s.emitUserCreated(ctx, entry, occurred, username)
 		case isPrivilegeGrantMethod(method):
-			s.emitPrivilegeGranted(ctx, entry, occurred, username)
+			return s.emitPrivilegeGranted(ctx, entry, occurred, username)
 		}
 	}
+	// Nothing matched — the row is fully handled.
+	return true
 }
 
 func (s *Security) handleAuthentication(
@@ -199,15 +208,18 @@ func (s *Security) handleAuthentication(
 	entry map[string]any,
 	occurred time.Time,
 	username, address string,
-) {
+) bool {
 	// One entry can fire more than one rule (e.g. root login from a new
-	// public IP).
+	// public IP). Run both before reporting so a failure in the first
+	// doesn't skip the second.
+	ok := true
 	if address != "" && isPublicIP(address) {
-		s.emitNewPublicIPLogin(ctx, entry, occurred, username, address)
+		ok = s.emitNewPublicIPLogin(ctx, entry, occurred, username, address) && ok
 	}
 	if _, privileged := privilegedUsers[strings.ToLower(username)]; privileged {
-		s.emitPrivilegedLogin(ctx, entry, occurred, username, address)
+		ok = s.emitPrivilegedLogin(ctx, entry, occurred, username, address) && ok
 	}
+	return ok
 }
 
 func (s *Security) emitNewPublicIPLogin(
@@ -215,7 +227,7 @@ func (s *Security) emitNewPublicIPLogin(
 	entry map[string]any,
 	occurred time.Time,
 	username, address string,
-) {
+) bool {
 	body, _ := json.Marshal(map[string]any{
 		"username": username,
 		"address":  address,
@@ -237,7 +249,9 @@ func (s *Security) emitNewPublicIPLogin(
 	// after a month of silence it's worth re-surfacing.
 	if _, err := s.store.Ingest(ctx, ev, securityIPMergeWindow); err != nil {
 		slog.Warn("security: new-ip ingest", "err", err)
+		return false
 	}
+	return true
 }
 
 func (s *Security) emitPrivilegedLogin(
@@ -245,7 +259,7 @@ func (s *Security) emitPrivilegedLogin(
 	entry map[string]any,
 	occurred time.Time,
 	username, address string,
-) {
+) bool {
 	body, _ := json.Marshal(map[string]any{
 		"username": username,
 		"address":  address,
@@ -266,7 +280,9 @@ func (s *Security) emitPrivilegedLogin(
 	}
 	if _, err := s.store.Ingest(ctx, ev, securityRoutineMergeWindow); err != nil {
 		slog.Warn("security: privileged-login ingest", "err", err)
+		return false
 	}
+	return true
 }
 
 func (s *Security) emitShareCreated(
@@ -274,7 +290,7 @@ func (s *Security) emitShareCreated(
 	entry map[string]any,
 	occurred time.Time,
 	username string,
-) {
+) bool {
 	target := readShareName(entry)
 	body, _ := json.Marshal(entry)
 	ev := events.Event{
@@ -288,7 +304,9 @@ func (s *Security) emitShareCreated(
 	}
 	if _, err := s.store.Ingest(ctx, ev, securityRoutineMergeWindow); err != nil {
 		slog.Warn("security: share-create ingest", "err", err)
+		return false
 	}
+	return true
 }
 
 func (s *Security) emitUserCreated(
@@ -296,7 +314,7 @@ func (s *Security) emitUserCreated(
 	entry map[string]any,
 	occurred time.Time,
 	actor string,
-) {
+) bool {
 	target := readTargetUsername(entry)
 	body, _ := json.Marshal(entry)
 	ev := events.Event{
@@ -310,7 +328,9 @@ func (s *Security) emitUserCreated(
 	}
 	if _, err := s.store.Ingest(ctx, ev, securityRoutineMergeWindow); err != nil {
 		slog.Warn("security: user-create ingest", "err", err)
+		return false
 	}
+	return true
 }
 
 func (s *Security) emitPrivilegeGranted(
@@ -318,7 +338,7 @@ func (s *Security) emitPrivilegeGranted(
 	entry map[string]any,
 	occurred time.Time,
 	actor string,
-) {
+) bool {
 	target := readTargetUsername(entry)
 	body, _ := json.Marshal(entry)
 	ev := events.Event{
@@ -332,7 +352,9 @@ func (s *Security) emitPrivilegeGranted(
 	}
 	if _, err := s.store.Ingest(ctx, ev, securityRoutineMergeWindow); err != nil {
 		slog.Warn("security: privilege-grant ingest", "err", err)
+		return false
 	}
+	return true
 }
 
 func (s *Security) emitAuditDown(ctx context.Context, reason string) {
