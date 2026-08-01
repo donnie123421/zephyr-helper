@@ -28,12 +28,12 @@ func makeJobEvent(t *testing.T, body map[string]any) events.Event {
 
 func TestScrubParentForSuccess(t *testing.T) {
 	child := makeJobEvent(t, map[string]any{
-		"id":             float64(1),
-		"method":         "pool.scrub",
-		"state":          "SUCCESS",
-		"arguments":      []any{"tank", "START"},
-		"time_started":   map[string]any{"$date": float64(1713990000000)},
-		"time_finished":  map[string]any{"$date": float64(1714000000000)},
+		"id":            float64(1),
+		"method":        "pool.scrub",
+		"state":         "SUCCESS",
+		"arguments":     []any{"tank", "START"},
+		"time_started":  map[string]any{"$date": float64(1713990000000)},
+		"time_finished": map[string]any{"$date": float64(1714000000000)},
 	})
 	parent, ok := ScrubParentFor(child)
 	if !ok {

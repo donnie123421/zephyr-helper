@@ -47,11 +47,11 @@ type Server struct {
 // SelfStatus is the slim subset of ipnstate.PeerStatus iOS needs.
 // We mirror the names the iOS client decoder already expects.
 type SelfStatus struct {
-	HostName        string   `json:"hostname,omitempty"`
-	DNSName         string   `json:"dnsName,omitempty"`         // "truenas-shed.tail-scale.ts.net."
-	TailscaleIPs    []string `json:"tailscaleIPs,omitempty"`    // ["100.x.y.z"]
-	MagicDNSSuffix  string   `json:"magicDNSSuffix,omitempty"`  // "tail-scale.ts.net"
-	BackendState    string   `json:"backendState,omitempty"`    // "Running" / "NeedsLogin" / etc.
+	HostName       string   `json:"hostname,omitempty"`
+	DNSName        string   `json:"dnsName,omitempty"`        // "truenas-shed.tail-scale.ts.net."
+	TailscaleIPs   []string `json:"tailscaleIPs,omitempty"`   // ["100.x.y.z"]
+	MagicDNSSuffix string   `json:"magicDNSSuffix,omitempty"` // "tail-scale.ts.net"
+	BackendState   string   `json:"backendState,omitempty"`   // "Running" / "NeedsLogin" / etc.
 }
 
 // PeerInfo carries just enough of an ipnstate.PeerStatus for the
@@ -336,7 +336,7 @@ func (s *Server) tsnetLogf(format string, args ...any) {
 	// tsnet emits a lot of debug chatter we don't want in our
 	// JSON logs. Compress to a single Debug line so we can still
 	// turn it on if something breaks.
-	s.log.Debug("tsnet: "+strings.TrimSpace(fmt.Sprintf(format, args...)))
+	s.log.Debug("tsnet: " + strings.TrimSpace(fmt.Sprintf(format, args...)))
 }
 
 // Sentinel for callers that want to assert tsnet was unconfigured

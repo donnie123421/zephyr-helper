@@ -29,12 +29,12 @@ func TestIsPublicIP(t *testing.T) {
 		{"203.0.113.5", true},
 		{"2001:4860:4860::8888", true},
 		// Edge cases.
-		{"203.0.113.5:54321", true},   // host:port form
-		{"[2001:db8::1]:443", true},    // bracketed IPv6:port
+		{"203.0.113.5:54321", true}, // host:port form
+		{"[2001:db8::1]:443", true}, // bracketed IPv6:port
 		{"", false},
 		{"not-an-ip", false},
-		{"100.63.255.255", true},       // just below CGNAT range
-		{"100.128.0.0", true},          // just above CGNAT range
+		{"100.63.255.255", true}, // just below CGNAT range
+		{"100.128.0.0", true},    // just above CGNAT range
 	}
 	for _, c := range cases {
 		got := isPublicIP(c.addr)

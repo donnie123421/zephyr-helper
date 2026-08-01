@@ -14,17 +14,60 @@ env:
 
 jobs:
   test:
-    name: Lint & build
+    name: Lint, test & build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          # go.mod pins a patch-level minimum (security fix); read it from
+          # there so this doesn't silently drift behind.
+          go-version-file: go.mod
           cache: true
       - run: go mod download
+
+      # gofmt has no exit code of its own — it just lists offenders.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      # `go mod tidy` drift (direct imports still marked indirect) is easy to
+      # miss locally and CLAUDE.md requires it before commit — enforce it.
+      - name: go mod tidy is clean
+        run: |
+          cp go.mod go.mod.orig && cp go.sum go.sum.orig
+          go mod tidy
+          if ! diff -q go.mod go.mod.orig >/dev/null || ! diff -q go.sum go.sum.orig >/dev/null; then
+            echo "::error::go.mod/go.sum are not tidy — run 'go mod tidy' and commit the result"
+            diff -u go.mod.orig go.mod || true
+            exit 1
+          fi
+          rm go.mod.orig go.sum.orig
+
       - run: go vet ./...
+      # The race detector is the whole point of running these in CI: the
+      # store fans out to correlators, the notifier and every WS subscriber.
+      - run: go test -race ./...
       - run: go build ./...
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
 
   publish:
     name: Build & push image

@@ -410,12 +410,12 @@ type rowScanner interface {
 
 func scanEvent(row rowScanner) (Event, error) {
 	var (
-		e                                          Event
-		occurredMs, firstMs, lastMs                int64
-		parent                                     sql.NullString
-		ackedMs                                    sql.NullInt64
-		kindStr, severityStr                       string
-		body                                       []byte
+		e                           Event
+		occurredMs, firstMs, lastMs int64
+		parent                      sql.NullString
+		ackedMs                     sql.NullInt64
+		kindStr, severityStr        string
+		body                        []byte
 	)
 	if err := row.Scan(
 		&e.ID, &occurredMs, &firstMs, &lastMs, &e.Count, &kindStr, &severityStr,

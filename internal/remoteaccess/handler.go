@@ -25,7 +25,7 @@ import (
 
 // Handler serves the read-only `GET /remote-access` endpoint.
 type Handler struct {
-	TN      *truenas.Client
+	TN *truenas.Client
 	// Tailnet is optional. When the helper joined the tailnet via
 	// tsnet at startup, the handler upgrades the response with the
 	// authoritative MagicDNS hostname instead of guessing.
@@ -308,9 +308,9 @@ func (h *Handler) detectTailscale(ctx context.Context) *Tailscale {
 // shape narrow makes the JSON tolerant to schema drift across
 // 24.10 / 25.04 / 25.10 / 26.0.
 type appEntry struct {
-	Name     string                 `json:"name"`
-	State    string                 `json:"state"`
-	Metadata map[string]any         `json:"metadata"`
+	Name     string         `json:"name"`
+	State    string         `json:"state"`
+	Metadata map[string]any `json:"metadata"`
 	// Both shapes seen in the wild — `config` on classic charts,
 	// `values` on the newer compose-style apps. We probe both.
 	Config map[string]any `json:"config"`

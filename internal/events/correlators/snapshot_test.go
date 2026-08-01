@@ -11,13 +11,13 @@ import (
 
 func TestIsSnapshotJobKey(t *testing.T) {
 	cases := map[string]bool{
-		"job|pool.snapshottask.run|success":  true,
-		"job|pool.snapshottask.run|failed":   false,
+		"job|pool.snapshottask.run|success":      true,
+		"job|pool.snapshottask.run|failed":       false,
 		"job|zettarepl.snapshot_created|success": true,
-		"job|pool.scrub|success":             false,
-		"job|replication.run|success":        false,
-		"alert|warning|ZfsDegraded|Pool tank": false,
-		"malformed":                          false,
+		"job|pool.scrub|success":                 false,
+		"job|replication.run|success":            false,
+		"alert|warning|ZfsDegraded|Pool tank":    false,
+		"malformed":                              false,
 	}
 	for k, want := range cases {
 		if got := IsSnapshotJobKey(k); got != want {

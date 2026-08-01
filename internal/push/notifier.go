@@ -45,8 +45,8 @@ type Notifier struct {
 	// after that window probably means the situation got worse."
 	dedupeWindow time.Duration
 
-	mu          sync.Mutex
-	lastPushed  map[string]time.Time // event id → last push timestamp
+	mu         sync.Mutex
+	lastPushed map[string]time.Time // event id → last push timestamp
 }
 
 // New builds a Notifier. The caller must call Run to actually start
