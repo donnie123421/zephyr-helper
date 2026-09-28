@@ -228,7 +228,9 @@ func TestDiskRunEmitsParentAndLinksChild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var parent events.Event
+	// The correlator runs async: it writes the parent row, then links the
+	// child to it in a second write. Poll until both have landed.
+	var parent, refreshed events.Event
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		list, err := store.List(ctx, events.ListFilter{Kind: events.KindDisk})
@@ -237,7 +239,12 @@ func TestDiskRunEmitsParentAndLinksChild(t *testing.T) {
 		}
 		if len(list) == 1 {
 			parent = list[0]
-			break
+			if refreshed, err = store.Get(ctx, child.ID); err != nil {
+				t.Fatal(err)
+			}
+			if refreshed.CorrelatesTo != nil {
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -248,10 +255,6 @@ func TestDiskRunEmitsParentAndLinksChild(t *testing.T) {
 		t.Errorf("parent title = %q", parent.Title)
 	}
 
-	refreshed, err := store.Get(ctx, child.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if refreshed.CorrelatesTo == nil || *refreshed.CorrelatesTo != parent.ID {
 		t.Errorf("child correlates_to = %v, want %s", refreshed.CorrelatesTo, parent.ID)
 	}
