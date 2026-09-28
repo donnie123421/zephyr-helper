@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 )
@@ -56,13 +57,21 @@ func New(tn *truenas.Client) *Registry {
 func (r *Registry) Empty() bool { return len(r.tools) == 0 }
 
 // Definitions returns all tool definitions in the shape Ollama's /api/chat
-// expects in its request body.
+// expects in its request body, sorted by name. The list is part of every
+// prompt, and hosted model APIs only reuse a cached prompt whose prefix is
+// byte-identical — map order would make every request a cache miss.
 func (r *Registry) Definitions() []map[string]any {
-	out := make([]map[string]any, 0, len(r.tools))
-	for _, t := range r.tools {
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]map[string]any, 0, len(names))
+	for _, name := range names {
 		out = append(out, map[string]any{
 			"type":     "function",
-			"function": t.Def,
+			"function": r.tools[name].Def,
 		})
 	}
 	return out

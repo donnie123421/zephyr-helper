@@ -59,7 +59,7 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | Default model |
 | `TRUENAS_URL` | — | TrueNAS host (used from Phase B onward) |
 | `TRUENAS_API_KEY` | — | TrueNAS API key (used from Phase B onward) |
-| `DATA_DIR` | `/data` | Directory for persistent state (events DB, push prefs). The iOS installer mounts a named volume here; falls back to `/tmp` if unwritable. |
+| `DATA_DIR` | `/data` | Directory for persistent state (events DB, push prefs, pool capacity history, TLS certificate). The iOS installer mounts a named volume here; falls back to `/tmp` if unwritable. |
 | `EVENTS_DB_PATH` | `{DATA_DIR}/events.db` | SQLite path for the event store. Override for tests/manual layouts. |
 | `EVENTS_RETENTION_DAYS` | `90` | Daily pruner deletes events older than this. `0` disables pruning. |
 | `PUSH_RELAY_URL` | — | Base URL of the zephyr-push-relay Worker. Set by the iOS installer. Empty = push disabled. |
@@ -72,6 +72,7 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 |---|---|---|---|
 | GET | `/health` | no | Liveness |
 | GET | `/version` | no | Reports running version + commit SHA, for update detection |
+| GET | `/tls?nonce=<hex>` | no | Certificate fingerprint plus proof of the pairing token (see [HTTPS](#https)) |
 | POST | `/auth/verify` | yes | Token-check round-trip |
 | GET (WS) | `/chat` | yes | Streaming chat |
 | GET | `/model` | yes | Current Ollama model |
@@ -83,6 +84,20 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | GET (WS) | `/events/stream` | yes | Live event stream |
 | GET | `/push/prefs` | yes | Muted push categories (iOS-synced) |
 | POST | `/push/prefs` | yes | Replace muted categories: `{"muted_categories": ["ALERT_WARNING"]}` |
+
+### HTTPS
+
+The helper answers plain HTTP and HTTPS on the same port, telling them apart by each connection's first byte, so existing installs need no compose change and older app versions keep working over HTTP.
+
+The certificate is self-signed and generated on first start (`tls-cert.pem` and `tls-key.pem` in `DATA_DIR`). Clients pin its SHA-256 fingerprint (of the DER bytes, lowercase hex) rather than trusting a CA. To pin it without sending the pairing token over an unverified connection, a client connects over HTTPS, sends `GET /tls?nonce=<32–128 hex chars>`, and checks the reply
+
+```json
+{"fingerprint_sha256": "…", "proof": "…"}
+```
+
+where `proof` is `hex(HMAC-SHA256(key: pairing token, message: "zephyr-helper-tls-v1\n" + fingerprint + "\n" + nonce))`, computed with the fingerprint the client actually saw in the handshake. A proxy in the middle can't produce a valid proof for its own certificate without the token.
+
+When the helper is on a tailnet (`TS_AUTHKEY` set), it also serves the same API on its own tailnet address, port 8080.
 
 ### Wire format
 

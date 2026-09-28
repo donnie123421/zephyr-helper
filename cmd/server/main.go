@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +16,7 @@ import (
 	_ "time/tzdata"
 
 	"github.com/donnie123421/zephyr-helper/internal/auth"
+	"github.com/donnie123421/zephyr-helper/internal/capacity"
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
 	"github.com/donnie123421/zephyr-helper/internal/events"
@@ -25,6 +28,8 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/push"
 	"github.com/donnie123421/zephyr-helper/internal/remoteaccess"
 	"github.com/donnie123421/zephyr-helper/internal/tailnet"
+	"github.com/donnie123421/zephyr-helper/internal/tlscert"
+	"github.com/donnie123421/zephyr-helper/internal/tlsmux"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
 	"github.com/donnie123421/zephyr-helper/internal/version"
@@ -135,6 +140,18 @@ func main() {
 		securityPoller := pollers.NewSecurity(tnClient, eventsStore, pollers.DefaultSecurityInterval)
 		go securityPoller.Run(ctx)
 		slog.Info("security poller started", "interval", pollers.DefaultSecurityInterval)
+
+		// Capacity history for the pool-full forecast. Losing it only
+		// costs the forecast its history, so a failure here is logged
+		// rather than taking the rest of the helper down with it.
+		capacityStore, err := capacity.Open(cfg.CapacityDBPath)
+		if err != nil {
+			slog.Warn("capacity store open; not recording pool usage", "err", err, "path", cfg.CapacityDBPath)
+		} else {
+			defer capacityStore.Close()
+			go capacity.NewRecorder(tnClient, capacityStore, capacity.DefaultInterval).Run(ctx)
+			slog.Info("capacity recorder started", "path", cfg.CapacityDBPath, "interval", capacity.DefaultInterval)
+		}
 	}
 
 	// Push prefs: the iOS-synced muted categories, persisted next to
@@ -169,6 +186,7 @@ func main() {
 	// registration takes a few hundred ms on first run; we cap at
 	// 30s so a misconfigured key doesn't stall startup forever.
 	tsServer := tailnet.New(cfg.TSAuthKey, cfg.TSHostname, cfg.TSStateDir, slog.Default())
+	onTailnet := false
 	if tsServer.Available() {
 		startCtx, startCancel := context.WithTimeout(ctx, 30*time.Second)
 		if err := tsServer.Start(startCtx); err != nil {
@@ -176,6 +194,8 @@ func main() {
 			// have. Log and continue; /remote-access falls back to
 			// chart-scrape + NAS hostname suggestion.
 			slog.Warn("tsnet: start failed; continuing without tailnet", "err", err)
+		} else {
+			onTailnet = true
 		}
 		startCancel()
 	}
@@ -198,19 +218,60 @@ func main() {
 		return auth.Require(cfg.PairingToken, h)
 	})
 
+	// HTTPS on the same port as plain HTTP, sorted per connection by
+	// tlsmux, so existing installs keep their compose file and app
+	// versions from before HTTPS keep working. Without a certificate the
+	// helper stays on plain HTTP; the app finds no /tls and does too.
+	var tlsConfig *tls.Config
+	if cert, err := tlscert.LoadOrCreate(cfg.DataDir); err != nil {
+		slog.Warn("tls: no certificate; serving plain HTTP only", "err", err)
+	} else {
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			// HTTP/1.1 only: the chat WebSocket takes over its
+			// connection, which HTTP/2 doesn't allow.
+			NextProtos: []string{"http/1.1"},
+		}
+		fingerprint := tlscert.Fingerprint(cert)
+		// Deliberately unauthenticated — see ProofHandler.
+		mux.Handle("GET /tls", tlscert.ProofHandler{Token: cfg.PairingToken, Fingerprint: fingerprint})
+		slog.Info("tls: ready", "fingerprint_sha256", fingerprint)
+	}
+
 	srv := &http.Server{
-		Addr:              cfg.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		slog.Error("listen", "err", err, "addr", cfg.Addr)
+		os.Exit(1)
+	}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("listen", "err", err)
+		if err := serve(srv, ln, tlsConfig); err != nil {
+			slog.Error("serve", "err", err)
 			os.Exit(1)
 		}
 	}()
-	slog.Info("listening", "addr", cfg.Addr)
+	slog.Info("listening", "addr", cfg.Addr, "https", tlsConfig != nil)
+
+	// Also answer on the helper's own tailnet address, where the app
+	// sends helper traffic when it routes over Tailscale. Joining the
+	// tailnet doesn't do this by itself.
+	if onTailnet {
+		if tsLn, err := tsServer.Listen("tcp", tailnetAddr); err != nil {
+			slog.Warn("tsnet: listen failed; helper unreachable at its tailnet address", "err", err)
+		} else {
+			go func() {
+				if err := serve(srv, tsLn, tlsConfig); err != nil {
+					slog.Warn("tsnet: stopped serving", "err", err)
+				}
+			}()
+			slog.Info("listening on tailnet", "addr", tailnetAddr)
+		}
+	}
 
 	<-ctx.Done()
 	slog.Info("shutting down")
@@ -220,6 +281,22 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown", "err", err)
 	}
+}
+
+// tailnetAddr is where the helper answers on its own tailnet address. Fixed
+// rather than following ZEPHYR_ADDR, because it's the port the app dials.
+const tailnetAddr = ":8080"
+
+// serve runs srv on ln until shutdown, splitting off HTTPS when there's a
+// certificate. It returns nil once the server is shut down.
+func serve(srv *http.Server, ln net.Listener, tlsConfig *tls.Config) error {
+	if tlsConfig != nil {
+		ln = tlsmux.New(ln, tlsConfig, tlsmux.DefaultSniffTimeout)
+	}
+	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {

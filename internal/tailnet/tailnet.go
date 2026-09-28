@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -149,6 +150,17 @@ func (s *Server) Stop() {
 		return
 	}
 	_ = s.srv.Close()
+}
+
+// Listen accepts connections on the helper's own tailnet address — what
+// the app dials when it routes helper traffic over Tailscale. Joining the
+// tailnet alone accepts nothing: tsnet only answers ports someone listens
+// on. Errors when the helper isn't on the tailnet.
+func (s *Server) Listen(network, addr string) (net.Listener, error) {
+	if s == nil || s.srv == nil || s.local == nil {
+		return nil, errors.New("tsnet: not on the tailnet")
+	}
+	return s.srv.Listen(network, addr)
 }
 
 // Status returns the latest known SelfStatus. Refreshes from the
