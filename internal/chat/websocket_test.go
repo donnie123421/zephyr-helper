@@ -65,7 +65,7 @@ func TestChatOverWebSocketWithClaude(t *testing.T) {
 	store := llm.NewConfigStore(filepath.Join(t.TempDir(), "llm.json"))
 	if err := store.Save(llm.Config{
 		Provider:  llm.ProviderAnthropic,
-		Anthropic: llm.AnthropicConfig{APIKey: "sk-ant-test", BaseURL: claude.URL},
+		Anthropic: llm.ProviderConfig{APIKey: "sk-ant-test", BaseURL: claude.URL},
 	}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}

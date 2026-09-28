@@ -86,8 +86,8 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | POST | `/push/prefs` | yes | Replace muted categories: `{"muted_categories": ["ALERT_WARNING"]}` |
 | GET | `/llm/config` | yes | Model provider, model, and whether a key is saved (last four characters only) |
 | POST | `/llm/config` | yes | Choose the provider and model, save or remove a key (see [Models](#models)) |
-| POST | `/llm/test` | yes | Check an Anthropic key by listing its models; `{"ok": false, "error": …}` when it's rejected |
-| GET | `/llm/models` | yes | Models the saved Anthropic key can use |
+| POST | `/llm/test` | yes | Check a key or custom server by listing its models; `{"ok": false, "error": …}` when it's rejected |
+| GET | `/llm/models?provider=` | yes | Models the saved settings can use (`anthropic`, the default, `openai` or `custom`) |
 
 ### HTTPS
 
@@ -105,11 +105,18 @@ When the helper is on a tailnet (`TS_AUTHKEY` set), it also serves the same API 
 
 ### Models
 
-Chats run on Ollama unless the app saves another provider. Today that's Claude (`anthropic`) with the user's own API key, through Anthropic's official Go SDK; the default model is `claude-opus-5`. The choice and the key live in `llm.json` in `DATA_DIR`, readable only by the helper. Keys go in through `POST /llm/config` and never come back out: responses carry only whether a key is saved and its last four characters. The helper only accepts a key over HTTPS.
+Chats run on Ollama unless the app saves another provider:
+
+- `anthropic`: Claude with the user's own API key, through Anthropic's official Go SDK. Default model `claude-opus-5`.
+- `openai`: ChatGPT with the user's own API key, through OpenAI's official Go SDK (Chat Completions). Default model `gpt-6-astra`.
+- `custom`: any server that speaks OpenAI's Chat Completions API — LM Studio, llama.cpp, vLLM, OpenRouter — given its address (`http://pc:1234/v1`), a model, and a key if it wants one.
+
+The choice and any keys live in `llm.json` in `DATA_DIR`, readable only by the helper. Keys go in through `POST /llm/config` and never come back out: responses carry only whether a key is saved and its last four characters. The helper only accepts a key over HTTPS.
 
 ```json
 {"provider": "anthropic", "anthropic": {"api_key": "sk-ant-…", "model": "claude-opus-5"}}
-{"provider": "ollama", "anthropic": {"remove_key": true}}
+{"provider": "custom", "custom": {"base_url": "http://pc:1234/v1", "model": "qwen3-32b"}}
+{"provider": "ollama", "anthropic": {"remove_key": true}, "custom": {"forget": true}}
 ```
 
 A chat keeps the model it started with; a change applies from the next chat.

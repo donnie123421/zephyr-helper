@@ -14,16 +14,32 @@ import (
 // helper's data folder readable only by the helper, and keys are never
 // sent back out.
 type Config struct {
-	Provider  string          `json:"provider"`
-	Anthropic AnthropicConfig `json:"anthropic"`
+	Provider  string         `json:"provider"`
+	Anthropic ProviderConfig `json:"anthropic"`
+	OpenAI    ProviderConfig `json:"openai"`
+	Custom    ProviderConfig `json:"custom"`
 }
 
-type AnthropicConfig struct {
+// ProviderConfig is one hosted provider's settings.
+type ProviderConfig struct {
 	APIKey string `json:"api_key,omitempty"`
 	Model  string `json:"model,omitempty"`
-	// BaseURL overrides Anthropic's API, for a gateway. Empty means the
-	// real API.
+	// BaseURL is the server for Custom. For Anthropic and OpenAI it's an
+	// override for a gateway; empty means their own API.
 	BaseURL string `json:"base_url,omitempty"`
+}
+
+// section is the settings for one hosted provider, nil for any other.
+func (c *Config) section(provider string) *ProviderConfig {
+	switch provider {
+	case ProviderAnthropic:
+		return &c.Anthropic
+	case ProviderOpenAI:
+		return &c.OpenAI
+	case ProviderCustom:
+		return &c.Custom
+	}
+	return nil
 }
 
 // ConfigStore reads and writes the config file.
@@ -155,6 +171,23 @@ func (s *Switch) build(cfg Config) (Provider, error) {
 			return nil, Problem("Add an Anthropic API key first.")
 		}
 		return NewAnthropic(cfg.Anthropic.APIKey, cfg.Anthropic.Model, cfg.Anthropic.BaseURL), nil
+	case ProviderOpenAI:
+		if cfg.OpenAI.APIKey == "" {
+			return nil, Problem("Add an OpenAI API key first.")
+		}
+		model := cfg.OpenAI.Model
+		if model == "" {
+			model = DefaultOpenAIModel
+		}
+		return NewOpenAI(ProviderOpenAI, cfg.OpenAI.APIKey, model, cfg.OpenAI.BaseURL), nil
+	case ProviderCustom:
+		if cfg.Custom.BaseURL == "" {
+			return nil, Problem("Add the server's address first.")
+		}
+		if cfg.Custom.Model == "" {
+			return nil, Problem("Choose one of the server's models first.")
+		}
+		return NewOpenAI(ProviderCustom, cfg.Custom.APIKey, cfg.Custom.Model, cfg.Custom.BaseURL), nil
 	default:
 		return nil, Problem(fmt.Sprintf("Unknown provider %q.", cfg.Provider))
 	}

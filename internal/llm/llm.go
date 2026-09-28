@@ -18,6 +18,10 @@ import (
 const (
 	ProviderOllama    = "ollama"
 	ProviderAnthropic = "anthropic"
+	ProviderOpenAI    = "openai"
+	// ProviderCustom is any server that speaks OpenAI's Chat Completions
+	// API: LM Studio, llama.cpp, vLLM, OpenRouter.
+	ProviderCustom = "custom"
 )
 
 // ErrModelNotReady means the model isn't available yet: Ollama hasn't
