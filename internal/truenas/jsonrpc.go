@@ -58,6 +58,13 @@ func (e *rpcError) Error() string {
 	if e == nil {
 		return ""
 	}
+	// TrueNAS's message is a generic "Method call error"; what went wrong
+	// ("Not authenticated", a validation failure) is in data.reason.
+	if data, ok := e.Data.(map[string]any); ok {
+		if reason, ok := data["reason"].(string); ok && reason != "" {
+			return fmt.Sprintf("rpc error %d: %s: %s", e.Code, e.Message, reason)
+		}
+	}
 	return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message)
 }
 
@@ -198,16 +205,20 @@ func (c *rpcClient) ensureConnected(ctx context.Context) (*websocket.Conn, error
 	// legacy REST client used.
 	newConn.SetReadLimit(4 << 20)
 
-	c.connMu.Lock()
-	c.conn = newConn
-	c.connMu.Unlock()
-
 	go c.readLoop(newConn)
 
 	if err := c.authenticate(ctx, newConn); err != nil {
-		c.dropConnection(newConn)
+		_ = newConn.Close(websocket.StatusInternalError, "auth failed")
 		return nil, fmt.Errorf("auth: %w", err)
 	}
+
+	// Publish the connection only once it has logged in. Callers that
+	// find c.conn set skip connectMu and send straight away, and TrueNAS
+	// rejects calls on a socket that hasn't authenticated yet — which is
+	// what the pollers' first calls at startup used to run into.
+	c.connMu.Lock()
+	c.conn = newConn
+	c.connMu.Unlock()
 
 	c.log.Info("rpc: connected", "url", c.wsURL)
 	return newConn, nil
