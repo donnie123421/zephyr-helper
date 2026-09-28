@@ -36,6 +36,9 @@ type Config struct {
 	// day, the history behind the capacity forecast. Its own file so the
 	// hourly sample never waits on the events DB's write lock.
 	CapacityDBPath string
+	// LLMConfigPath is the chosen model provider and its API key, written
+	// by POST /llm/config with owner-only permissions.
+	LLMConfigPath string
 	// EventsRetentionDays bounds the events archive; a daily pruner
 	// deletes rows older than this. 0 disables pruning entirely.
 	EventsRetentionDays int
@@ -108,6 +111,7 @@ func Load() (*Config, error) {
 	cfg.EventsDBPath = envOr("EVENTS_DB_PATH", filepath.Join(cfg.DataDir, "events.db"))
 	cfg.PushPrefsPath = filepath.Join(cfg.DataDir, "push_prefs.json")
 	cfg.CapacityDBPath = filepath.Join(cfg.DataDir, "capacity.db")
+	cfg.LLMConfigPath = filepath.Join(cfg.DataDir, "llm.json")
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,
 	// mint one and print it so the operator can pair by hand.

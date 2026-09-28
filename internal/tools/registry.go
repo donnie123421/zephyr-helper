@@ -52,26 +52,46 @@ func New(tn *truenas.Client) *Registry {
 	return r
 }
 
+// NewWith builds a registry from the given tools rather than the TrueNAS
+// builtins.
+func NewWith(ts ...Tool) *Registry {
+	r := &Registry{tools: map[string]Tool{}}
+	for _, t := range ts {
+		r.tools[t.Def.Name] = t
+	}
+	return r
+}
+
 // Empty reports whether the registry has no tools (helper was started without
 // TrueNAS credentials).
 func (r *Registry) Empty() bool { return len(r.tools) == 0 }
 
-// Definitions returns all tool definitions in the shape Ollama's /api/chat
-// expects in its request body, sorted by name. The list is part of every
-// prompt, and hosted model APIs only reuse a cached prompt whose prefix is
-// byte-identical — map order would make every request a cache miss.
-func (r *Registry) Definitions() []map[string]any {
+// List returns every tool definition, sorted by name. The list is part of
+// every prompt, and hosted model APIs only reuse a cached prompt whose
+// prefix is byte-identical — map order would make every request a cache
+// miss.
+func (r *Registry) List() []Definition {
 	names := make([]string, 0, len(r.tools))
 	for name := range r.tools {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
-	out := make([]map[string]any, 0, len(names))
+	out := make([]Definition, 0, len(names))
 	for _, name := range names {
+		out = append(out, r.tools[name].Def)
+	}
+	return out
+}
+
+// Definitions returns List in the shape Ollama's /api/chat expects.
+func (r *Registry) Definitions() []map[string]any {
+	defs := r.List()
+	out := make([]map[string]any, 0, len(defs))
+	for _, def := range defs {
 		out = append(out, map[string]any{
 			"type":     "function",
-			"function": r.tools[name].Def,
+			"function": def,
 		})
 	}
 	return out
@@ -87,19 +107,19 @@ func (r *Registry) StatusLine(name string) string {
 }
 
 // Dispatch runs the named tool with the given arguments, returning the
-// JSON-encoded result the LLM should see as the tool message content. Unknown
-// tool names aren't a fatal error — we return the error as the tool result so
-// the model can recover.
-func (r *Registry) Dispatch(ctx context.Context, name string, args json.RawMessage) string {
+// JSON-encoded result the LLM should see as the tool message content, and
+// whether it's an error. Unknown tool names aren't a fatal error — we return
+// the error as the tool result so the model can recover.
+func (r *Registry) Dispatch(ctx context.Context, name string, args json.RawMessage) (string, bool) {
 	t, ok := r.tools[name]
 	if !ok {
-		return toolErrorf("unknown tool: %s", name)
+		return toolErrorf("unknown tool: %s", name), true
 	}
 	result, err := t.Handler(ctx, args)
 	if err != nil {
-		return toolErrorf("%s failed: %v", name, err)
+		return toolErrorf("%s failed: %v", name, err), true
 	}
-	return result
+	return result, false
 }
 
 func toolErrorf(format string, a ...any) string {

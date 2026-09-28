@@ -22,6 +22,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/events"
 	"github.com/donnie123421/zephyr-helper/internal/events/correlators"
 	eventshttp "github.com/donnie123421/zephyr-helper/internal/events/http"
+	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/pollers"
@@ -67,7 +68,12 @@ func main() {
 	}
 
 	ollamaClient := ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel)
-	chatHandler := chat.NewHandler(ollamaClient, toolRegistry)
+	// The model new chats use: Ollama unless the app has saved another
+	// provider and its key.
+	llmSwitch := llm.NewSwitch(llm.NewConfigStore(cfg.LLMConfigPath), llm.NewOllama(ollamaClient))
+	slog.Info("llm: provider", "provider", llmSwitch.Current().Name(), "model", llmSwitch.Current().Model())
+	chatHandler := chat.NewHandler(llmSwitch, toolRegistry)
+	llmHandler := &llm.Handler{Switch: llmSwitch, Ollama: ollamaClient}
 	modelsHandler := models.NewHandler(ollamaClient)
 
 	eventsStore, err := events.Open(cfg.EventsDBPath)
@@ -215,6 +221,9 @@ func main() {
 		return auth.Require(cfg.PairingToken, h)
 	})
 	pushPrefsHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
+	llmHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
 

@@ -59,7 +59,7 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | `OLLAMA_MODEL` | `qwen2.5:7b-instruct` | Default model |
 | `TRUENAS_URL` | — | TrueNAS host (used from Phase B onward) |
 | `TRUENAS_API_KEY` | — | TrueNAS API key (used from Phase B onward) |
-| `DATA_DIR` | `/data` | Directory for persistent state (events DB, push prefs, pool capacity history, TLS certificate). The iOS installer mounts a named volume here; falls back to `/tmp` if unwritable. |
+| `DATA_DIR` | `/data` | Directory for persistent state (events DB, push prefs, pool capacity history, TLS certificate, model settings). The iOS installer mounts a named volume here; falls back to `/tmp` if unwritable. |
 | `EVENTS_DB_PATH` | `{DATA_DIR}/events.db` | SQLite path for the event store. Override for tests/manual layouts. |
 | `EVENTS_RETENTION_DAYS` | `90` | Daily pruner deletes events older than this. `0` disables pruning. |
 | `PUSH_RELAY_URL` | — | Base URL of the zephyr-push-relay Worker. Set by the iOS installer. Empty = push disabled. |
@@ -84,6 +84,10 @@ On first boot with no `PAIRING_TOKEN` env set, the server mints one and prints i
 | GET (WS) | `/events/stream` | yes | Live event stream |
 | GET | `/push/prefs` | yes | Muted push categories (iOS-synced) |
 | POST | `/push/prefs` | yes | Replace muted categories: `{"muted_categories": ["ALERT_WARNING"]}` |
+| GET | `/llm/config` | yes | Model provider, model, and whether a key is saved (last four characters only) |
+| POST | `/llm/config` | yes | Choose the provider and model, save or remove a key (see [Models](#models)) |
+| POST | `/llm/test` | yes | Check an Anthropic key by listing its models; `{"ok": false, "error": …}` when it's rejected |
+| GET | `/llm/models` | yes | Models the saved Anthropic key can use |
 
 ### HTTPS
 
@@ -99,6 +103,17 @@ where `proof` is `hex(HMAC-SHA256(key: pairing token, message: "zephyr-helper-tl
 
 When the helper is on a tailnet (`TS_AUTHKEY` set), it also serves the same API on its own tailnet address, port 8080.
 
+### Models
+
+Chats run on Ollama unless the app saves another provider. Today that's Claude (`anthropic`) with the user's own API key, through Anthropic's official Go SDK; the default model is `claude-opus-5`. The choice and the key live in `llm.json` in `DATA_DIR`, readable only by the helper. Keys go in through `POST /llm/config` and never come back out: responses carry only whether a key is saved and its last four characters. The helper only accepts a key over HTTPS.
+
+```json
+{"provider": "anthropic", "anthropic": {"api_key": "sk-ant-…", "model": "claude-opus-5"}}
+{"provider": "ollama", "anthropic": {"remove_key": true}}
+```
+
+A chat keeps the model it started with; a change applies from the next chat.
+
 ### Wire format
 
 Client → server:
@@ -112,12 +127,15 @@ Server → client (streamed):
 {"type": "delta", "content": " plus "}
 {"type": "delta", "content": "2"}
 {"type": "delta", "content": " = 4."}
+{"type": "usage", "model": "claude-opus-5", "input_tokens": 1250, "output_tokens": 180, "cache_read_tokens": 900, "cache_write_tokens": 0}
 {"type": "done"}
 ```
 
-Errors terminate the stream:
+`usage` comes before `done` for models that count tokens (not Ollama), even when the turn fails partway. Clients that don't know a frame type skip it.
+
+An error ends the turn, not the chat — the client can send the next message on the same connection:
 ```json
-{"type": "error", "message": "ollama: 500 Internal Server Error"}
+{"type": "error", "message": "Anthropic rejected the API key. Check it in the assistant's settings."}
 ```
 
 ### Docker

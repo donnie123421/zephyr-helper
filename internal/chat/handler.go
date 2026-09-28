@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sync"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	"github.com/donnie123421/zephyr-helper/internal/ollama"
+	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 )
 
@@ -51,21 +50,21 @@ type outboundEvent struct {
 	Name string `json:"name,omitempty"`
 }
 
-type Handler struct {
-	ollama *ollama.Client
-	tools  *tools.Registry
-
-	// modelMu serializes the first Pull across concurrent WS connections so we
-	// don't fire N simultaneous downloads. readyModel holds the name of the
-	// model we've successfully pulled this process — when it differs from the
-	// active model (e.g. after the iOS picker switched), the next chat triggers
-	// a fresh pull.
-	modelMu    sync.Mutex
-	readyModel string
+// usageEvent reports the tokens one turn used, for models that count them.
+// Clients that don't know the frame skip it.
+type usageEvent struct {
+	Type  string `json:"type"`
+	Model string `json:"model"`
+	llm.Usage
 }
 
-func NewHandler(c *ollama.Client, reg *tools.Registry) *Handler {
-	return &Handler{ollama: c, tools: reg}
+type Handler struct {
+	models *llm.Switch
+	tools  *tools.Registry
+}
+
+func NewHandler(models *llm.Switch, reg *tools.Registry) *Handler {
+	return &Handler{models: models, tools: reg}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -83,31 +82,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// r.Context() isn't reliably cancelled when a WebSocket connection closes
 	// (the HTTP request "completes" at upgrade time), so we drive cancellation
 	// from the read loop below: any wsjson.Read error cancels this ctx, which
-	// aborts any in-flight Pull or Chat goroutines for this connection.
+	// aborts any in-flight Prepare or Step for this connection.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Seed history with the system prompt so the model knows its role + tools.
-	history := []ollama.Message{{Role: "system", Content: h.systemPrompt()}}
+	send := func(v any) error { return wsjson.Write(ctx, conn, v) }
+	onStatus := func(status string) {
+		if err := send(outboundEvent{Type: "status", Content: status}); err != nil {
+			slog.Warn("chat: status write failed", "err", err)
+		}
+	}
 
-	// Pre-warm the model in a background goroutine so we can pull a large
-	// model while simultaneously watching the read side for a client
-	// disconnect. If the client leaves, ctx cancels, Pull aborts.
-	slog.Info("chat: pre-warming model on connect",
-		"model", h.ollama.Model(),
-		"ready_model", h.readyModelSnapshot(),
-		"tools", !h.tools.Empty(),
-	)
-	prewarmDone := make(chan struct{})
-	var prewarmErr error
+	// The chat keeps the model it started with; a settings change applies
+	// from the next chat.
+	provider := h.models.Current()
+	session := provider.NewSession(h.systemPrompt(), h.toolList())
+
+	// Prepare the model in the background so a large Ollama pull can run
+	// while the read side watches for a client disconnect. If the client
+	// leaves, ctx cancels and the pull aborts.
+	slog.Info("chat: connected", "provider", provider.Name(), "model", provider.Model(), "tools", !h.tools.Empty())
+	prepareDone := make(chan struct{})
+	var prepareErr error
 	go func() {
-		defer close(prewarmDone)
-		prewarmErr = h.ensureModelPulled(ctx, conn)
-		if prewarmErr != nil {
+		defer close(prepareDone)
+		prepareErr = provider.Prepare(ctx, onStatus)
+		if prepareErr != nil {
 			// Tell the client immediately — otherwise they'll sit waiting for a
 			// download that never finishes and only see the failure when they
 			// type a message.
-			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: prewarmErr.Error()})
+			_ = send(outboundEvent{Type: "error", Message: prepareErr.Error()})
 		}
 	}()
 
@@ -115,43 +119,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var msg inboundEvent
 		if err := wsjson.Read(ctx, conn, &msg); err != nil {
 			slog.Info("chat: ws read ended", "err", err)
-			return // defer cancel() aborts pre-warm/pull
+			return // defer cancel() aborts the prepare/pull
 		}
 		if msg.Type != "user_message" || msg.Content == "" {
 			continue
 		}
 
-		// Don't attempt chat until the model is pulled and ready.
+		// Don't chat until the model is ready.
 		select {
-		case <-prewarmDone:
+		case <-prepareDone:
 		case <-ctx.Done():
 			return
 		}
-		if prewarmErr != nil {
-			// Error frame was already sent by the prewarm goroutine when it
-			// failed; just bail so we don't run a chat against an unready model.
+		if prepareErr != nil {
+			// The error frame went out when Prepare failed.
 			return
 		}
 
-		history = append(history, ollama.Message{Role: "user", Content: msg.Content})
-		// Bound the replayed conversation before it goes back to Ollama —
-		// otherwise a long session eventually overruns the model's context
-		// window and the system prompt is the first thing the server drops.
-		if trimmed := trimHistory(history); len(trimmed) != len(history) {
-			slog.Info("chat: history trimmed",
-				"from_messages", len(history), "to_messages", len(trimmed))
-			history = trimmed
+		session.AddUserMessage(msg.Content)
+		if err := h.runTurn(ctx, send, onStatus, provider, session); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Report it and keep the chat open: a rate limit or a flaky
+			// connection shouldn't cost the user the conversation.
+			slog.Error("chat: turn failed", "provider", provider.Name(), "err", err)
+			if send(outboundEvent{Type: "error", Message: err.Error()}) != nil {
+				return
+			}
+			continue
 		}
 
-		newHistory, err := h.runTurn(ctx, conn, history)
-		if err != nil {
-			slog.Error("turn", "err", err)
-			_ = wsjson.Write(ctx, conn, outboundEvent{Type: "error", Message: err.Error()})
-			return
-		}
-		history = newHistory
-
-		if err := wsjson.Write(ctx, conn, outboundEvent{Type: "done"}); err != nil {
+		if err := send(outboundEvent{Type: "done"}); err != nil {
 			slog.Info("chat: done write failed", "err", err)
 			return
 		}
@@ -165,128 +164,72 @@ func (h *Handler) systemPrompt() string {
 	return systemPromptBase + systemPromptWithTools
 }
 
-// runTurn drives one user-message → assistant-answer cycle, including any
-// intermediate tool calls. Returns the updated history (including the
-// assistant's final message and any tool results) for the caller to keep.
-func (h *Handler) runTurn(ctx context.Context, conn *websocket.Conn, history []ollama.Message) ([]ollama.Message, error) {
+func (h *Handler) toolList() []llm.Tool {
+	if h.tools == nil {
+		return nil
+	}
+	defs := h.tools.List()
+	out := make([]llm.Tool, 0, len(defs))
+	for _, def := range defs {
+		out = append(out, llm.Tool{Name: def.Name, Description: def.Description, Parameters: def.Parameters})
+	}
+	return out
+}
+
+// runTurn drives one user message to the model's answer, running any tools
+// it asks for along the way.
+func (h *Handler) runTurn(
+	ctx context.Context,
+	send func(any) error,
+	onStatus func(string),
+	provider llm.Provider,
+	session llm.Session,
+) error {
 	onDelta := func(delta string) error {
-		return wsjson.Write(ctx, conn, outboundEvent{Type: "delta", Content: delta})
+		return send(outboundEvent{Type: "delta", Content: delta})
 	}
 
-	toolDefs := h.tools.Definitions() // empty slice is fine — Chat skips the tools key
+	var usage llm.Usage
+	defer func() {
+		// Sent even when the turn fails partway: those tokens were spent.
+		if !usage.IsZero() {
+			_ = send(usageEvent{Type: "usage", Model: provider.Model(), Usage: usage})
+		}
+	}()
 
 	for iter := 0; iter < maxToolIterations; iter++ {
-		result, err := h.ollama.Chat(ctx, history, toolDefs, onDelta)
-		if errors.Is(err, ollama.ErrModelMissing) {
-			slog.Info("chat: model not present mid-turn, pulling", "model", h.ollama.Model())
-			if pullErr := h.ensureModelPulled(ctx, conn); pullErr != nil {
-				return history, pullErr
+		result, err := session.Step(ctx, onDelta)
+		if errors.Is(err, llm.ErrModelNotReady) {
+			slog.Info("chat: model not present mid-turn, preparing", "model", provider.Model())
+			if prepErr := provider.Prepare(ctx, onStatus); prepErr != nil {
+				return prepErr
 			}
-			// Single retry after a successful pull.
-			result, err = h.ollama.Chat(ctx, history, toolDefs, onDelta)
+			// Single retry once the model is ready.
+			result, err = session.Step(ctx, onDelta)
 		}
+		usage.Add(result.Usage)
 		if err != nil {
-			return history, err
+			return err
 		}
-
-		history = append(history, result.Message)
-
 		if len(result.ToolCalls) == 0 {
-			// Plain text answer — we already streamed it via onDelta. Done.
-			return history, nil
+			// The answer already streamed through onDelta.
+			return nil
 		}
 
 		// Tool calls to dispatch. Emit a user-facing status line for each so
 		// the iOS UI can render "Checking pools…" rather than a silent pause,
 		// and a `tool_used` frame once the dispatch completes so the UI can
 		// leave a persistent chip in the chat thread.
-		for _, tc := range result.ToolCalls {
-			_ = wsjson.Write(ctx, conn, outboundEvent{
-				Type:    "status",
-				Content: h.tools.StatusLine(tc.Function.Name),
-			})
-
-			slog.Info("chat: dispatching tool",
-				"name", tc.Function.Name,
-				"args", string(tc.Function.Arguments),
-			)
-			toolResult := h.tools.Dispatch(ctx, tc.Function.Name, tc.Function.Arguments)
-
-			_ = wsjson.Write(ctx, conn, outboundEvent{
-				Type: "tool_used",
-				Name: tc.Function.Name,
-			})
-
-			history = append(history, ollama.Message{
-				Role:    "tool",
-				Content: toolResult,
-			})
+		results := make([]llm.ToolResult, 0, len(result.ToolCalls))
+		for _, call := range result.ToolCalls {
+			onStatus(h.tools.StatusLine(call.Name))
+			slog.Info("chat: dispatching tool", "name", call.Name, "args", string(call.Arguments))
+			content, isError := h.tools.Dispatch(ctx, call.Name, call.Arguments)
+			_ = send(outboundEvent{Type: "tool_used", Name: call.Name})
+			results = append(results, llm.ToolResult{CallID: call.ID, Content: content, IsError: isError})
 		}
+		session.AddToolResults(results)
 	}
 
-	return history, fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
-}
-
-// readyModelSnapshot returns the name of the model we've pulled this process,
-// or empty string if none. Takes the modelMu read-lock defensively even though
-// the caller (logging) doesn't strictly need it.
-func (h *Handler) readyModelSnapshot() string {
-	h.modelMu.Lock()
-	defer h.modelMu.Unlock()
-	return h.readyModel
-}
-
-// ensureModelPulled triggers a pull if the currently-active model hasn't been
-// pulled yet in this process. Serialized across concurrent connections via
-// modelMu. Compares the active model to readyModel rather than tracking a bool
-// so a model switch (via POST /model) transparently triggers a new pull.
-func (h *Handler) ensureModelPulled(ctx context.Context, conn *websocket.Conn) error {
-	h.modelMu.Lock()
-	defer h.modelMu.Unlock()
-
-	model := h.ollama.Model()
-	if h.readyModel == model {
-		_ = wsjson.Write(ctx, conn, outboundEvent{Type: "status", Content: "Model ready."})
-		return nil
-	}
-	if err := wsjson.Write(ctx, conn, outboundEvent{
-		Type:    "status",
-		Content: fmt.Sprintf("Downloading model %s — this can take several minutes.", model),
-	}); err != nil {
-		slog.Warn("chat: status write failed (intro)", "err", err)
-	}
-
-	var lastPct int = -1
-	err := h.ollama.Pull(ctx, func(s ollama.PullStatus) {
-		// Collapse noisy frames: only forward progress updates where the
-		// rounded percent has changed, plus terminal phase transitions.
-		if s.Total > 0 {
-			pct := int((s.Completed * 100) / s.Total)
-			if pct == lastPct {
-				return
-			}
-			lastPct = pct
-			if err := wsjson.Write(ctx, conn, outboundEvent{
-				Type:    "status",
-				Content: fmt.Sprintf("%s (%d%%)", s.Status, pct),
-			}); err != nil {
-				slog.Warn("chat: status write failed (pct)", "err", err, "pct", pct)
-			}
-			return
-		}
-		// Phase transition without percent (e.g. "verifying sha256 digest").
-		if err := wsjson.Write(ctx, conn, outboundEvent{
-			Type:    "status",
-			Content: s.Status,
-		}); err != nil {
-			slog.Warn("chat: status write failed (phase)", "err", err, "phase", s.Status)
-		}
-	})
-	if err != nil {
-		return fmt.Errorf("pull: %w", err)
-	}
-
-	h.readyModel = model
-	_ = wsjson.Write(ctx, conn, outboundEvent{Type: "status", Content: "Model ready."})
-	return nil
+	return fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
 }

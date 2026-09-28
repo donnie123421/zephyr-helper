@@ -1,4 +1,4 @@
-package chat
+package llm
 
 import "github.com/donnie123421/zephyr-helper/internal/ollama"
 
