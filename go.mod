@@ -1,10 +1,13 @@
 module github.com/donnie123421/zephyr-helper
 
-// Patch-level minimum, not just 1.26: go1.26.5 carries the fix for
-// GO-2026-5856 (Encrypted Client Hello privacy leak in crypto/tls), which
-// the helper's outbound TLS reaches. Pinning it here makes the requirement
-// machine-enforced instead of relying on the floating golang:1.26 tag.
-go 1.26.5
+// Patch-level minimum, not just 1.26. go1.26.5 carried the fix for
+// GO-2026-5856 (Encrypted Client Hello privacy leak in crypto/tls); go1.26.6
+// fixed a further set in crypto/tls, net/http, net/url, net, encoding/asn1
+// and encoding/xml (GO-2026-6090, -6089, -6218, -5942, -5972, -6088, -5026),
+// which matter more now that the helper serves TLS as well as dialing it.
+// 1.26.8 is what golang:1.26-alpine builds with. Pinning it here makes the
+// requirement machine-enforced instead of relying on the floating tag.
+go 1.26.8
 
 require (
 	github.com/coder/websocket v1.8.14
