@@ -327,7 +327,7 @@ func TestAnExplanationClosedBeforeItsAnswerIsNotSaved(t *testing.T) {
 	if types := frameTypes(frames); fmt.Sprint(types) != "[error]" {
 		t.Fatalf("frames = %v", frames)
 	}
-	if list, _ := saved.List(ctx); len(list) != 0 {
+	if list, _ := saved.List(ctx, 0); len(list) != 0 {
 		t.Errorf("saved %+v, want nothing", list)
 	}
 }
@@ -365,7 +365,7 @@ func TestAChatDeletedWhileOpenStaysDeleted(t *testing.T) {
 	if second[len(second)-1]["type"] != "done" {
 		t.Fatalf("the chat should carry on: %v", second)
 	}
-	if list, _ := saved.List(ctx); len(list) != 0 {
+	if list, _ := saved.List(ctx, 0); len(list) != 0 {
 		t.Errorf("the deleted chat came back: %+v", list)
 	}
 }
