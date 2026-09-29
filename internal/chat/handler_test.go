@@ -109,7 +109,7 @@ func TestRunTurnDispatchesToolsAndReportsUsage(t *testing.T) {
 	var out frames
 	onStatus := func(s string) { _ = out.send(outboundEvent{Type: "status", Content: s}) }
 
-	if err := h.runTurn(context.Background(), out.send, onStatus, &fakeProvider{}, session); err != nil {
+	if _, err := h.runTurn(context.Background(), out.send, onStatus, &fakeProvider{}, session); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestRunTurnPreparesAndRetriesWhenTheModelIsMissing(t *testing.T) {
 		{deltas: []string{"hello"}},
 	}}
 	var out frames
-	if err := h.runTurn(context.Background(), out.send, func(string) {}, provider, session); err != nil {
+	if _, err := h.runTurn(context.Background(), out.send, func(string) {}, provider, session); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if provider.prepared != 1 {
@@ -161,7 +161,7 @@ func TestRunTurnReportsUsageEvenWhenItFails(t *testing.T) {
 		{result: llm.StepResult{Usage: llm.Usage{InputTokens: 5}}, err: llm.Problem("Claude declined to answer that.")},
 	}}
 	var out frames
-	err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session)
+	_, err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session)
 	if err == nil || err.Error() != "Claude declined to answer that." {
 		t.Fatalf("err = %v", err)
 	}
@@ -178,7 +178,7 @@ func TestRunTurnStopsRunawayToolLoops(t *testing.T) {
 		session.steps = append(session.steps, loop)
 	}
 	var out frames
-	if err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session); err == nil {
+	if _, err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session); err == nil {
 		t.Fatal("expected the iteration cap to stop the loop")
 	}
 }
@@ -196,7 +196,7 @@ func TestRunTurnStartsANewParagraphOnlyWhenNeeded(t *testing.T) {
 			{deltas: []string{"Done."}},
 		}}
 		var out frames
-		if err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session); err != nil {
+		if _, err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session); err != nil {
 			t.Fatalf("runTurn: %v", err)
 		}
 		var deltas []string
@@ -208,5 +208,18 @@ func TestRunTurnStartsANewParagraphOnlyWhenNeeded(t *testing.T) {
 		if len(deltas) != 2 || deltas[1] != c.want {
 			t.Errorf("after %q, next delta = %q, want %q", c.first, deltas, c.want)
 		}
+	}
+}
+
+func TestRunTurnReturnsTheTextOfAStepCutShort(t *testing.T) {
+	h := &Handler{tools: testRegistry()}
+	session := &scriptedSession{steps: []scriptedStep{
+		{deltas: []string{"Checking."}, result: llm.StepResult{ToolCalls: []llm.ToolCall{{ID: "1", Name: "list_pools"}}}},
+		{deltas: []string{"tank is"}, err: context.Canceled},
+	}}
+	var out frames
+	unfinished, err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session)
+	if !errors.Is(err, context.Canceled) || unfinished != "\n\ntank is" {
+		t.Fatalf("runTurn = %q, %v; want the second step's text", unfinished, err)
 	}
 }

@@ -62,10 +62,10 @@ func (c *savedChat) active() bool { return c.store != nil && !c.off }
 
 // resume carries on the saved conversation id in session. It returns
 // conversations.ErrNotFound when it has been deleted.
-func (c *savedChat) resume(ctx context.Context, id string, session llm.Session) (conversations.Summary, error) {
+func (c *savedChat) resume(ctx context.Context, id string, session llm.Session) (conversations.Conversation, error) {
 	conv, err := c.store.Get(ctx, id)
 	if err != nil {
-		return conversations.Summary{}, err
+		return conversations.Conversation{}, err
 	}
 	for _, m := range replayable(conv.Messages) {
 		if m.Role == conversations.RoleUser {
@@ -75,7 +75,7 @@ func (c *savedChat) resume(ctx context.Context, id string, session llm.Session) 
 		}
 	}
 	c.id = conv.ID
-	return conv.Summary, nil
+	return conv, nil
 }
 
 // replayable tidies saved messages into a transcript every model accepts:
@@ -134,9 +134,10 @@ func (c *savedChat) userSaid(ctx context.Context, text string) {
 	}
 }
 
-// turnEnded saves the reply, if the turn finished with one, and records the
-// model and what the turn cost either way.
-func (c *savedChat) turnEnded(ctx context.Context, provider llm.Provider, turn *turnRecord, finished bool) {
+// turnEnded saves the reply when keep is set (the turn finished, or the
+// user stopped it and so has seen it), and records the model and what the
+// turn cost either way.
+func (c *savedChat) turnEnded(ctx context.Context, provider llm.Provider, turn *turnRecord, keep bool) {
 	if !c.active() {
 		return
 	}
@@ -147,7 +148,7 @@ func (c *savedChat) turnEnded(ctx context.Context, provider llm.Provider, turn *
 	// the reply, and the session doesn't keep it either. Nor is a reply
 	// with no text, which can't be replayed.
 	reply := turn.text.String()
-	answered := finished && strings.TrimSpace(reply) != ""
+	answered := keep && strings.TrimSpace(reply) != ""
 
 	if c.id == "" {
 		if len(c.pending) == 0 || !answered {
@@ -180,6 +181,18 @@ func (c *savedChat) turnEnded(ctx context.Context, provider llm.Provider, turn *
 		u.InputTokens+u.CacheReadTokens+u.CacheWriteTokens, u.OutputTokens)
 	if err != nil && !errors.Is(err, conversations.ErrNotFound) {
 		slog.Error("chat: couldn't record the turn", "err", err)
+	}
+}
+
+// dropReplies forgets what came after the last question, for Retry.
+func (c *savedChat) dropReplies(ctx context.Context) {
+	if !c.active() || c.id == "" {
+		return
+	}
+	ctx, cancel := storeContext(ctx)
+	defer cancel()
+	if err := c.store.DropReplies(ctx, c.id); err != nil {
+		slog.Error("chat: couldn't drop the answer being redone", "err", err)
 	}
 }
 

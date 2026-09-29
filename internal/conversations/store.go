@@ -209,6 +209,20 @@ SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ? FROM messages WHERE conversat
 	return tx.Commit()
 }
 
+// DropReplies deletes whatever follows the conversation's last user
+// message: an answer that's being written again.
+func (s *Store) DropReplies(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `
+DELETE FROM messages
+WHERE conversation_id = ?
+  AND seq > (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation_id = ? AND role = 'user')`,
+		id, id)
+	if err != nil {
+		return fmt.Errorf("drop replies: %w", err)
+	}
+	return nil
+}
+
 // RecordTurn notes which model answered and adds the tokens it used.
 func (s *Store) RecordTurn(ctx context.Context, id, provider, model string, inputTokens, outputTokens int64) error {
 	res, err := s.db.ExecContext(ctx, `

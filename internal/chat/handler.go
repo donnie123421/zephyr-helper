@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -100,14 +101,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Tell the app what this helper can do in a chat. Apps that don't know
+	// the frame skip it.
+	if err := send(readyEvent{Type: "ready", Features: chatFeatures}); err != nil {
+		return
+	}
+
 	// The chat keeps the model it started with; a settings change applies
-	// from the next chat.
+	// from the next chat (or when the app reconnects this one).
 	provider := h.models.Current()
-	session := provider.NewSession(h.systemPrompt(), h.toolList())
+	chat := &chatConn{
+		h:        h,
+		send:     send,
+		onStatus: onStatus,
+		provider: provider,
+		session:  provider.NewSession(h.systemPrompt(), h.toolList()),
+		saved:    newSavedChat(h.saved, send, r.URL.Query()),
+	}
 
 	// The app reopens a saved chat with ?conversation=<id>; the model
 	// picks up from its saved messages.
-	saved := newSavedChat(h.saved, send, r.URL.Query())
 	if id := r.URL.Query().Get("conversation"); id != "" {
 		if h.saved == nil {
 			// Carrying on without the history would look like the same
@@ -115,7 +128,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = send(outboundEvent{Type: "error", Code: codeConversationsUnavailable, Message: conversations.Unavailable})
 			return
 		}
-		summary, err := saved.resume(ctx, id, session)
+		summary, err := chat.resume(ctx, id)
 		if err != nil {
 			event := outboundEvent{Type: "error", Message: "Couldn't open this conversation."}
 			if errors.Is(err, conversations.ErrNotFound) {
@@ -148,13 +161,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// The reader runs alongside the turns, so a stop reaches the answer
+	// it's meant for. Anything else waits its turn; the app sends one
+	// message at a time, so the queue is a backstop.
+	inbox := make(chan inboundEvent, 8)
+	var stopMu sync.Mutex
+	var stopTurn context.CancelFunc
+	go func() {
+		defer cancel() // a read error ends the chat
+		for {
+			var msg inboundEvent
+			if err := wsjson.Read(ctx, conn, &msg); err != nil {
+				slog.Info("chat: ws read ended", "err", err)
+				return
+			}
+			if msg.Type == "stop" {
+				stopMu.Lock()
+				if stopTurn != nil {
+					stopTurn()
+				}
+				stopMu.Unlock()
+				continue
+			}
+			select {
+			case inbox <- msg:
+			default:
+				slog.Warn("chat: dropped a message sent while the queue was full", "type", msg.Type)
+			}
+		}
+	}()
+
 	for {
 		var msg inboundEvent
-		if err := wsjson.Read(ctx, conn, &msg); err != nil {
-			slog.Info("chat: ws read ended", "err", err)
-			return // defer cancel() aborts the prepare/pull
+		select {
+		case msg = <-inbox:
+		case <-ctx.Done():
+			return // the reader cancelled; the pull and any turn abort
 		}
-		if msg.Type != "user_message" || msg.Content == "" {
+		switch {
+		case msg.Type == "user_message" && msg.Content != "":
+		case msg.Type == "retry":
+		default:
 			continue
 		}
 
@@ -169,26 +216,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session.AddUserMessage(msg.Content)
-		saved.userSaid(ctx, msg.Content)
-		turn := &turnRecord{}
-		err := h.runTurn(ctx, turn.observe(send), onStatus, provider, session)
-		saved.turnEnded(ctx, provider, turn, err == nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			// Report it and keep the chat open: a rate limit or a flaky
-			// connection shouldn't cost the user the conversation.
-			slog.Error("chat: turn failed", "provider", provider.Name(), "err", err)
-			if send(outboundEvent{Type: "error", Message: err.Error()}) != nil {
-				return
-			}
-			continue
+		turnCtx, stop := context.WithCancel(ctx)
+		stopMu.Lock()
+		stopTurn = stop
+		stopMu.Unlock()
+
+		var open bool
+		if msg.Type == "retry" {
+			open = chat.retry(ctx, turnCtx)
+		} else {
+			open = chat.ask(ctx, turnCtx, msg.Content)
 		}
 
-		if err := send(outboundEvent{Type: "done"}); err != nil {
-			slog.Info("chat: done write failed", "err", err)
+		stopMu.Lock()
+		stopTurn = nil
+		stopMu.Unlock()
+		stop()
+		if !open {
 			return
 		}
 	}
@@ -214,18 +258,20 @@ func (h *Handler) toolList() []llm.Tool {
 }
 
 // runTurn drives one user message to the model's answer, running any tools
-// it asks for along the way.
+// it asks for along the way. When it fails, unfinished is the text of the
+// step that was cut short, which the session hasn't kept.
 func (h *Handler) runTurn(
 	ctx context.Context,
 	send func(any) error,
 	onStatus func(string),
 	provider llm.Provider,
 	session llm.Session,
-) error {
+) (unfinished string, err error) {
 	// Every step's text goes out as one reply. When a step that ran tools
 	// had already said something ("Let me check your pools."), the next
 	// step's text starts a new paragraph instead of running on from it.
 	var lastText string
+	var stepText strings.Builder
 	stepEnded := false
 	onDelta := func(delta string) error {
 		if stepEnded && lastText != "" {
@@ -241,6 +287,7 @@ func (h *Handler) runTurn(
 		if delta != "" {
 			lastText = delta
 		}
+		stepText.WriteString(delta)
 		return send(outboundEvent{Type: "delta", Content: delta})
 	}
 
@@ -253,22 +300,23 @@ func (h *Handler) runTurn(
 	}()
 
 	for iter := 0; iter < maxToolIterations; iter++ {
+		stepText.Reset()
 		result, err := session.Step(ctx, onDelta)
 		if errors.Is(err, llm.ErrModelNotReady) {
 			slog.Info("chat: model not present mid-turn, preparing", "model", provider.Model())
 			if prepErr := provider.Prepare(ctx, onStatus); prepErr != nil {
-				return prepErr
+				return "", prepErr
 			}
 			// Single retry once the model is ready.
 			result, err = session.Step(ctx, onDelta)
 		}
 		usage.Add(result.Usage)
 		if err != nil {
-			return err
+			return stepText.String(), err
 		}
 		if len(result.ToolCalls) == 0 {
 			// The answer already streamed through onDelta.
-			return nil
+			return "", nil
 		}
 
 		// Tool calls to dispatch. Emit a user-facing status line for each so
@@ -287,5 +335,5 @@ func (h *Handler) runTurn(
 		stepEnded = true
 	}
 
-	return fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
+	return "", fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
 }

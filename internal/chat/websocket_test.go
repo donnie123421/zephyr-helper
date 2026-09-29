@@ -23,11 +23,17 @@ import (
 )
 
 // claudeScript answers /v1/messages in order: a reply text streams back,
-// a status code fails the request.
+// a status code fails the request, and slowReply streams in parts.
 type claudeScript struct {
 	mu     sync.Mutex
-	steps  []any    // string (reply text) or int (HTTP status)
+	steps  []any    // string (reply text), int (HTTP status) or slowReply
 	bodies [][]byte // what each request sent
+}
+
+// slowReply streams its parts gap apart, for stopping mid-answer.
+type slowReply struct {
+	parts []string
+	gap   time.Duration
 }
 
 func (c *claudeScript) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +48,31 @@ func (c *claudeScript) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		fmt.Fprint(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+		return
+	}
+	if slow, ok := step.(slowReply); ok {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flush := func(event string) {
+			var probe struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal([]byte(event), &probe)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", probe.Type, event)
+			w.(http.Flusher).Flush()
+		}
+		flush(`{"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":50,"output_tokens":1}}}`)
+		flush(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+		for _, part := range slow.parts {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(slow.gap):
+			}
+			flush(fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%q}}`, part))
+		}
+		flush(`{"type":"content_block_stop","index":0}`)
+		flush(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":9}}`)
+		flush(`{"type":"message_stop"}`)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -126,6 +157,10 @@ func dial(ctx context.Context, t *testing.T, helper *httptest.Server, query stri
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
+	// Every chat opens by saying what the helper can do.
+	if ready := readFrame(ctx, t, conn); ready["type"] != "ready" || fmt.Sprint(ready["features"]) != "[stop retry]" {
+		t.Fatalf("first frame = %v, want ready with stop and retry", ready)
+	}
 	return conn
 }
 
@@ -401,5 +436,144 @@ func TestReopeningADeletedConversation(t *testing.T) {
 	var next map[string]any
 	if err := wsjson.Read(ctx, conn, &next); err == nil {
 		t.Errorf("the connection should close, got %v", next)
+	}
+}
+
+func TestStopKeepsWhatArrived(t *testing.T) {
+	story := slowReply{parts: []string{"Once ", "upon ", "a ", "time ", "there ", "was ", "a ", "pool."}, gap: 150 * time.Millisecond}
+	script := &claudeScript{steps: []any{story, "It was tank."}}
+	claude := httptest.NewServer(script)
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelper(t, claude.URL, saved)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := dial(ctx, t, helper, "")
+	if err := wsjson.Write(ctx, conn, inboundEvent{Type: "user_message", Content: "Tell me a story"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var id, shown string
+	stopped := false
+	for {
+		frame := readFrame(ctx, t, conn)
+		switch frame["type"] {
+		case "conversation":
+			id = frame["id"].(string)
+		case "delta":
+			shown += frame["content"].(string)
+			if !stopped {
+				stopped = true
+				if err := wsjson.Write(ctx, conn, inboundEvent{Type: "stop"}); err != nil {
+					t.Fatalf("stop: %v", err)
+				}
+			}
+		}
+		if frame["type"] == "done" {
+			if frame["stopped"] != true {
+				t.Fatalf("done frame = %v, want stopped", frame)
+			}
+			break
+		}
+		if frame["type"] == "error" {
+			t.Fatalf("error frame: %v", frame)
+		}
+	}
+	if shown == "" || strings.Contains(shown, "pool.") {
+		t.Fatalf("shown %q: the stop should have cut the story short", shown)
+	}
+	conv, _ := saved.Get(ctx, id)
+	if len(conv.Messages) != 2 || conv.Messages[1].Content != shown {
+		t.Fatalf("saved = %+v, want the question and %q", conv.Messages, shown)
+	}
+
+	// The chat carries on, and the model knows what it had said.
+	next := ask(ctx, t, conn, "Which pool?")
+	if next[len(next)-1]["type"] != "done" {
+		t.Fatalf("next turn = %v", next)
+	}
+	want := []string{"user: Tell me a story", "assistant: " + strings.TrimSpace(shown), "user: Which pool?"}
+	if got := script.lastMessages(t); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("Claude was sent %q, want %q", got, want)
+	}
+}
+
+func TestRetryWritesTheLastAnswerAgain(t *testing.T) {
+	script := &claudeScript{steps: []any{"Hi there.", "Hi again."}}
+	claude := httptest.NewServer(script)
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelper(t, claude.URL, saved)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := dial(ctx, t, helper, "")
+	first := ask(ctx, t, conn, "hello")
+	id := first[0]["id"].(string)
+
+	again := retry(ctx, t, conn)
+	if types := frameTypes(again); fmt.Sprint(types) != "[delta usage done]" || again[0]["content"] != "Hi again." {
+		t.Fatalf("retry frames = %v", again)
+	}
+	// The model wasn't shown the answer it's replacing.
+	if got := script.lastMessages(t); fmt.Sprint(got) != "[user: hello]" {
+		t.Errorf("Claude was sent %q", got)
+	}
+	conv, _ := saved.Get(ctx, id)
+	if len(conv.Messages) != 2 || conv.Messages[1].Content != "Hi again." {
+		t.Errorf("saved = %+v", conv.Messages)
+	}
+}
+
+func TestRetryAfterAFailedAnswer(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{steps: []any{http.StatusUnauthorized, "Recovered."}})
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelper(t, claude.URL, saved)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := dial(ctx, t, helper, "")
+	failed := ask(ctx, t, conn, "hello")
+	id := failed[0]["id"].(string)
+	if failed[len(failed)-1]["type"] != "error" {
+		t.Fatalf("first turn = %v, want an error", failed)
+	}
+	again := retry(ctx, t, conn)
+	if again[len(again)-1]["type"] != "done" {
+		t.Fatalf("retry = %v", again)
+	}
+	conv, _ := saved.Get(ctx, id)
+	if len(conv.Messages) != 2 || conv.Messages[0].Content != "hello" || conv.Messages[1].Content != "Recovered." {
+		t.Errorf("saved = %+v", conv.Messages)
+	}
+}
+
+func TestRetryWithNothingToAnswer(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{})
+	defer claude.Close()
+	helper := claudeHelper(t, claude.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	frames := retry(ctx, t, dial(ctx, t, helper, ""))
+	if frames[0]["type"] != "error" || frames[0]["code"] != codeNothingToRetry {
+		t.Fatalf("frames = %v", frames)
+	}
+}
+
+// retry asks for the last answer again and collects frames until the turn ends.
+func retry(ctx context.Context, t *testing.T, conn *websocket.Conn) []map[string]any {
+	t.Helper()
+	if err := wsjson.Write(ctx, conn, inboundEvent{Type: "retry"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got []map[string]any
+	for {
+		frame := readFrame(ctx, t, conn)
+		got = append(got, frame)
+		if frame["type"] == "done" || frame["type"] == "error" {
+			return got
+		}
 	}
 }
