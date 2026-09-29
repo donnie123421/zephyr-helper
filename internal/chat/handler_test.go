@@ -182,3 +182,31 @@ func TestRunTurnStopsRunawayToolLoops(t *testing.T) {
 		t.Fatal("expected the iteration cap to stop the loop")
 	}
 }
+
+func TestRunTurnStartsANewParagraphOnlyWhenNeeded(t *testing.T) {
+	cases := []struct{ first, want string }{
+		{"Checking.", "\n\nDone."},
+		{"Checking.\n", "\nDone."},
+		{"Checking.\n\n", "Done."},
+	}
+	for _, c := range cases {
+		h := &Handler{tools: testRegistry()}
+		session := &scriptedSession{steps: []scriptedStep{
+			{deltas: []string{c.first}, result: llm.StepResult{ToolCalls: []llm.ToolCall{{ID: "1", Name: "list_pools"}}}},
+			{deltas: []string{"Done."}},
+		}}
+		var out frames
+		if err := h.runTurn(context.Background(), out.send, func(string) {}, &fakeProvider{}, session); err != nil {
+			t.Fatalf("runTurn: %v", err)
+		}
+		var deltas []string
+		for _, f := range out {
+			if f["type"] == "delta" {
+				deltas = append(deltas, f["content"].(string))
+			}
+		}
+		if len(deltas) != 2 || deltas[1] != c.want {
+			t.Errorf("after %q, next delta = %q, want %q", c.first, deltas, c.want)
+		}
+	}
+}

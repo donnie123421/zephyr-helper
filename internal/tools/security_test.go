@@ -15,9 +15,9 @@ func TestProjectUsersKeepsAccessAndDropsSecrets(t *testing.T) {
 		{"username": "bob", "uid": 3000, "builtin": false, "sudo_commands_nopasswd": []any{"ALL"},
 			"ssh_password_enabled": true, "sshpubkey": nil, "unixhash": "$6$bobsecret"},
 	}
-	got := projectUsers(users)
-	if len(got) != 2 || got[0]["username"] != "root" || got[1]["username"] != "bob" {
-		t.Fatalf("users = %v, want root and bob only", got)
+	got, total := projectUsers(users)
+	if len(got) != 2 || total != 2 || got[0]["username"] != "root" || got[1]["username"] != "bob" {
+		t.Fatalf("users = %v (total %d), want root and bob only", got, total)
 	}
 	if got[0]["has_ssh_key"] != true || got[1]["has_ssh_key"] != false {
 		t.Errorf("has_ssh_key = %v / %v", got[0]["has_ssh_key"], got[1]["has_ssh_key"])
@@ -35,8 +35,16 @@ func TestProjectUsersIsBounded(t *testing.T) {
 	for i := 0; i < maxUsers+50; i++ {
 		users = append(users, map[string]any{"username": "u", "builtin": false})
 	}
-	if got := projectUsers(users); len(got) != maxUsers {
-		t.Errorf("got %d users, want %d", len(got), maxUsers)
+	got, total := projectUsers(users)
+	if len(got) != maxUsers || total != maxUsers+50 {
+		t.Errorf("got %d users of %d, want %d of %d", len(got), total, maxUsers, maxUsers+50)
+	}
+}
+
+func TestListUsersAsksForLocalAccountsOnly(t *testing.T) {
+	// user.query includes AD/LDAP accounts unless filtered.
+	if !strings.Contains(localUsersPath, `["local","=",true]`) {
+		t.Errorf("list_users path = %q", localUsersPath)
 	}
 }
 
@@ -59,9 +67,10 @@ func TestProjectSMBShareReadsBothShapes(t *testing.T) {
 		t.Errorf("default share shouldn't report guest access: %v", plain)
 	}
 
-	// Before 25.10 both sat at the top level.
-	legacy := projectSMBShare(map[string]any{"name": "old", "guestok": false, "recyclebin": true, "ro": true})
-	if legacy["guest_access"] != false || legacy["recycle_bin"] != true || legacy["ro"] != true {
+	// Before 25.10 both sat at the top level, and ABE was "abe".
+	legacy := projectSMBShare(map[string]any{"name": "old", "guestok": false, "recyclebin": true, "ro": true, "abe": true})
+	if legacy["guest_access"] != false || legacy["recycle_bin"] != true || legacy["ro"] != true ||
+		legacy["access_based_share_enumeration"] != true {
 		t.Errorf("pre-25.10 share = %v", legacy)
 	}
 }
@@ -83,14 +92,57 @@ func TestSettingsProjectionsAreAllowlists(t *testing.T) {
 	ssh := pick(map[string]any{
 		"tcpport": 22, "passwordauth": true, "host_rsa_key": "-----BEGIN RSA PRIVATE KEY-----",
 		"host_ed25519_key": "-----BEGIN OPENSSH PRIVATE KEY-----",
-	}, "tcpport", "passwordauth", "rootlogin")
+	}, "tcpport", "passwordauth", "password_login_groups")
 	if len(ssh) != 2 || ssh["passwordauth"] != true {
 		t.Errorf("ssh = %v", ssh)
 	}
-	cert := pick(map[string]any{"name": "truenas_default", "expired": false, "until": "Mon Jan 1 2035",
-		"privatekey": "-----BEGIN PRIVATE KEY-----"}, "name", "expired", "until", "issuer")
-	if _, ok := cert["privatekey"]; ok {
-		t.Errorf("certificate projection leaked the private key: %v", cert)
+	cert := projectCertificate(map[string]any{"name": "truenas_default", "expired": false,
+		"until": "Mon Jan 1 2035", "issuer": "self-signed", "privatekey": "-----BEGIN PRIVATE KEY-----"})
+	if _, ok := cert["privatekey"]; ok || cert["issuer"] != "self-signed" {
+		t.Errorf("certificate = %v", cert)
+	}
+}
+
+func TestCertificateIssuerNeverCarriesTheCA(t *testing.T) {
+	// TrueNAS 25.04 gives a certificate signed by an internal CA that whole
+	// CA record as its issuer.
+	cert := projectCertificate(map[string]any{
+		"name": "nas-https", "expired": false, "until": "Mon Jan 1 2035",
+		"issuer": map[string]any{
+			"name": "homelab-ca", "certificate": "-----BEGIN CERTIFICATE-----",
+			"privatekey": "-----BEGIN PRIVATE KEY-----\nMIIEv",
+		},
+	})
+	data, _ := json.Marshal(cert)
+	if cert["issuer"] != "homelab-ca" || strings.Contains(string(data), "BEGIN") {
+		t.Errorf("certificate = %s, want only the CA's name", data)
+	}
+}
+
+func TestProjectFTPSaysWhoCanLogIn(t *testing.T) {
+	cases := []struct {
+		name       string
+		ftp        map[string]any
+		anonymous  bool
+		localLogin string
+	}{
+		{"defaults", map[string]any{"onlyanonymous": false, "onlylocal": false},
+			false, "only members of the ftp group"},
+		{"anonymous with a path", map[string]any{"onlyanonymous": true, "anonpath": "/mnt/tank/pub"},
+			true, "every local user"},
+		{"anonymous without a path", map[string]any{"onlyanonymous": true, "anonpath": nil},
+			false, "every local user"},
+		{"local", map[string]any{"onlylocal": true}, false, "every local user"},
+	}
+	for _, c := range cases {
+		c.ftp["port"], c.ftp["tls"], c.ftp["tls_policy"] = 21, true, "on"
+		got := projectFTP(c.ftp)
+		if got["anonymous_login"] != c.anonymous || got["local_user_login"] != c.localLogin || got["tls_policy"] != "on" {
+			t.Errorf("%s: ftp = %v", c.name, got)
+		}
+		if _, ok := got["onlyanonymous"]; ok {
+			t.Errorf("%s: the misleading option names should stay out: %v", c.name, got)
+		}
 	}
 }
 

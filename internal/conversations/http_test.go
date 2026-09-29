@@ -98,3 +98,28 @@ func TestConversationEndpoints(t *testing.T) {
 		t.Errorf("delete all = %d %v", status, deleted)
 	}
 }
+
+func TestWithoutAStoreEveryRouteSaysUnavailable(t *testing.T) {
+	srv := serve(t, nil)
+	status, body := call(t, "GET", srv.URL+"/conversations", "")
+	if status != http.StatusServiceUnavailable || body["error"] != Unavailable {
+		t.Errorf("list = %d %v", status, body)
+	}
+	if status, _ := call(t, "DELETE", srv.URL+"/conversations/abc", ""); status != http.StatusServiceUnavailable {
+		t.Errorf("delete = %d", status)
+	}
+}
+
+func TestAnUnknownRouteIsAPlainNotFound(t *testing.T) {
+	// What an older helper answers: the app reads it as "update the helper".
+	srv := serve(t, openStore(t))
+	resp, err := http.Get(srv.URL + "/conversations/abc/nope")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 404 || json.Valid(data) {
+		t.Errorf("unknown route = %d %q", resp.StatusCode, data)
+	}
+}

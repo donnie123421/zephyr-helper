@@ -94,7 +94,10 @@ func Open(path string) (*Store, error) {
 		}
 		_ = f.Close()
 	}
-	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)"
+	// secure_delete zeroes what a deleted chat leaves behind, since people
+	// delete a chat because they pasted something they shouldn't have.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)" +
+		"&_pragma=secure_delete(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -158,12 +161,15 @@ func (s *Store) Start(ctx context.Context, title string) (Summary, error) {
 		id, title, now.UnixMilli(), now.UnixMilli()); err != nil {
 		return Summary{}, fmt.Errorf("start: %w", err)
 	}
-	// Past the limit, the chats idle longest go.
-	const stale = `SELECT id FROM conversations ORDER BY updated_at DESC, created_at DESC LIMIT -1 OFFSET ?`
-	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id IN (`+stale+`)`, s.keep); err != nil {
+	// Past the limit, the chats idle longest go, never the new one (a clock
+	// that stepped back could otherwise make it look the oldest).
+	const stale = `SELECT id FROM conversations WHERE id != ?
+ORDER BY updated_at DESC, created_at DESC LIMIT -1 OFFSET ?`
+	others := max(s.keep-1, 0)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id IN (`+stale+`)`, id, others); err != nil {
 		return Summary{}, fmt.Errorf("prune messages: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE id IN (`+stale+`)`, s.keep); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE id IN (`+stale+`)`, id, others); err != nil {
 		return Summary{}, fmt.Errorf("prune: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -316,7 +322,11 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ?`, id); err != nil {
 		return fmt.Errorf("delete messages: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.flushDeleted(ctx)
+	return nil
 }
 
 // DeleteAll removes every conversation and reports how many went.
@@ -336,7 +346,15 @@ func (s *Store) DeleteAll(ctx context.Context) (int64, error) {
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	s.flushDeleted(ctx)
 	return res.RowsAffected()
+}
+
+// flushDeleted moves a deletion out of the write-ahead log and empties it,
+// so earlier copies of the deleted pages don't linger there. A failure only
+// means they go at the next automatic checkpoint.
+func (s *Store) flushDeleted(ctx context.Context) {
+	_, _ = s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`)
 }
 
 // TitleFrom makes a title from the first thing someone asked: its first

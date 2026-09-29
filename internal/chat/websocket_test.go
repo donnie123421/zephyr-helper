@@ -242,7 +242,8 @@ func TestChatsAreSavedAndReopened(t *testing.T) {
 }
 
 func TestContextFromTheAppIsHiddenAndKeepsItsTitle(t *testing.T) {
-	claude := httptest.NewServer(&claudeScript{steps: []any{"Remove root's key."}})
+	script := &claudeScript{steps: []any{"Remove root's key.", "It won't."}}
+	claude := httptest.NewServer(script)
 	defer claude.Close()
 	saved := openConversations(t)
 	helper := claudeHelper(t, claude.URL, saved)
@@ -252,12 +253,118 @@ func TestContextFromTheAppIsHiddenAndKeepsItsTitle(t *testing.T) {
 	query := url.Values{"title": {"How to Fix: SSH Root Login"}, "context": {"1"}}
 	conn := dial(ctx, t, helper, "?"+query.Encode())
 	frames := ask(ctx, t, conn, "Zephyr's security audit flagged this on the user's NAS…")
-	if frames[0]["type"] != "conversation" || frames[0]["title"] != "How to Fix: SSH Root Login" {
-		t.Fatalf("conversation frame = %v", frames[0])
+	// Saved once it has an answer.
+	if types := frameTypes(frames); fmt.Sprint(types) != "[delta usage conversation done]" {
+		t.Fatalf("frames = %v", frames)
 	}
-	conv, _ := saved.Get(ctx, frames[0]["id"].(string))
+	event := frames[2]
+	if event["title"] != "How to Fix: SSH Root Login" {
+		t.Fatalf("conversation frame = %v", event)
+	}
+	id := event["id"].(string)
+	conv, _ := saved.Get(ctx, id)
 	if len(conv.Messages) != 2 || !conv.Messages[0].Hidden || conv.Messages[1].Hidden || conv.MessageCount != 1 {
 		t.Errorf("saved = %+v", conv)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	// Reopened, the model still gets the hidden context.
+	again := dial(ctx, t, helper, "?conversation="+id)
+	readFrame(ctx, t, again)
+	ask(ctx, t, again, "Will that lock me out?")
+	want := []string{"user: Zephyr's security audit flagged this on the user's NAS…",
+		"assistant: Remove root's key.", "user: Will that lock me out?"}
+	if got := script.lastMessages(t); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("Claude was sent %q, want %q", got, want)
+	}
+}
+
+func TestAnExplanationClosedBeforeItsAnswerIsNotSaved(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{steps: []any{http.StatusUnauthorized}})
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelper(t, claude.URL, saved)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := url.Values{"title": {"Explain Alert: tank is DEGRADED"}, "context": {"1"}}
+	frames := ask(ctx, t, dial(ctx, t, helper, "?"+query.Encode()), "An alert fired on the NAS…")
+	if types := frameTypes(frames); fmt.Sprint(types) != "[error]" {
+		t.Fatalf("frames = %v", frames)
+	}
+	if list, _ := saved.List(ctx); len(list) != 0 {
+		t.Errorf("saved %+v, want nothing", list)
+	}
+}
+
+func TestABlankReplyIsNotSaved(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{steps: []any{"\n\n"}})
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelper(t, claude.URL, saved)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	frames := ask(ctx, t, dial(ctx, t, helper, ""), "hello")
+	conv, _ := saved.Get(ctx, frames[0]["id"].(string))
+	if len(conv.Messages) != 1 || conv.Messages[0].Role != conversations.RoleUser {
+		t.Errorf("saved = %+v, want just the question", conv.Messages)
+	}
+}
+
+func TestAChatDeletedWhileOpenStaysDeleted(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{steps: []any{"First.", "Second."}})
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelper(t, claude.URL, saved)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := dial(ctx, t, helper, "")
+	first := ask(ctx, t, conn, "hello")
+	id := first[0]["id"].(string)
+	if err := saved.Delete(ctx, id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	second := ask(ctx, t, conn, "still there?")
+	if second[len(second)-1]["type"] != "done" {
+		t.Fatalf("the chat should carry on: %v", second)
+	}
+	if list, _ := saved.List(ctx); len(list) != 0 {
+		t.Errorf("the deleted chat came back: %+v", list)
+	}
+}
+
+func TestReopeningWithoutAStoreSaysSo(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{})
+	defer claude.Close()
+	helper := claudeHelper(t, claude.URL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	frame := readFrame(ctx, t, dial(ctx, t, helper, "?conversation=abc"))
+	if frame["type"] != "error" || frame["code"] != codeConversationsUnavailable {
+		t.Fatalf("frame = %v", frame)
+	}
+}
+
+func TestReplayableTidiesTheTranscript(t *testing.T) {
+	u := func(s string) conversations.Message {
+		return conversations.Message{Role: conversations.RoleUser, Content: s}
+	}
+	a := func(s string) conversations.Message {
+		return conversations.Message{Role: conversations.RoleAssistant, Content: s}
+	}
+	got := replayable([]conversations.Message{
+		a("orphaned reply"), u("first"), u("retry after a failed turn"), a("\n\n"), a("answer"), u("  "), u("next"),
+	})
+	var lines []string
+	for _, m := range got {
+		lines = append(lines, m.Role+": "+m.Content)
+	}
+	want := []string{"user: first\n\nretry after a failed turn", "assistant: answer", "user: next"}
+	if fmt.Sprint(lines) != fmt.Sprint(want) {
+		t.Errorf("replayable = %q, want %q", lines, want)
 	}
 }
 
@@ -287,7 +394,8 @@ func TestReopeningADeletedConversation(t *testing.T) {
 	defer cancel()
 
 	conn := dial(ctx, t, helper, "?conversation=gone")
-	if frame := readFrame(ctx, t, conn); frame["type"] != "error" || frame["message"] != "This conversation has been deleted." {
+	if frame := readFrame(ctx, t, conn); frame["type"] != "error" || frame["code"] != codeConversationNotFound ||
+		frame["message"] != "This conversation has been deleted." {
 		t.Fatalf("frame = %v", frame)
 	}
 	var next map[string]any

@@ -8,19 +8,34 @@ import (
 	"time"
 )
 
-// Handler serves the saved conversations under /conversations.
+// Handler serves the saved conversations under /conversations. With no
+// Store (the file wouldn't open) every route answers 503, so the app can
+// tell that from an older helper that has no such routes.
 type Handler struct {
 	Store *Store
 }
 
 // RegisterMux mounts the endpoints, each wrapped by wrap (bearer auth).
 func (h *Handler) RegisterMux(mux *http.ServeMux, wrap func(http.Handler) http.Handler) {
-	mux.Handle("GET /conversations", wrap(http.HandlerFunc(h.list)))
-	mux.Handle("DELETE /conversations", wrap(http.HandlerFunc(h.deleteAll)))
-	mux.Handle("GET /conversations/{id}", wrap(http.HandlerFunc(h.get)))
-	mux.Handle("PATCH /conversations/{id}", wrap(http.HandlerFunc(h.rename)))
-	mux.Handle("DELETE /conversations/{id}", wrap(http.HandlerFunc(h.delete)))
+	route := func(pattern string, handle http.HandlerFunc) {
+		mux.Handle(pattern, wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if h.Store == nil {
+				writeError(w, http.StatusServiceUnavailable, Unavailable)
+				return
+			}
+			handle(w, r)
+		})))
+	}
+	route("GET /conversations", h.list)
+	route("DELETE /conversations", h.deleteAll)
+	route("GET /conversations/{id}", h.get)
+	route("PATCH /conversations/{id}", h.rename)
+	route("DELETE /conversations/{id}", h.delete)
 }
+
+// Unavailable is what the app is told when the helper can't open its saved
+// conversations.
+const Unavailable = "The helper couldn't open its saved conversations. Restart it, and check that its data folder is writable."
 
 // Times go out in whole seconds, which is what the app's date decoding
 // expects.

@@ -239,3 +239,53 @@ func TestTheFileIsPrivate(t *testing.T) {
 		t.Errorf("permissions = %o, want 600", perm)
 	}
 }
+
+func TestStartNeverPrunesTheNewChat(t *testing.T) {
+	store := openStore(t)
+	store.keep = 2
+	ctx := context.Background()
+	now := time.Date(2026, 9, 29, 9, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	_, _ = store.Start(ctx, "a")
+	now = now.Add(time.Hour)
+	_, _ = store.Start(ctx, "b")
+
+	// The clock steps back, so the new chat looks the oldest.
+	now = now.Add(-3 * time.Hour)
+	c, err := store.Start(ctx, "c")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := store.Get(ctx, c.ID); err != nil {
+		t.Fatalf("the new chat was pruned: %v", err)
+	}
+	if list, _ := store.List(ctx); len(list) != 2 {
+		t.Errorf("kept %d chats, want 2", len(list))
+	}
+}
+
+func TestDeletedTextIsGoneFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	c, _ := store.Start(ctx, "oops")
+	secret := "my-pasted-password-" + strings.Repeat("x", 40)
+	mustAppend(t, store, c.ID, Message{Role: RoleUser, Content: secret})
+	mustAppend(t, store, c.ID, Message{Role: RoleAssistant, Content: "Don't paste passwords here."})
+	if err := store.Delete(ctx, c.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	_ = store.Close()
+
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		data, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		if strings.Contains(string(data), secret) {
+			t.Errorf("%s still holds the deleted text", e.Name())
+		}
+	}
+}

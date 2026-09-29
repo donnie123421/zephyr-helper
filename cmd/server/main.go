@@ -75,7 +75,7 @@ func main() {
 	slog.Info("llm: provider", "provider", llmSwitch.Current().Name(), "model", llmSwitch.Current().Model())
 
 	// Saved chats. Without the store the assistant still chats; it just
-	// can't keep them, and the app finds no /conversations.
+	// can't keep them.
 	conversationStore, err := conversations.Open(cfg.ConversationsDBPath)
 	if err != nil {
 		slog.Warn("conversations store open; chats won't be saved", "err", err, "path", cfg.ConversationsDBPath)
@@ -236,11 +236,11 @@ func main() {
 	llmHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
-	if conversationStore != nil {
-		(&conversations.Handler{Store: conversationStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
-			return auth.Require(cfg.PairingToken, h)
-		})
-	}
+	// Registered without a store too: it answers 503 rather than the
+	// plain 404 the app reads as a helper that predates saved chats.
+	(&conversations.Handler{Store: conversationStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
 
 	// HTTPS on the same port as plain HTTP, sorted per connection by
 	// tlsmux, so existing installs keep their compose file and app

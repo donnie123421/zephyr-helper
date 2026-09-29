@@ -47,6 +47,8 @@ type outboundEvent struct {
 	Type    string `json:"type"`
 	Content string `json:"content,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Code marks an error the app acts on (codeConversation*).
+	Code string `json:"code,omitempty"`
 	// Name is only populated on `tool_used` frames — the tool the helper just
 	// finished dispatching, so iOS can render a persistent "Checked pools" chip.
 	Name string `json:"name,omitempty"`
@@ -105,17 +107,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// The app reopens a saved chat with ?conversation=<id>; the model
 	// picks up from its saved messages.
-	saved := newSavedChat(h.saved, r.URL.Query())
-	if id := r.URL.Query().Get("conversation"); id != "" && h.saved != nil {
+	saved := newSavedChat(h.saved, send, r.URL.Query())
+	if id := r.URL.Query().Get("conversation"); id != "" {
+		if h.saved == nil {
+			// Carrying on without the history would look like the same
+			// chat to the app while the model remembered none of it.
+			_ = send(outboundEvent{Type: "error", Code: codeConversationsUnavailable, Message: conversations.Unavailable})
+			return
+		}
 		summary, err := saved.resume(ctx, id, session)
 		if err != nil {
-			message := "Couldn't open this conversation."
+			event := outboundEvent{Type: "error", Message: "Couldn't open this conversation."}
 			if errors.Is(err, conversations.ErrNotFound) {
-				message = "This conversation has been deleted."
+				event.Code, event.Message = codeConversationNotFound, "This conversation has been deleted."
 			} else {
 				slog.Error("chat: couldn't load a saved conversation", "id", id, "err", err)
 			}
-			_ = send(outboundEvent{Type: "error", Message: message})
+			_ = send(event)
 			return
 		}
 		if err := send(conversationEvent{Type: "conversation", ID: summary.ID, Title: summary.Title}); err != nil {
@@ -162,7 +170,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		session.AddUserMessage(msg.Content)
-		saved.userSaid(ctx, send, msg.Content)
+		saved.userSaid(ctx, msg.Content)
 		turn := &turnRecord{}
 		err := h.runTurn(ctx, turn.observe(send), onStatus, provider, session)
 		saved.turnEnded(ctx, provider, turn, err == nil)

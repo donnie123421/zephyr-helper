@@ -16,8 +16,13 @@ import (
 // password hashes, private keys and SSH host keys in some of these
 // responses, and none of it can reach the model.
 
-// maxUsers bounds list_users on servers with directory-sized user lists.
+// maxUsers bounds list_users on servers with a great many accounts.
 const maxUsers = 200
+
+// localUsersPath asks for the NAS's own accounts. user.query also returns
+// directory-service (AD/LDAP) accounts, which aren't the NAS's to manage
+// and can run to thousands.
+const localUsersPath = `/user?filters=[["local","=",true]]`
 
 // ----- list_users -------------------------------------------------------------
 
@@ -33,7 +38,7 @@ func listUsers(tn *truenas.Client) Tool {
 		},
 		StatusLine: "Checking user accounts…",
 		Handler: func(ctx context.Context, _ json.RawMessage) (string, error) {
-			raw, err := tn.GetRaw(ctx, "/user")
+			raw, err := tn.GetRaw(ctx, localUsersPath)
 			if err != nil {
 				return "", err
 			}
@@ -41,19 +46,30 @@ func listUsers(tn *truenas.Client) Tool {
 			if err := json.Unmarshal(raw, &users); err != nil {
 				return "", fmt.Errorf("decode users: %w", err)
 			}
-			return toJSON(map[string]any{"users": projectUsers(users)})
+			listed, total := projectUsers(users)
+			out := map[string]any{"users": listed, "total": total}
+			if total > len(listed) {
+				out["truncated"] = true
+				out["note"] = fmt.Sprintf("Only the first %d of %d accounts are listed.", len(listed), total)
+			}
+			return toJSON(out)
 		},
 	}
 }
 
-// projectUsers keeps what matters for access questions. An SSH key is
-// reported only as present or not.
-func projectUsers(users []map[string]any) []map[string]any {
-	out := make([]map[string]any, 0, len(users))
+// projectUsers keeps what matters for access questions, for at most
+// maxUsers accounts, and counts them all. An SSH key is reported only as
+// present or not.
+func projectUsers(users []map[string]any) (listed []map[string]any, total int) {
+	listed = []map[string]any{}
 	for _, u := range users {
 		builtin, _ := u["builtin"].(bool)
 		name, _ := u["username"].(string)
 		if builtin && name != "root" {
+			continue
+		}
+		total++
+		if len(listed) == maxUsers {
 			continue
 		}
 		entry := map[string]any{}
@@ -63,12 +79,9 @@ func projectUsers(users []map[string]any) []map[string]any {
 			"shell", "twofactor_auth_configured", "roles")
 		key, _ := u["sshpubkey"].(string)
 		entry["has_ssh_key"] = strings.TrimSpace(key) != ""
-		out = append(out, entry)
-		if len(out) == maxUsers {
-			break
-		}
+		listed = append(listed, entry)
 	}
-	return out
+	return listed, total
 }
 
 // ----- security_settings --------------------------------------------------------
@@ -78,9 +91,9 @@ func securitySettings(tn *truenas.Client) Tool {
 		Def: Definition{
 			Name: "security_settings",
 			Description: "Get the server's security-related settings: SSH (port, password " +
-				"logins, root login on older TrueNAS versions, TCP forwarding, weak ciphers), FTP " +
-				"(TLS, anonymous access), which services are running and start at boot, the web " +
-				"UI's HTTPS redirect and ports, and certificate expiry. Use for questions about " +
+				"logins and the groups allowed them, TCP forwarding, weak ciphers), FTP (TLS, who " +
+				"can log in, anonymous access), which services are running and start at boot, the " +
+				"web UI's HTTPS redirect and ports, and certificate expiry. Use for questions about " +
 				"SSH, FTP, services, HTTPS, certificates, or hardening the server.",
 			Parameters: noArgs,
 		},
@@ -88,11 +101,13 @@ func securitySettings(tn *truenas.Client) Tool {
 		Handler: func(ctx context.Context, _ json.RawMessage) (string, error) {
 			out := map[string]any{}
 			if ssh := getObject(ctx, tn, "/ssh"); ssh != nil {
-				out["ssh"] = pick(ssh, "tcpport", "passwordauth", "rootlogin", "kerberosauth",
-					"tcpfwd", "weak_ciphers", "bindiface")
+				// Password logins need passwordauth plus either the
+				// account's own switch (list_users) or one of these groups.
+				out["ssh"] = pick(ssh, "tcpport", "passwordauth", "password_login_groups",
+					"kerberosauth", "tcpfwd", "weak_ciphers", "bindiface")
 			}
 			if ftp := getObject(ctx, tn, "/ftp"); ftp != nil {
-				out["ftp"] = pick(ftp, "port", "tls", "onlyanonymous", "onlylocal", "rootlogin")
+				out["ftp"] = projectFTP(ftp)
 			}
 			if services := getList(ctx, tn, "/service"); services != nil {
 				out["services"] = projectServices(services)
@@ -107,7 +122,7 @@ func securitySettings(tn *truenas.Client) Tool {
 			if certs := getList(ctx, tn, "/certificate"); certs != nil {
 				list := make([]map[string]any, 0, len(certs))
 				for _, c := range certs {
-					list = append(list, pick(c, "name", "expired", "until", "issuer"))
+					list = append(list, projectCertificate(c))
 				}
 				out["certificates"] = list
 			}
@@ -134,6 +149,40 @@ func projectServices(services []map[string]any) []map[string]any {
 	return out
 }
 
+// projectFTP says who can log in rather than passing on TrueNAS's option
+// names, which don't mean what they say. From TrueNAS's proftpd template:
+// "onlyanonymous" with an anonymous path adds anonymous logins, and either
+// option lets every local user log in; with neither, only the ftp group can.
+func projectFTP(ftp map[string]any) map[string]any {
+	entry := pick(ftp, "port", "tls", "tls_policy")
+	onlyAnonymous, _ := ftp["onlyanonymous"].(bool)
+	onlyLocal, _ := ftp["onlylocal"].(bool)
+	anonPath, _ := ftp["anonpath"].(string)
+	entry["anonymous_login"] = onlyAnonymous && strings.TrimSpace(anonPath) != ""
+	if onlyLocal || onlyAnonymous {
+		entry["local_user_login"] = "every local user"
+	} else {
+		entry["local_user_login"] = "only members of the ftp group"
+	}
+	return entry
+}
+
+// projectCertificate keeps a certificate's name, expiry and issuer. On
+// TrueNAS 25.04 a certificate signed by an internal CA gives that whole CA
+// as its issuer, private key included, so only the CA's name is kept.
+func projectCertificate(c map[string]any) map[string]any {
+	entry := pick(c, "name", "expired", "until")
+	switch issuer := c["issuer"].(type) {
+	case string:
+		entry["issuer"] = issuer
+	case map[string]any:
+		if name, ok := issuer["name"].(string); ok {
+			entry["issuer"] = name
+		}
+	}
+	return entry
+}
+
 // ----- share projections (list_shares) -----------------------------------------
 
 // projectSMBShare keeps an SMB share's identity and its access settings.
@@ -142,7 +191,13 @@ func projectServices(services []map[string]any) []map[string]any {
 func projectSMBShare(s map[string]any) map[string]any {
 	entry := map[string]any{"type": "smb"}
 	copyFields(entry, s, "name", "path", "enabled", "comment", "purpose", "locked",
-		"readonly", "ro", "browsable", "access_based_share_enumeration")
+		"readonly", "ro", "browsable")
+	// "abe" before 25.10.
+	if v, ok := firstPresent("access_based_share_enumeration", s); ok {
+		entry["access_based_share_enumeration"] = v
+	} else if v, ok := firstPresent("abe", s); ok {
+		entry["access_based_share_enumeration"] = v
+	}
 	opts, _ := s["options"].(map[string]any)
 	if v, ok := firstPresent("guestok", s, opts); ok {
 		entry["guest_access"] = v
