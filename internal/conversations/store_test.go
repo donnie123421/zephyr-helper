@@ -48,7 +48,10 @@ func TestConversationRoundTrip(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	mustAppend(t, store, started.ID, Message{Role: RoleUser, Content: "Zephyr's audit flagged…", Hidden: true})
-	mustAppend(t, store, started.ID, Message{Role: RoleAssistant, Content: "Remove root's key.", Tools: []string{"list_users", "security_settings"}})
+	checked := time.Date(2026, 9, 29, 9, 0, 5, 0, time.UTC)
+	usersTool := NewToolUse("list_users", nil, `{"users":[{"username":"root","has_ssh_key":true}]}`, false, checked)
+	settingsTool := NewToolUse("security_settings", nil, `{"error":"security_settings failed: timeout"}`, true, checked)
+	mustAppend(t, store, started.ID, Message{Role: RoleAssistant, Content: "Remove root's key.", Tools: []ToolUse{usersTool, settingsTool}})
 	mustAppend(t, store, started.ID, Message{Role: RoleUser, Content: "Will that lock me out?"})
 	if err := store.RecordTurn(ctx, started.ID, "anthropic", "claude-opus-5", 120, 30); err != nil {
 		t.Fatalf("record: %v", err)
@@ -76,8 +79,17 @@ func TestConversationRoundTrip(t *testing.T) {
 	if m := got.Messages[0]; m.Role != RoleUser || !m.Hidden {
 		t.Errorf("first message = %+v, want hidden user context", m)
 	}
-	if m := got.Messages[1]; m.Content != "Remove root's key." || fmt.Sprint(m.Tools) != "[list_users security_settings]" {
+	if m := got.Messages[1]; m.Content != "Remove root's key." || fmt.Sprint(ToolNames(m.Tools)) != "[list_users security_settings]" {
 		t.Errorf("reply = %+v", m)
+	} else {
+		users, settings := m.Tools[0], m.Tools[1]
+		if string(users.Result) != `{"users":[{"username":"root","has_ssh_key":true}]}` || users.Failed ||
+			users.CheckedAt == nil || !users.CheckedAt.Equal(checked) {
+			t.Errorf("list_users kept as %+v", users)
+		}
+		if !settings.Failed || !strings.Contains(string(settings.Result), "timeout") {
+			t.Errorf("security_settings kept as %+v", settings)
+		}
 	}
 	if m := got.Messages[2]; m.Content != "Will that lock me out?" || m.Hidden || len(m.Tools) != 0 || m.Tools == nil {
 		t.Errorf("follow-up = %+v", m)

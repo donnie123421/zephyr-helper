@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -50,9 +51,14 @@ type outboundEvent struct {
 	Message string `json:"message,omitempty"`
 	// Code marks an error the app acts on (codeConversation*).
 	Code string `json:"code,omitempty"`
-	// Name is only populated on `tool_used` frames — the tool the helper just
-	// finished dispatching, so iOS can render a persistent "Checked pools" chip.
-	Name string `json:"name,omitempty"`
+}
+
+// toolUsedEvent reports a tool the helper just ran and what it returned, so
+// the app can leave a "Checked pools" chip in the chat that opens on what
+// the assistant looked at.
+type toolUsedEvent struct {
+	Type string `json:"type"`
+	conversations.ToolUse
 }
 
 // usageEvent reports the tokens one turn used, for models that count them.
@@ -328,7 +334,8 @@ func (h *Handler) runTurn(
 			onStatus(h.tools.StatusLine(call.Name))
 			slog.Info("chat: dispatching tool", "name", call.Name, "args", string(call.Arguments))
 			content, isError := h.tools.Dispatch(ctx, call.Name, call.Arguments)
-			_ = send(outboundEvent{Type: "tool_used", Name: call.Name})
+			use := conversations.NewToolUse(call.Name, call.Arguments, content, isError, time.Now())
+			_ = send(toolUsedEvent{Type: "tool_used", ToolUse: use})
 			results = append(results, llm.ToolResult{CallID: call.ID, Content: content, IsError: isError})
 		}
 		session.AddToolResults(results)

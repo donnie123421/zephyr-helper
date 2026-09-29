@@ -233,7 +233,7 @@ func storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 // tools that ran and the tokens used.
 type turnRecord struct {
 	text  strings.Builder
-	tools []string
+	tools []conversations.ToolUse
 	usage llm.Usage
 }
 
@@ -242,12 +242,11 @@ func (t *turnRecord) observe(send func(any) error) func(any) error {
 	return func(v any) error {
 		switch ev := v.(type) {
 		case outboundEvent:
-			switch ev.Type {
-			case "delta":
+			if ev.Type == "delta" {
 				t.text.WriteString(ev.Content)
-			case "tool_used":
-				t.tools = append(t.tools, ev.Name)
 			}
+		case toolUsedEvent:
+			t.tools = append(t.tools, ev.ToolUse)
 		case usageEvent:
 			t.usage.Add(ev.Usage)
 		}

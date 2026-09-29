@@ -52,9 +52,11 @@ type summaryView struct {
 }
 
 type messageView struct {
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// Tools names the tools, for apps from before ToolUses.
 	Tools     []string  `json:"tools"`
+	ToolUses  []ToolUse `json:"tool_uses"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -121,7 +123,8 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		view.Messages = append(view.Messages, messageView{
 			Role:      m.Role,
 			Content:   m.Content,
-			Tools:     m.Tools,
+			Tools:     ToolNames(m.Tools),
+			ToolUses:  m.Tools,
 			CreatedAt: m.CreatedAt.Truncate(time.Second),
 		})
 	}

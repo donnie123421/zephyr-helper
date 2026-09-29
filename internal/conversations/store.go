@@ -4,7 +4,8 @@
 // A chat is stored as the text both sides saw, not in a provider's own
 // transcript format. Reopening one replays that text to whichever model is
 // current, so a chat started on Ollama can carry on with Claude. What the
-// tools returned isn't kept: the model looks again if it needs to.
+// tools returned is kept for the app to show, but never replayed: the
+// model looks again if it needs to.
 package conversations
 
 import (
@@ -12,7 +13,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -44,8 +44,9 @@ const (
 type Message struct {
 	Role    string
 	Content string
-	// Tools are the tools the assistant ran for this reply, in order.
-	Tools []string
+	// Tools are the tools the assistant ran for this reply, in order, with
+	// what they returned.
+	Tools []ToolUse
 	// Hidden marks context the app sent as the first message and doesn't
 	// show: an alert, a log excerpt, the audit's findings. The model still
 	// sees it when the chat is reopened.
@@ -180,7 +181,7 @@ ORDER BY updated_at DESC, created_at DESC LIMIT -1 OFFSET ?`
 
 // Append adds a message to the end of a conversation.
 func (s *Store) Append(ctx context.Context, id string, m Message) error {
-	tools, err := json.Marshal(nonNil(m.Tools))
+	tools, err := encodeTools(m.Tools)
 	if err != nil {
 		return err
 	}
@@ -203,7 +204,7 @@ func (s *Store) Append(ctx context.Context, id string, m Message) error {
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO messages (conversation_id, seq, role, content, tools, hidden, created_at)
 SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ? FROM messages WHERE conversation_id = ?`,
-		id, m.Role, m.Content, string(tools), m.Hidden, now, id); err != nil {
+		id, m.Role, m.Content, tools, m.Hidden, now, id); err != nil {
 		return fmt.Errorf("append: %w", err)
 	}
 	return tx.Commit()
@@ -297,9 +298,7 @@ WHERE conversation_id = ? ORDER BY seq`, id)
 		if err := rows.Scan(&m.Role, &m.Content, &tools, &m.Hidden, &at); err != nil {
 			return Conversation{}, err
 		}
-		if err := json.Unmarshal([]byte(tools), &m.Tools); err != nil || m.Tools == nil {
-			m.Tools = []string{}
-		}
+		m.Tools = decodeTools(tools)
 		m.CreatedAt = fromMillis(at)
 		c.Messages = append(c.Messages, m)
 	}
@@ -427,10 +426,3 @@ func newID() (string, error) {
 }
 
 func fromMillis(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
-
-func nonNil(tools []string) []string {
-	if tools == nil {
-		return []string{}
-	}
-	return tools
-}

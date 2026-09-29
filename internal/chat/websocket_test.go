@@ -36,6 +36,11 @@ type slowReply struct {
 	gap   time.Duration
 }
 
+// toolCall asks for a tool, as Claude does before it answers.
+type toolCall struct {
+	name, input string
+}
+
 func (c *claudeScript) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	c.mu.Lock()
@@ -48,6 +53,24 @@ func (c *claudeScript) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		fmt.Fprint(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+		return
+	}
+	if call, ok := step.(toolCall); ok {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, e := range []string{
+			`{"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":50,"output_tokens":1}}}`,
+			fmt.Sprintf(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":%q,"input":{}}}`, call.name),
+			fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":%q}}`, call.input),
+			`{"type":"content_block_stop","index":0}`,
+			`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":12}}`,
+			`{"type":"message_stop"}`,
+		} {
+			var probe struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal([]byte(e), &probe)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", probe.Type, e)
+		}
 		return
 	}
 	if slow, ok := step.(slowReply); ok {
@@ -127,6 +150,12 @@ func (c *claudeScript) lastMessages(t *testing.T) []string {
 // saved when it isn't nil.
 func claudeHelper(t *testing.T, claudeURL string, saved *conversations.Store) *httptest.Server {
 	t.Helper()
+	return claudeHelperWithTools(t, claudeURL, saved, tools.NewWith())
+}
+
+// claudeHelperWithTools is claudeHelper with tools for Claude to call.
+func claudeHelperWithTools(t *testing.T, claudeURL string, saved *conversations.Store, reg *tools.Registry) *httptest.Server {
+	t.Helper()
 	store := llm.NewConfigStore(filepath.Join(t.TempDir(), "llm.json"))
 	if err := store.Save(llm.Config{
 		Provider:  llm.ProviderAnthropic,
@@ -135,7 +164,7 @@ func claudeHelper(t *testing.T, claudeURL string, saved *conversations.Store) *h
 		t.Fatalf("save config: %v", err)
 	}
 	sw := llm.NewSwitch(store, llm.NewOllama(ollama.NewClient("http://127.0.0.1:1", "unused")))
-	helper := httptest.NewServer(NewHandler(sw, tools.NewWith(), saved))
+	helper := httptest.NewServer(NewHandler(sw, reg, saved))
 	t.Cleanup(helper.Close)
 	return helper
 }
@@ -575,5 +604,69 @@ func retry(ctx context.Context, t *testing.T, conn *websocket.Conn) []map[string
 		if frame["type"] == "done" || frame["type"] == "error" {
 			return got
 		}
+	}
+}
+
+func TestSavedChatsKeepWhatToolsFound(t *testing.T) {
+	const found = `{"pools":[{"name":"tank","status":"ONLINE"}]}`
+	reg := tools.NewWith(tools.Tool{
+		Def:        tools.Definition{Name: "pool_status", Parameters: json.RawMessage(`{"type":"object","properties":{"pool_name":{"type":"string"}}}`)},
+		StatusLine: "Checking pool status…",
+		Handler: func(context.Context, json.RawMessage) (string, error) {
+			return found, nil
+		},
+	})
+	script := &claudeScript{steps: []any{toolCall{name: "pool_status", input: `{"pool_name":"tank"}`}, "tank is ONLINE.", "Still ONLINE."}}
+	claude := httptest.NewServer(script)
+	defer claude.Close()
+	saved := openConversations(t)
+	helper := claudeHelperWithTools(t, claude.URL, saved, reg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := dial(ctx, t, helper, "")
+	frames := ask(ctx, t, conn, "How is tank?")
+	var id string
+	var used map[string]any
+	for _, f := range frames {
+		switch f["type"] {
+		case "conversation":
+			id, _ = f["id"].(string)
+		case "tool_used":
+			used = f
+		}
+	}
+	if used == nil || used["name"] != "pool_status" || fmt.Sprint(used["arguments"]) != "map[pool_name:tank]" ||
+		fmt.Sprint(used["result"]) != "map[pools:[map[name:tank status:ONLINE]]]" || used["checked_at"] == nil {
+		t.Fatalf("tool_used frame = %v in %v", used, frames)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	conv, err := saved.Get(ctx, id)
+	if err != nil || len(conv.Messages) != 2 {
+		t.Fatalf("saved = %+v, %v", conv, err)
+	}
+	kept := conv.Messages[1].Tools
+	if len(kept) != 1 || kept[0].Name != "pool_status" || string(kept[0].Result) != found ||
+		string(kept[0].Arguments) != `{"pool_name":"tank"}` || kept[0].CheckedAt == nil {
+		t.Fatalf("saved tools = %+v", kept)
+	}
+
+	// Reopened, the model gets the text alone: what the tool found then
+	// is only for the app to show.
+	again := dial(ctx, t, helper, "?conversation="+id)
+	_ = readFrame(ctx, t, again) // conversation
+	if next := ask(ctx, t, again, "And now?"); next[len(next)-1]["type"] != "done" {
+		t.Fatalf("next turn = %v", next)
+	}
+	script.mu.Lock()
+	body := string(script.bodies[len(script.bodies)-1])
+	script.mu.Unlock()
+	if strings.Contains(body, `"tool_use"`) || strings.Contains(body, `"tool_result"`) {
+		t.Errorf("the reopened chat replayed the tool's result: %s", body)
+	}
+	want := []string{"user: How is tank?", "assistant: tank is ONLINE.", "user: And now?"}
+	if got := script.lastMessages(t); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("Claude was sent %q, want %q", got, want)
 	}
 }

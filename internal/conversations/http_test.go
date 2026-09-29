@@ -3,11 +3,13 @@ package conversations
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func serve(t *testing.T, store *Store) *httptest.Server {
@@ -44,7 +46,9 @@ func TestConversationEndpoints(t *testing.T) {
 
 	c, _ := store.Start(ctx, "How to Fix: SSH Root Login")
 	mustAppend(t, store, c.ID, Message{Role: RoleUser, Content: "long hidden context", Hidden: true})
-	mustAppend(t, store, c.ID, Message{Role: RoleAssistant, Content: "1. Remove root's key.", Tools: []string{"list_users"}})
+	checked := time.Date(2026, 9, 29, 9, 0, 5, 0, time.UTC)
+	usersTool := NewToolUse("list_users", nil, `{"users":[{"username":"root"}]}`, false, checked)
+	mustAppend(t, store, c.ID, Message{Role: RoleAssistant, Content: "1. Remove root's key.", Tools: []ToolUse{usersTool}})
 	_ = store.RecordTurn(ctx, c.ID, "anthropic", "claude-opus-5", 900, 120)
 
 	status, list := call(t, "GET", srv.URL+"/conversations", "")
@@ -67,8 +71,21 @@ func TestConversationEndpoints(t *testing.T) {
 		t.Fatalf("get = %d %v, want only the visible message", status, got)
 	}
 	reply := messages[0].(map[string]any)
-	if reply["role"] != "assistant" || reply["content"] != "1. Remove root's key." || len(reply["tools"].([]any)) != 1 {
+	if reply["role"] != "assistant" || reply["content"] != "1. Remove root's key." {
 		t.Errorf("message = %v", reply)
+	}
+	// Apps from before tool results read the names.
+	if fmt.Sprint(reply["tools"]) != "[list_users]" {
+		t.Errorf("tools = %v", reply["tools"])
+	}
+	uses, _ := reply["tool_uses"].([]any)
+	if len(uses) != 1 {
+		t.Fatalf("tool_uses = %v", reply["tool_uses"])
+	}
+	use := uses[0].(map[string]any)
+	if use["name"] != "list_users" || use["checked_at"] != "2026-09-29T09:00:05Z" ||
+		fmt.Sprint(use["result"]) != "map[users:[map[username:root]]]" || use["failed"] != nil {
+		t.Errorf("tool use = %v", use)
 	}
 	if got["input_tokens"] != float64(900) || got["output_tokens"] != float64(120) || got["title"] != "How to Fix: SSH Root Login" {
 		t.Errorf("conversation = %v", got)

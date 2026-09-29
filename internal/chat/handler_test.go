@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/donnie123421/zephyr-helper/internal/llm"
@@ -120,6 +121,15 @@ func TestRunTurnDispatchesToolsAndReportsUsage(t *testing.T) {
 	// The answer after the tools starts a new paragraph.
 	if got := out[5]["content"]; got != "\n\ntank is fine." {
 		t.Errorf("second step's text = %q", got)
+	}
+	// Each tool_used frame carries what the tool returned, for the chip.
+	pools, broken := out[2], out[4]
+	if pools["name"] != "list_pools" || fmt.Sprint(pools["result"]) != "map[pools:[tank]]" ||
+		pools["failed"] != nil || pools["checked_at"] == nil {
+		t.Errorf("list_pools frame = %v", pools)
+	}
+	if result, _ := broken["result"].(map[string]any); broken["failed"] != true || !strings.Contains(fmt.Sprint(result["error"]), "boom") {
+		t.Errorf("broken frame = %v", broken)
 	}
 	usage := out[len(out)-1]
 	if usage["input_tokens"] != float64(250) || usage["output_tokens"] != float64(30) ||
