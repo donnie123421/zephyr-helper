@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -76,8 +77,18 @@ func viewOfSummary(s Summary) summaryView {
 	}
 }
 
+// list takes an optional ?limit=, for the app's few most recent.
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
-	summaries, err := h.Store.List(r.Context())
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive number.")
+			return
+		}
+		limit = n
+	}
+	summaries, err := h.Store.List(r.Context(), limit)
 	if err != nil {
 		h.fail(w, err)
 		return

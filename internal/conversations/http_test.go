@@ -123,3 +123,20 @@ func TestAnUnknownRouteIsAPlainNotFound(t *testing.T) {
 		t.Errorf("unknown route = %d %q", resp.StatusCode, data)
 	}
 }
+
+func TestListTakesALimit(t *testing.T) {
+	store := openStore(t)
+	tick(store)
+	srv := serve(t, store)
+	for _, title := range []string{"one", "two", "three"} {
+		_, _ = store.Start(context.Background(), title)
+	}
+	_, body := call(t, "GET", srv.URL+"/conversations?limit=2", "")
+	items, _ := body["conversations"].([]any)
+	if len(items) != 2 || items[0].(map[string]any)["title"] != "three" {
+		t.Errorf("limited list = %v", body)
+	}
+	if status, _ := call(t, "GET", srv.URL+"/conversations?limit=x", ""); status != 400 {
+		t.Errorf("bad limit = %d, want 400", status)
+	}
+}

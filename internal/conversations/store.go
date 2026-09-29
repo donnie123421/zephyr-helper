@@ -242,10 +242,14 @@ WHERE id = ?`,
 const summaryColumns = `c.id, c.title, c.created_at, c.updated_at, c.provider, c.model,
     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id AND m.hidden = 0)`
 
-// List returns every conversation, most recently active first.
-func (s *Store) List(ctx context.Context) ([]Summary, error) {
+// List returns conversations, most recently active first: all of them, or
+// the first limit when limit is above zero.
+func (s *Store) List(ctx context.Context, limit int) ([]Summary, error) {
+	if limit <= 0 {
+		limit = -1 // SQLite: no limit
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+summaryColumns+`
-FROM conversations c ORDER BY c.updated_at DESC, c.created_at DESC`)
+FROM conversations c ORDER BY c.updated_at DESC, c.created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list: %w", err)
 	}

@@ -96,7 +96,7 @@ func TestListIsMostRecentlyActiveFirst(t *testing.T) {
 	newer, _ := store.Start(ctx, "newer")
 	mustAppend(t, store, older.ID, Message{Role: RoleUser, Content: "back again"})
 
-	list, err := store.List(ctx)
+	list, err := store.List(ctx, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestListIsMostRecentlyActiveFirst(t *testing.T) {
 }
 
 func TestEmptyListIsNotNil(t *testing.T) {
-	list, err := openStore(t).List(context.Background())
+	list, err := openStore(t).List(context.Background(), 0)
 	if err != nil || list == nil || len(list) != 0 {
 		t.Fatalf("list = %#v, %v; want an empty slice", list, err)
 	}
@@ -149,7 +149,7 @@ func TestStartKeepsTheMostRecentlyActive(t *testing.T) {
 	mustAppend(t, store, a.ID, Message{Role: RoleUser, Content: "still going"})
 	_, _ = store.Start(ctx, "d")
 
-	list, _ := store.List(ctx)
+	list, _ := store.List(ctx, 0)
 	var ids []string
 	for _, s := range list {
 		ids = append(ids, s.Title)
@@ -194,7 +194,7 @@ func TestRenameAndDelete(t *testing.T) {
 	if err != nil || n != 2 {
 		t.Fatalf("delete all = %d, %v", n, err)
 	}
-	if list, _ := store.List(ctx); len(list) != 0 {
+	if list, _ := store.List(ctx, 0); len(list) != 0 {
 		t.Errorf("left after delete all: %+v", list)
 	}
 }
@@ -259,7 +259,7 @@ func TestStartNeverPrunesTheNewChat(t *testing.T) {
 	if _, err := store.Get(ctx, c.ID); err != nil {
 		t.Fatalf("the new chat was pruned: %v", err)
 	}
-	if list, _ := store.List(ctx); len(list) != 2 {
+	if list, _ := store.List(ctx, 0); len(list) != 2 {
 		t.Errorf("kept %d chats, want 2", len(list))
 	}
 }
