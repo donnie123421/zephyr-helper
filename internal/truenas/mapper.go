@@ -53,6 +53,8 @@ var overrides = map[string]override{
 	// Config singletons
 	"/system/general":        {"system.general", kindConfig},
 	"/network/configuration": {"network.configuration", kindConfig},
+	"/ssh":                   {"ssh", kindConfig},
+	"/ftp":                   {"ftp", kindConfig},
 
 	// Action POSTs
 	"/audit/query": {"audit.query", kindAction},

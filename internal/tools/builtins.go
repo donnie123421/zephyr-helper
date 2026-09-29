@@ -25,6 +25,8 @@ func builtins(tn *truenas.Client) []Tool {
 		listDatasets(tn),
 		listSnapshots(tn),
 		listSmartTests(tn),
+		listUsers(tn),
+		securitySettings(tn),
 	}
 }
 
@@ -281,8 +283,10 @@ func listShares(tn *truenas.Client) Tool {
 			Name: "list_shares",
 			Description: "List all file-sharing exports on the NAS: SMB (Windows/Mac), " +
 				"NFS (Unix), and iSCSI targets. Each entry includes type, name, path, " +
-				"and enabled state. Use when the user asks 'what am I sharing', 'what " +
-				"SMB/NFS shares do I have', or about network shares generally.",
+				"enabled state, and access settings: SMB guest access, read-only, audit " +
+				"logging and recycle bin; NFS allowed hosts and networks and root mapping. " +
+				"Use when the user asks 'what am I sharing', 'what SMB/NFS shares do I " +
+				"have', about network shares generally, or about share security.",
 			Parameters: noArgs,
 		},
 		StatusLine: "Checking shares…",
@@ -296,9 +300,7 @@ func listShares(tn *truenas.Client) Tool {
 				var smb []map[string]any
 				if json.Unmarshal(raw, &smb) == nil {
 					for _, s := range smb {
-						entry := map[string]any{"type": "smb"}
-						copyFields(entry, s, "name", "path", "enabled", "comment", "purpose", "locked")
-						out = append(out, entry)
+						out = append(out, projectSMBShare(s))
 					}
 				}
 			}
@@ -309,9 +311,7 @@ func listShares(tn *truenas.Client) Tool {
 				var nfs []map[string]any
 				if json.Unmarshal(raw, &nfs) == nil {
 					for _, s := range nfs {
-						entry := map[string]any{"type": "nfs"}
-						copyFields(entry, s, "path", "enabled", "comment", "hosts", "networks", "locked")
-						out = append(out, entry)
+						out = append(out, projectNFSShare(s))
 					}
 				}
 			}

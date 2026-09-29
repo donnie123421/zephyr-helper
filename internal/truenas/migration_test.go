@@ -105,6 +105,27 @@ func TestMapREST(t *testing.T) {
 			wantParams: nil,
 		},
 		{
+			name:       "ssh settings are a config singleton",
+			httpMethod: "GET",
+			path:       "/ssh",
+			wantMethod: "ssh.config",
+			wantParams: nil,
+		},
+		{
+			name:       "ftp settings are a config singleton",
+			httpMethod: "GET",
+			path:       "/ftp",
+			wantMethod: "ftp.config",
+			wantParams: nil,
+		},
+		{
+			name:       "users are a plain query",
+			httpMethod: "GET",
+			path:       "/user",
+			wantMethod: "user.query",
+			wantParams: []any{},
+		},
+		{
 			name:       "audit.query forwards body as single positional dict",
 			httpMethod: "POST",
 			path:       "/audit/query",

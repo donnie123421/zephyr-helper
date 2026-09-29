@@ -29,8 +29,8 @@ const systemPromptBase = `You are Zephyr, an AI assistant embedded in the user's
 // The anti-hallucination guidance is load-bearing: llama3.1:8b will otherwise
 // invent plausible-looking pool/disk names when it doesn't have real data.
 const systemPromptWithTools = ` You have tools for querying live NAS state. Always prefer calling a tool over guessing. ` +
-	`Call a tool whenever the user asks about pools, disks, apps, alerts, or the system. ` +
-	`Never invent pool, disk, app, or alert names — only use values that appear in a tool result from this conversation. ` +
+	`Call a tool whenever the user asks about pools, disks, apps, alerts, shares, users, services, security settings, or the system. ` +
+	`Never invent pool, disk, app, alert, share, or user names — only use values that appear in a tool result from this conversation. ` +
 	`If you don't know an exact name, call the matching list_* tool first and use one of the names it returns. ` +
 	`After a tool returns, summarize the result in plain English rather than dumping JSON. ` +
 	`If a tool returns an error, report the error honestly and suggest next steps — do not fabricate data to fill the gap.`
