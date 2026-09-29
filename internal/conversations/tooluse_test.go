@@ -81,6 +81,20 @@ func TestAToolUseCutsLongText(t *testing.T) {
 	}
 }
 
+func TestAToolUseMeasuresItsResultAsItWillBeWritten(t *testing.T) {
+	// A tool passing TrueNAS's JSON through untouched could have < and &
+	// unescaped; encoding/json writes each as six bytes.
+	raw := `{"log":"` + strings.Repeat("<", MaxToolResultBytes-20) + `"}`
+	use := NewToolUse("app_logs", nil, raw, false, checkedAt)
+	frame, err := json.Marshal(use)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !use.Trimmed || len(use.Result) > MaxToolResultBytes || len(frame) > MaxToolResultBytes+200 {
+		t.Errorf("trimmed = %v, result %d bytes, written as %d", use.Trimmed, len(use.Result), len(frame))
+	}
+}
+
 func TestAToolUseDropsAResultItCantShorten(t *testing.T) {
 	// Only lists and text are shortened, so a huge object can't be.
 	settings := map[string]int{}

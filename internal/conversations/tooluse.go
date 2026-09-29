@@ -88,6 +88,15 @@ func keptResult(result string) (json.RawMessage, bool) {
 		// Every tool answers in JSON, but anything else is kept as text.
 		raw, _ = json.Marshal(result)
 	}
+	// Measured as it will be written: encoding/json escapes <, > and & in
+	// a RawMessage too, and each grows to six bytes.
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil {
+		return nil, true
+	}
+	var escaped bytes.Buffer
+	json.HTMLEscape(&escaped, compact.Bytes())
+	raw = escaped.Bytes()
 	if len(raw) <= MaxToolResultBytes {
 		return raw, false
 	}
