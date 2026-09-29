@@ -86,7 +86,10 @@ func NewHandler(models *llm.Switch, reg *tools.Registry, saved *conversations.St
 }
 
 // recordUsage counts a turn's tokens toward the month, whatever became of
-// the turn: they were spent either way.
+// the turn: they were spent either way. A turn cut short counts what the
+// provider had reported by then. Claude reports the prompt as it starts
+// answering; OpenAI-style servers report only at the end, so a stopped
+// answer from one isn't counted.
 func (h *Handler) recordUsage(ctx context.Context, provider llm.Provider, u llm.Usage) {
 	if h.spent == nil || u.IsZero() {
 		return

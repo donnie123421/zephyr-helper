@@ -127,29 +127,26 @@ func (s *anthropicSession) Step(ctx context.Context, onDelta func(string) error)
 	defer stream.Close()
 
 	reply := anthropic.Message{}
+	// A reply cut short (stopped, or the app gone) still reports what it
+	// used: Claude bills the prompt as soon as it starts answering.
 	for stream.Next() {
 		event := stream.Current()
 		if err := reply.Accumulate(event); err != nil {
-			return StepResult{}, fmt.Errorf("claude stream: %w", err)
+			return StepResult{Usage: usageOf(&reply)}, fmt.Errorf("claude stream: %w", err)
 		}
 		if delta, ok := event.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
 			if text, ok := delta.Delta.AsAny().(anthropic.TextDelta); ok && text.Text != "" {
 				if err := onDelta(text.Text); err != nil {
-					return StepResult{}, err
+					return StepResult{Usage: usageOf(&reply)}, err
 				}
 			}
 		}
 	}
 	if err := stream.Err(); err != nil {
-		return StepResult{}, describeAnthropicError(err, s.model)
+		return StepResult{Usage: usageOf(&reply)}, describeAnthropicError(err, s.model)
 	}
 
-	usage := Usage{
-		InputTokens:      reply.Usage.InputTokens,
-		OutputTokens:     reply.Usage.OutputTokens,
-		CacheReadTokens:  reply.Usage.CacheReadInputTokens,
-		CacheWriteTokens: reply.Usage.CacheCreationInputTokens,
-	}
+	usage := usageOf(&reply)
 
 	// These replies stay out of the transcript: a refusal or a cut-off
 	// reply can end partway through a tool call, which must never run or be
@@ -177,6 +174,17 @@ func (s *anthropicSession) Step(ctx context.Context, onDelta func(string) error)
 		}
 	}
 	return StepResult{ToolCalls: calls, Usage: usage}, nil
+}
+
+// usageOf is what a reply has used so far. One cut short has its prompt
+// from message_start, and whatever output had been reported.
+func usageOf(reply *anthropic.Message) Usage {
+	return Usage{
+		InputTokens:      reply.Usage.InputTokens,
+		OutputTokens:     reply.Usage.OutputTokens,
+		CacheReadTokens:  reply.Usage.CacheReadInputTokens,
+		CacheWriteTokens: reply.Usage.CacheCreationInputTokens,
+	}
 }
 
 func (s *anthropicSession) AddToolResults(results []ToolResult) {

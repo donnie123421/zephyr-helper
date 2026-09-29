@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeClaude answers /v1/messages with queued SSE streams and records each
@@ -152,6 +153,48 @@ func TestClaudeStreamsTextAndReportsUsage(t *testing.T) {
 	system := req["system"].([]any)[0].(map[string]any)
 	if system["text"] != "You are Zephyr." || system["cache_control"] == nil {
 		t.Errorf("system block = %v, want the prompt with a cache breakpoint", system)
+	}
+}
+
+func TestClaudeReportsWhatAnAnswerCutShortUsed(t *testing.T) {
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, sse(messageStart,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Once "}}`))
+		w.(http.Flusher).Flush()
+		// The rest of the answer never comes.
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	defer srv.Close()
+	defer close(done)
+	claude := NewAnthropic("sk-ant-test", "claude-opus-5", srv.URL)
+
+	cases := map[string]func(ctx context.Context, cancel context.CancelFunc) func(string) error{
+		"stopped": func(_ context.Context, cancel context.CancelFunc) func(string) error {
+			return func(string) error { cancel(); return nil }
+		},
+		"app gone": func(context.Context, context.CancelFunc) func(string) error {
+			return func(string) error { return errors.New("connection closed") }
+		},
+	}
+	for name, onDelta := range cases {
+		session := claude.NewSession("You are Zephyr.", testTools)
+		session.AddUserMessage("Tell me a story")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		result, err := session.Step(ctx, onDelta(ctx, cancel))
+		cancel()
+		if err == nil {
+			t.Errorf("%s: no error", name)
+		}
+		// The prompt was billed, cache writes included.
+		if result.Usage.InputTokens != 120 || result.Usage.CacheWriteTokens != 900 || result.Usage.OutputTokens != 1 {
+			t.Errorf("%s: usage = %+v", name, result.Usage)
+		}
 	}
 }
 

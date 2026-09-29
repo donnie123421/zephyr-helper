@@ -674,7 +674,8 @@ func TestSavedChatsKeepWhatToolsFound(t *testing.T) {
 }
 
 func TestTokensAreCountedForTheMonth(t *testing.T) {
-	claude := httptest.NewServer(&claudeScript{steps: []any{"Hi there.", http.StatusUnauthorized, "Again."}})
+	story := slowReply{parts: []string{"Once ", "upon ", "a ", "time."}, gap: 150 * time.Millisecond}
+	claude := httptest.NewServer(&claudeScript{steps: []any{"Hi there.", http.StatusUnauthorized, "Again.", story}})
 	defer claude.Close()
 	spent, err := usage.Open(filepath.Join(t.TempDir(), "usage.db"))
 	if err != nil {
@@ -690,11 +691,32 @@ func TestTokensAreCountedForTheMonth(t *testing.T) {
 	_ = ask(ctx, t, conn, "again") // rejected: nothing was spent
 	_ = ask(ctx, t, conn, "still there?")
 
+	// Stopped after its first words: the prompt was billed all the same.
+	if err := wsjson.Write(ctx, conn, inboundEvent{Type: "user_message", Content: "Tell me a story"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	stopped := false
+	for {
+		frame := readFrame(ctx, t, conn)
+		if frame["type"] == "delta" && !stopped {
+			stopped = true
+			if err := wsjson.Write(ctx, conn, inboundEvent{Type: "stop"}); err != nil {
+				t.Fatalf("stop: %v", err)
+			}
+		}
+		if frame["type"] == "done" || frame["type"] == "error" {
+			if frame["stopped"] != true {
+				t.Fatalf("last frame = %v, want done and stopped", frame)
+			}
+			break
+		}
+	}
+
 	totals, err := spent.Since(ctx, time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatalf("since: %v", err)
 	}
-	if got := fmt.Sprint(totals); got != "[{anthropic claude-opus-5 {100 14 0 0} 2}]" {
+	if got := fmt.Sprint(totals); got != "[{anthropic claude-opus-5 {150 15 0 0} 3}]" {
 		t.Errorf("counted %s", got)
 	}
 }
