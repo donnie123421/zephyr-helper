@@ -116,6 +116,10 @@ func (s *ollamaSession) AddUserMessage(text string) {
 	}
 }
 
+func (s *ollamaSession) AddAssistantMessage(text string) {
+	s.history = append(s.history, ollama.Message{Role: "assistant", Content: text})
+}
+
 func (s *ollamaSession) Step(ctx context.Context, onDelta func(string) error) (StepResult, error) {
 	result, err := s.owner.client.Chat(ctx, s.history, s.tools, onDelta)
 	if errors.Is(err, ollama.ErrModelMissing) {

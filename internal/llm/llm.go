@@ -5,7 +5,8 @@
 // Each session keeps its transcript in its own provider's format. Claude's
 // history has to be replayed exactly as it came back (thinking blocks
 // included), which a provider-neutral message list can't carry, so what's
-// shared is the loop, not the history.
+// shared is the loop, not the history. A reopened chat starts a session
+// from the saved text alone, which every provider accepts.
 package llm
 
 import (
@@ -45,6 +46,9 @@ type Provider interface {
 // Session is one conversation with a model.
 type Session interface {
 	AddUserMessage(text string)
+	// AddAssistantMessage adds an earlier reply, as text, when a saved
+	// chat is reopened.
+	AddAssistantMessage(text string)
 	// Step makes one model call, streaming reply text through onDelta, and
 	// adds the reply to the transcript. It returns the tools the model
 	// asked to run; none means the model has answered.

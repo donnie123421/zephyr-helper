@@ -104,6 +104,10 @@ func (s *openAISession) AddUserMessage(text string) {
 	s.messages = append(s.messages, openai.UserMessage(text))
 }
 
+func (s *openAISession) AddAssistantMessage(text string) {
+	s.messages = append(s.messages, openai.AssistantMessage(text))
+}
+
 func (s *openAISession) Step(ctx context.Context, onDelta func(string) error) (StepResult, error) {
 	params := openai.ChatCompletionNewParams{
 		Model:    s.model,

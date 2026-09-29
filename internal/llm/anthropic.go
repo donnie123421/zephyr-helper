@@ -109,6 +109,10 @@ func (s *anthropicSession) AddUserMessage(text string) {
 	s.messages = append(s.messages, anthropic.NewUserMessage(anthropic.NewTextBlock(text)))
 }
 
+func (s *anthropicSession) AddAssistantMessage(text string) {
+	s.messages = append(s.messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(text)))
+}
+
 func (s *anthropicSession) Step(ctx context.Context, onDelta func(string) error) (StepResult, error) {
 	stream := s.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
 		Model:     s.model,

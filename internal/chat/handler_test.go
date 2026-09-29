@@ -23,7 +23,8 @@ type scriptedStep struct {
 	err    error
 }
 
-func (s *scriptedSession) AddUserMessage(string) {}
+func (s *scriptedSession) AddUserMessage(string)      {}
+func (s *scriptedSession) AddAssistantMessage(string) {}
 
 func (s *scriptedSession) Step(_ context.Context, onDelta func(string) error) (llm.StepResult, error) {
 	if len(s.steps) == 0 {
@@ -115,6 +116,10 @@ func TestRunTurnDispatchesToolsAndReportsUsage(t *testing.T) {
 	want := []string{"delta", "status", "tool_used", "status", "tool_used", "delta", "usage"}
 	if got := out.types(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("frames = %v, want %v", got, want)
+	}
+	// The answer after the tools starts a new paragraph.
+	if got := out[5]["content"]; got != "\n\ntank is fine." {
+		t.Errorf("second step's text = %q", got)
 	}
 	usage := out[len(out)-1]
 	if usage["input_tokens"] != float64(250) || usage["output_tokens"] != float64(30) ||

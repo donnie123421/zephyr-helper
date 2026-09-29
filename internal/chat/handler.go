@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/donnie123421/zephyr-helper/internal/conversations"
 	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 )
@@ -61,10 +63,13 @@ type usageEvent struct {
 type Handler struct {
 	models *llm.Switch
 	tools  *tools.Registry
+	// saved keeps each chat so the app can reopen it. Nil runs chats
+	// without saving them.
+	saved *conversations.Store
 }
 
-func NewHandler(models *llm.Switch, reg *tools.Registry) *Handler {
-	return &Handler{models: models, tools: reg}
+func NewHandler(models *llm.Switch, reg *tools.Registry, saved *conversations.Store) *Handler {
+	return &Handler{models: models, tools: reg, saved: saved}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +102,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// from the next chat.
 	provider := h.models.Current()
 	session := provider.NewSession(h.systemPrompt(), h.toolList())
+
+	// The app reopens a saved chat with ?conversation=<id>; the model
+	// picks up from its saved messages.
+	saved := newSavedChat(h.saved, r.URL.Query())
+	if id := r.URL.Query().Get("conversation"); id != "" && h.saved != nil {
+		summary, err := saved.resume(ctx, id, session)
+		if err != nil {
+			message := "Couldn't open this conversation."
+			if errors.Is(err, conversations.ErrNotFound) {
+				message = "This conversation has been deleted."
+			} else {
+				slog.Error("chat: couldn't load a saved conversation", "id", id, "err", err)
+			}
+			_ = send(outboundEvent{Type: "error", Message: message})
+			return
+		}
+		if err := send(conversationEvent{Type: "conversation", ID: summary.ID, Title: summary.Title}); err != nil {
+			return
+		}
+	}
 
 	// Prepare the model in the background so a large Ollama pull can run
 	// while the read side watches for a client disconnect. If the client
@@ -137,7 +162,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		session.AddUserMessage(msg.Content)
-		if err := h.runTurn(ctx, send, onStatus, provider, session); err != nil {
+		saved.userSaid(ctx, send, msg.Content)
+		turn := &turnRecord{}
+		err := h.runTurn(ctx, turn.observe(send), onStatus, provider, session)
+		saved.turnEnded(ctx, provider, turn, err == nil)
+		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -185,7 +214,25 @@ func (h *Handler) runTurn(
 	provider llm.Provider,
 	session llm.Session,
 ) error {
+	// Every step's text goes out as one reply. When a step that ran tools
+	// had already said something ("Let me check your pools."), the next
+	// step's text starts a new paragraph instead of running on from it.
+	var lastText string
+	stepEnded := false
 	onDelta := func(delta string) error {
+		if stepEnded && lastText != "" {
+			switch {
+			case strings.HasSuffix(lastText, "\n\n"):
+			case strings.HasSuffix(lastText, "\n"):
+				delta = "\n" + delta
+			default:
+				delta = "\n\n" + delta
+			}
+		}
+		stepEnded = false
+		if delta != "" {
+			lastText = delta
+		}
 		return send(outboundEvent{Type: "delta", Content: delta})
 	}
 
@@ -229,6 +276,7 @@ func (h *Handler) runTurn(
 			results = append(results, llm.ToolResult{CallID: call.ID, Content: content, IsError: isError})
 		}
 		session.AddToolResults(results)
+		stepEnded = true
 	}
 
 	return fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)

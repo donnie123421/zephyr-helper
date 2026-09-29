@@ -19,6 +19,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/capacity"
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
+	"github.com/donnie123421/zephyr-helper/internal/conversations"
 	"github.com/donnie123421/zephyr-helper/internal/events"
 	"github.com/donnie123421/zephyr-helper/internal/events/correlators"
 	eventshttp "github.com/donnie123421/zephyr-helper/internal/events/http"
@@ -72,7 +73,16 @@ func main() {
 	// provider and its key.
 	llmSwitch := llm.NewSwitch(llm.NewConfigStore(cfg.LLMConfigPath), llm.NewOllama(ollamaClient))
 	slog.Info("llm: provider", "provider", llmSwitch.Current().Name(), "model", llmSwitch.Current().Model())
-	chatHandler := chat.NewHandler(llmSwitch, toolRegistry)
+
+	// Saved chats. Without the store the assistant still chats; it just
+	// can't keep them, and the app finds no /conversations.
+	conversationStore, err := conversations.Open(cfg.ConversationsDBPath)
+	if err != nil {
+		slog.Warn("conversations store open; chats won't be saved", "err", err, "path", cfg.ConversationsDBPath)
+	} else {
+		defer conversationStore.Close()
+	}
+	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore)
 	llmHandler := &llm.Handler{Switch: llmSwitch, Ollama: ollamaClient}
 	modelsHandler := models.NewHandler(ollamaClient)
 
@@ -226,6 +236,11 @@ func main() {
 	llmHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
+	if conversationStore != nil {
+		(&conversations.Handler{Store: conversationStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
+			return auth.Require(cfg.PairingToken, h)
+		})
+	}
 
 	// HTTPS on the same port as plain HTTP, sorted per connection by
 	// tlsmux, so existing installs keep their compose file and app
