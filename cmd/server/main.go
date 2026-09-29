@@ -34,6 +34,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/tlsmux"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
 	"github.com/donnie123421/zephyr-helper/internal/truenas"
+	"github.com/donnie123421/zephyr-helper/internal/usage"
 	"github.com/donnie123421/zephyr-helper/internal/version"
 )
 
@@ -82,7 +83,15 @@ func main() {
 	} else {
 		defer conversationStore.Close()
 	}
-	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore)
+	// Token counts, for the app's month total. Without the store chats
+	// carry on; the app just can't show the month.
+	usageStore, err := usage.Open(cfg.UsageDBPath)
+	if err != nil {
+		slog.Warn("usage store open; tokens won't be counted", "err", err, "path", cfg.UsageDBPath)
+	} else {
+		defer usageStore.Close()
+	}
+	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore, usageStore)
 	llmHandler := &llm.Handler{Switch: llmSwitch, Ollama: ollamaClient}
 	modelsHandler := models.NewHandler(ollamaClient)
 
@@ -239,6 +248,10 @@ func main() {
 	// Registered without a store too: it answers 503 rather than the
 	// plain 404 the app reads as a helper that predates saved chats.
 	(&conversations.Handler{Store: conversationStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
+	// The same goes for the month's token counts.
+	(&usage.Handler{Store: usageStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
 

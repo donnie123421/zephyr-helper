@@ -15,6 +15,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/conversations"
 	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
+	"github.com/donnie123421/zephyr-helper/internal/usage"
 )
 
 // maxToolIterations caps the tool-call loop per user message. Six is enough
@@ -75,10 +76,27 @@ type Handler struct {
 	// saved keeps each chat so the app can reopen it. Nil runs chats
 	// without saving them.
 	saved *conversations.Store
+	// spent counts the tokens hosted models use, for the app's month
+	// total. Nil counts nothing.
+	spent *usage.Store
 }
 
-func NewHandler(models *llm.Switch, reg *tools.Registry, saved *conversations.Store) *Handler {
-	return &Handler{models: models, tools: reg, saved: saved}
+func NewHandler(models *llm.Switch, reg *tools.Registry, saved *conversations.Store, spent *usage.Store) *Handler {
+	return &Handler{models: models, tools: reg, saved: saved, spent: spent}
+}
+
+// recordUsage counts a turn's tokens toward the month, whatever became of
+// the turn: they were spent either way.
+func (h *Handler) recordUsage(ctx context.Context, provider llm.Provider, u llm.Usage) {
+	if h.spent == nil || u.IsZero() {
+		return
+	}
+	ctx, cancel := storeContext(ctx)
+	defer cancel()
+	tokens := usage.Tokens{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadTokens, CacheWrite: u.CacheWriteTokens}
+	if err := h.spent.Record(ctx, provider.Name(), provider.Model(), tokens); err != nil {
+		slog.Error("chat: couldn't count the turn's tokens", "err", err)
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

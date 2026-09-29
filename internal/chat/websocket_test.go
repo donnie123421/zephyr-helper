@@ -20,6 +20,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
+	"github.com/donnie123421/zephyr-helper/internal/usage"
 )
 
 // claudeScript answers /v1/messages in order: a reply text streams back,
@@ -150,11 +151,12 @@ func (c *claudeScript) lastMessages(t *testing.T) []string {
 // saved when it isn't nil.
 func claudeHelper(t *testing.T, claudeURL string, saved *conversations.Store) *httptest.Server {
 	t.Helper()
-	return claudeHelperWithTools(t, claudeURL, saved, tools.NewWith())
+	return claudeHelperWithTools(t, claudeURL, saved, tools.NewWith(), nil)
 }
 
-// claudeHelperWithTools is claudeHelper with tools for Claude to call.
-func claudeHelperWithTools(t *testing.T, claudeURL string, saved *conversations.Store, reg *tools.Registry) *httptest.Server {
+// claudeHelperWithTools is claudeHelper with tools for Claude to call, and
+// counting tokens in spent when it isn't nil.
+func claudeHelperWithTools(t *testing.T, claudeURL string, saved *conversations.Store, reg *tools.Registry, spent *usage.Store) *httptest.Server {
 	t.Helper()
 	store := llm.NewConfigStore(filepath.Join(t.TempDir(), "llm.json"))
 	if err := store.Save(llm.Config{
@@ -164,7 +166,7 @@ func claudeHelperWithTools(t *testing.T, claudeURL string, saved *conversations.
 		t.Fatalf("save config: %v", err)
 	}
 	sw := llm.NewSwitch(store, llm.NewOllama(ollama.NewClient("http://127.0.0.1:1", "unused")))
-	helper := httptest.NewServer(NewHandler(sw, reg, saved))
+	helper := httptest.NewServer(NewHandler(sw, reg, saved, spent))
 	t.Cleanup(helper.Close)
 	return helper
 }
@@ -620,7 +622,7 @@ func TestSavedChatsKeepWhatToolsFound(t *testing.T) {
 	claude := httptest.NewServer(script)
 	defer claude.Close()
 	saved := openConversations(t)
-	helper := claudeHelperWithTools(t, claude.URL, saved, reg)
+	helper := claudeHelperWithTools(t, claude.URL, saved, reg, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -668,5 +670,31 @@ func TestSavedChatsKeepWhatToolsFound(t *testing.T) {
 	want := []string{"user: How is tank?", "assistant: tank is ONLINE.", "user: And now?"}
 	if got := script.lastMessages(t); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("Claude was sent %q, want %q", got, want)
+	}
+}
+
+func TestTokensAreCountedForTheMonth(t *testing.T) {
+	claude := httptest.NewServer(&claudeScript{steps: []any{"Hi there.", http.StatusUnauthorized, "Again."}})
+	defer claude.Close()
+	spent, err := usage.Open(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatalf("open usage: %v", err)
+	}
+	defer spent.Close()
+	helper := claudeHelperWithTools(t, claude.URL, nil, tools.NewWith(), spent)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := dial(ctx, t, helper, "")
+	_ = ask(ctx, t, conn, "hello")
+	_ = ask(ctx, t, conn, "again") // rejected: nothing was spent
+	_ = ask(ctx, t, conn, "still there?")
+
+	totals, err := spent.Since(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("since: %v", err)
+	}
+	if got := fmt.Sprint(totals); got != "[{anthropic claude-opus-5 {100 14 0 0} 2}]" {
+		t.Errorf("counted %s", got)
 	}
 }
