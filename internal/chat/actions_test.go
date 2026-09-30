@@ -25,6 +25,8 @@ type fakeAction struct {
 	describeErr error
 	runErr      error
 	job         *tools.Job
+	// settled, when set, are the arguments the card settles on.
+	settled json.RawMessage
 }
 
 func (f *fakeAction) tool(name string) tools.Tool {
@@ -36,7 +38,7 @@ func (f *fakeAction) tool(name string) tools.Tool {
 				if f.describeErr != nil {
 					return tools.Card{}, f.describeErr
 				}
-				return tools.Card{Title: "Start a scrub on tank", Detail: "tank will be slower for a few hours.", Risk: tools.RiskRoutine}, nil
+				return tools.Card{Title: "Start a scrub on tank", Detail: "tank will be slower for a few hours.", Risk: tools.RiskRoutine, Args: f.settled}, nil
 			},
 			Run: func(_ context.Context, args json.RawMessage) (tools.Outcome, error) {
 				f.mu.Lock()
@@ -379,7 +381,7 @@ func TestAFailedActionIsReportedAndRecorded(t *testing.T) {
 	}
 	results := turn.framesOf("action_result")
 	if len(results) != 1 || results[0]["status"] != "failed" ||
-		results[0]["message"] != "Couldn't start a scrub on tank: the pool is exported" {
+		results[0]["message"] != "The pool is exported" {
 		t.Errorf("action_result = %v", results)
 	}
 	if r := session.results[0][0]; !r.IsError || !strings.Contains(r.Content, "the pool is exported") {
@@ -426,5 +428,47 @@ func TestAJobAnActionStartedIsFollowedToItsEnd(t *testing.T) {
 	// The jobs poller leaves it to this entry.
 	if !turn.log.Following(42) || turn.log.Following(43) {
 		t.Errorf("Following = %v/%v, want the action's job only", turn.log.Following(42), turn.log.Following(43))
+	}
+}
+
+func TestAnActionRunsWithTheArgumentsItsCardSettledOn(t *testing.T) {
+	fake := &fakeAction{settled: json.RawMessage(`{"pool":"tank","name":"zephyr-2026-09-30-1415"}`)}
+	turn := newActionTurn(t, fake, nil)
+	session := &scriptedSession{steps: []scriptedStep{
+		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
+		{deltas: []string{"Done."}},
+	}}
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.ran) != 1 || fake.ran[0] != string(fake.settled) {
+		t.Errorf("ran with %v, want the card's %s", fake.ran, fake.settled)
+	}
+}
+
+func TestAJobCanReportHowItEnded(t *testing.T) {
+	fake := &fakeAction{job: &tools.Job{ID: 7, Report: func(context.Context, truenas.Job) tools.Ending {
+		return tools.Ending{Title: "The scrub on tank found 3 errors", Summary: "Check the pool.", Bad: true}
+	}}}
+	turn := newActionTurn(t, fake, fakeJobs{ended: truenas.Job{State: "SUCCESS"}})
+	session := &scriptedSession{steps: []scriptedStep{
+		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
+		{deltas: []string{"Scrubbing."}},
+	}}
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+	var found *events.Event
+	evs := turn.recorded(t)
+	for i := range evs {
+		if events.IsAssistantJobFailure(evs[i]) {
+			found = &evs[i]
+		}
+	}
+	// A job that succeeded but found errors still warns, and pushes.
+	if found == nil || found.Title != "The scrub on tank found 3 errors" || found.Summary != "Check the pool." {
+		t.Fatalf("events = %+v", evs)
 	}
 }

@@ -65,6 +65,10 @@ type Card struct {
 	Title  string
 	Detail string
 	Risk   Risk
+	// Args, when set, are what Run gets instead of the model's arguments:
+	// the defaults Describe settled on, such as a snapshot's name or an
+	// update's version, so what runs is what the card said.
+	Args json.RawMessage
 }
 
 // Outcome is what an approved action did.
@@ -81,6 +85,17 @@ type Job struct {
 	ID int64
 	// Done and Failed title the activity entry when the job ends.
 	Done, Failed string
+	// Report, when set, writes the entry instead, from what the NAS shows
+	// once the job has ended: a scrub's job ends the same way whether it
+	// found errors or not.
+	Report func(ctx context.Context, ended truenas.Job) Ending
+}
+
+// Ending is how an action's job turned out, for its activity entry.
+type Ending struct {
+	Title, Summary string
+	// Bad marks an ending worth a warning, and a notification.
+	Bad bool
 }
 
 // Registry owns the set of registered tools and dispatches calls.

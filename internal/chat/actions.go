@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/donnie123421/zephyr-helper/internal/actions"
 	"github.com/donnie123421/zephyr-helper/internal/conversations"
@@ -33,8 +35,10 @@ const systemPromptWithActions = ` You can also make changes with the action tool
 	`to your suggestion; the card is how they approve, so don't ask for permission in text first. Never say an action ` +
 	`happened unless its result says so. If the user declines, don't propose it again unless they ask. At most ` +
 	`5 actions per reply. You can't update TrueNAS itself, reboot or shut down, delete anything, roll back ` +
-	`snapshots, change configuration (shares, users, permissions, datasets, networking) or replace disks: for ` +
-	`those, tell the user where to do it in the Zephyr app.`
+	`snapshots, change configuration (shares, users, permissions, datasets, networking) or replace disks. For ` +
+	`those, tell the user where to do it in the Zephyr app: TrueNAS updates, and rebooting or shutting down, ` +
+	`are in More → System Admin; snapshots in More → Snapshots; shares, datasets and disk replacement in the ` +
+	`Storage tab; accounts in More → Users & Groups; networking in More → Network.`
 
 // What became of a card, in action_result frames and saved chats.
 const (
@@ -208,14 +212,19 @@ func (t *turnActions) run(ctx context.Context, send func(any) error, onStatus fu
 // leaving: once approved, the call goes through and its outcome is recorded.
 func (t *turnActions) execute(ctx context.Context, send func(any) error, onStatus func(string), c *pendingCard, results []llm.ToolResult) {
 	onStatus(t.tools.StatusLine(c.call.Name))
-	slog.Info("chat: running an approved action", "name", c.call.Name, "args", string(c.call.Arguments))
+	// What runs is what the card said, defaults included.
+	args := c.call.Arguments
+	if len(c.card.Args) > 0 {
+		args = c.card.Args
+	}
+	slog.Info("chat: running an approved action", "name", c.call.Name, "args", string(args))
 	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), actionTimeout)
-	outcome, err := c.action.Run(runCtx, c.call.Arguments)
+	outcome, err := c.action.Run(runCtx, args)
 	cancel()
 
 	if t.log != nil {
 		t.log.Record(ctx, actions.Entry{
-			ID: c.id, Tool: c.call.Name, Arguments: c.call.Arguments,
+			ID: c.id, Tool: c.call.Name, Arguments: args,
 			Card: c.card, Outcome: outcome, Err: err,
 		})
 	}
@@ -223,8 +232,8 @@ func (t *turnActions) execute(ctx context.Context, send func(any) error, onStatu
 	switch {
 	case err != nil:
 		slog.Warn("chat: an approved action failed", "name", c.call.Name, "err", err)
-		message := actions.Failed(c.card) + ": " + err.Error()
-		t.finish(send, c, actionFailed, message, tools.ToolError(err.Error()), true, results)
+		// The card already says what it was; its footer says why not.
+		t.finish(send, c, actionFailed, upperFirst(err.Error()), tools.ToolError(err.Error()), true, results)
 	case outcome.Job != nil:
 		t.finish(send, c, actionStarted, outcome.Message, statusResult(actionStarted,
 			outcome.Message+" TrueNAS carries on in the background, and how it ends will appear in the activity feed."), false, results)
@@ -258,6 +267,14 @@ func (t *turnActions) finish(send func(any) error, c *pendingCard, status, messa
 	}
 	_ = send(toolUsedEvent{Type: "tool_used", ToolUse: use})
 	results[c.index] = llm.ToolResult{CallID: c.call.ID, Content: content, IsError: failed}
+}
+
+func upperFirst(s string) string {
+	r, size := utf8.DecodeRuneInString(s)
+	if r == utf8.RuneError {
+		return s
+	}
+	return string(unicode.ToUpper(r)) + s[size:]
 }
 
 func findCard(cards []*pendingCard, id string) *pendingCard {

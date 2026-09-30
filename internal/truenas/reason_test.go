@@ -1,9 +1,13 @@
 package truenas
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestReasonTrimsTheFraming(t *testing.T) {
@@ -43,5 +47,26 @@ func TestJobFailureReadsWell(t *testing.T) {
 		if got := c.job.Failure(); got != c.want {
 			t.Errorf("Failure(%+v) = %q, want %q", c.job, got, c.want)
 		}
+	}
+}
+
+// A job TrueNAS stops listing has ended, and waiting on it stops at once
+// rather than polling until the deadline.
+func TestWaitingOnAJobTrueNASDroppedStopsAtOnce(t *testing.T) {
+	fake := &fakeTrueNAS{loginSeen: make(chan struct{})}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	c := &Client{rpc: newRPCClient("ws"+strings.TrimPrefix(srv.URL, "http")+"/api/current", "key", nil)}
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err := c.WaitJob(ctx, 42, time.Second)
+	if !errors.Is(err, ErrJobGone) {
+		t.Fatalf("WaitJob = %v, want ErrJobGone", err)
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Errorf("took %s to give up on a job that's gone", time.Since(started))
 	}
 }

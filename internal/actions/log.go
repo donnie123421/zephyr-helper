@@ -136,36 +136,51 @@ func (l *Log) follow(e Entry) {
 		defer cancel()
 		ended, err := l.jobs.WaitJob(ctx, job.ID, l.interval)
 		if err != nil || !ended.Finished() {
-			// The helper is stopping, or the job outlasted maxFollow; the
-			// jobs poller still records a failure.
+			// The helper is stopping, the job outlasted maxFollow, or
+			// TrueNAS dropped it without saying how it went. The jobs
+			// poller still records a failure it sees.
 			slog.Info("actions: stopped following a job", "job", job.ID, "err", err)
 			return
 		}
 
+		ending := Ending(job, ended, e.Card)
+		if job.Report != nil {
+			ending = job.Report(ctx, ended)
+		}
 		ev := events.Event{
 			Kind:      events.KindJob,
 			Severity:  events.SeverityInfo,
-			Title:     title(job.Done),
-			Summary:   approvedSummary,
+			Title:     title(ending.Title),
+			Summary:   ending.Summary,
 			DedupeKey: events.AssistantKey(e.ID, events.AssistantJobDone),
 		}
 		status := "job_done"
-		if !ended.Succeeded() {
+		if ending.Bad {
 			status = "job_failed"
 			ev.Severity = events.SeverityWarning
-			ev.Title = title(job.Failed)
-			if ev.Title == "" {
-				ev.Title = Failed(e.Card)
-			}
-			ev.Summary = ended.Failure()
 			ev.DedupeKey = events.AssistantKey(e.ID, events.AssistantJobFailed)
 		}
 		if ev.Title == "" {
 			ev.Title = title(e.Outcome.Message)
 		}
+		if ev.Summary == "" {
+			ev.Summary = approvedSummary
+		}
 		ev.Body = body(e, status, ev.Summary)
 		l.ingest(ctx, ev)
 	}()
+}
+
+// Ending is how a job ended, by its own state: done, or failed and why.
+func Ending(job tools.Job, ended truenas.Job, card tools.Card) tools.Ending {
+	if ended.Succeeded() {
+		return tools.Ending{Title: job.Done, Summary: approvedSummary}
+	}
+	failed := job.Failed
+	if failed == "" {
+		failed = Failed(card)
+	}
+	return tools.Ending{Title: failed, Summary: ended.Failure(), Bad: true}
 }
 
 func (l *Log) ingest(ctx context.Context, ev events.Event) {

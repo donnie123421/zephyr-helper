@@ -12,9 +12,10 @@ import (
 )
 
 // builtins returns the tool set this helper registers when TrueNAS is
-// configured. All v1 tools are read-only — nothing here mutates state.
+// configured: the reads, and the actions (actions.go), which are offered
+// only in chats that ask for them.
 func builtins(tn *truenas.Client) []Tool {
-	return []Tool{
+	return append([]Tool{
 		listPools(tn),
 		poolStatus(tn),
 		listApps(tn),
@@ -27,7 +28,11 @@ func builtins(tn *truenas.Client) []Tool {
 		listSmartTests(tn),
 		listUsers(tn),
 		securitySettings(tn),
-	}
+		listBackupTasks(tn),
+		listVMs(tn),
+		listContainers(tn),
+		listServices(tn),
+	}, actionTools(tn)...)
 }
 
 // JSON Schema for the common "no arguments" shape. Declared once so every
