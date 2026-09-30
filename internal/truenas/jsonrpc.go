@@ -116,6 +116,10 @@ func (c *rpcClient) Call(ctx context.Context, method string, params []any) (json
 	if c.closed.Load() {
 		return nil, errors.New("rpc: client closed")
 	}
+	// Don't send a call the caller no longer wants.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("rpc %s: %w", method, err)
+	}
 
 	conn, err := c.ensureConnected(ctx)
 	if err != nil {
@@ -140,7 +144,12 @@ func (c *rpcClient) Call(ctx context.Context, method string, params []any) (json
 		c.connMu.Unlock()
 	}()
 
-	writeCtx, cancelWrite := context.WithTimeout(ctx, 10*time.Second)
+	// The write isn't bound to the caller's ctx. The websocket library
+	// closes a connection whose write context ends, even one that ends just
+	// as the write finishes, and this connection is shared: one caller
+	// giving up would fail everyone else's calls. A caller that gives up
+	// stops waiting for the reply below instead.
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelWrite()
 	if err := wsjson.Write(writeCtx, conn, req); err != nil {
 		// Drop the dead connection so the next Call reconnects.
