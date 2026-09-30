@@ -36,6 +36,24 @@ type ToolUse struct {
 	// app's date decoding expects. Absent for chats saved before results
 	// were kept.
 	CheckedAt *time.Time `json:"checked_at,omitempty"`
+	// Action is set when the tool changes the NAS: the card the user was
+	// shown and what became of it.
+	Action *ActionRecord `json:"action,omitempty"`
+}
+
+// ActionRecord is an action's card and what became of it.
+type ActionRecord struct {
+	// ID is the card's, from the chat's approval_request, so the app can
+	// match it to the card it's showing.
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Detail string `json:"detail"`
+	Risk   string `json:"risk"`
+	// Status is done, started (TrueNAS carries on and the activity feed
+	// has the rest), failed, declined, expired (no answer in time) or
+	// cancelled (the reply was stopped first).
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }
 
 // NewToolUse records a tool the assistant ran at time at.

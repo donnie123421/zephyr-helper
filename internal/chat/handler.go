@@ -12,6 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/donnie123421/zephyr-helper/internal/actions"
 	"github.com/donnie123421/zephyr-helper/internal/conversations"
 	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
@@ -44,6 +45,9 @@ const systemPromptWithTools = ` You have tools for querying live NAS state. Alwa
 type inboundEvent struct {
 	Type    string `json:"type"`
 	Content string `json:"content"`
+	// ID and Approved answer an approval_request.
+	ID       string `json:"id,omitempty"`
+	Approved bool   `json:"approved,omitempty"`
 }
 
 type outboundEvent struct {
@@ -79,10 +83,20 @@ type Handler struct {
 	// spent counts the tokens hosted models use, for the app's month
 	// total. Nil counts nothing.
 	spent *usage.Store
+	// actions records what the assistant does with the user's approval.
+	// Nil turns actions off: the app can ask, but no action tools are
+	// offered.
+	actions *actions.Log
 }
 
-func NewHandler(models *llm.Switch, reg *tools.Registry, saved *conversations.Store, spent *usage.Store) *Handler {
-	return &Handler{models: models, tools: reg, saved: saved, spent: spent}
+func NewHandler(models *llm.Switch, reg *tools.Registry, saved *conversations.Store, spent *usage.Store, acts *actions.Log) *Handler {
+	return &Handler{models: models, tools: reg, saved: saved, spent: spent, actions: acts}
+}
+
+// actionsAvailable reports whether this helper can take actions: it has
+// the tools and somewhere to record what they do.
+func (h *Handler) actionsAvailable() bool {
+	return h.actions != nil && h.tools != nil && h.tools.HasActions()
 }
 
 // recordUsage counts a turn's tokens toward the month, whatever became of
@@ -128,9 +142,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The app asks for actions with ?actions=1 when the user has Pro and
+	// has switched them on. Without it the model never sees a tool that
+	// changes anything.
+	actionsOn := r.URL.Query().Get("actions") == "1" && h.actionsAvailable()
+
 	// Tell the app what this helper can do in a chat. Apps that don't know
 	// the frame skip it.
-	if err := send(readyEvent{Type: "ready", Features: chatFeatures}); err != nil {
+	if err := send(readyEvent{Type: "ready", Features: h.features(), Actions: actionsOn}); err != nil {
 		return
 	}
 
@@ -138,12 +157,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// from the next chat (or when the app reconnects this one).
 	provider := h.models.Current()
 	chat := &chatConn{
-		h:        h,
-		send:     send,
-		onStatus: onStatus,
-		provider: provider,
-		session:  provider.NewSession(h.systemPrompt(), h.toolList()),
-		saved:    newSavedChat(h.saved, send, r.URL.Query()),
+		h:         h,
+		send:      send,
+		onStatus:  onStatus,
+		provider:  provider,
+		actions:   actionsOn,
+		approvals: newApprovals(),
+		session:   provider.NewSession(h.systemPrompt(actionsOn), h.toolList(actionsOn)),
+		saved:     newSavedChat(h.saved, send, r.URL.Query()),
 	}
 
 	// The app reopens a saved chat with ?conversation=<id>; the model
@@ -210,6 +231,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				stopMu.Unlock()
 				continue
 			}
+			if msg.Type == "approval_response" {
+				// The turn is waiting on it, so it can't queue behind it.
+				chat.approvals.deliver(msg.ID, msg.Approved)
+				continue
+			}
 			select {
 			case inbox <- msg:
 			default:
@@ -265,18 +291,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) systemPrompt() string {
+func (h *Handler) systemPrompt(withActions bool) string {
 	if h.tools == nil || h.tools.Empty() {
 		return systemPromptBase
+	}
+	if withActions {
+		return systemPromptBase + systemPromptWithTools + systemPromptWithActions
 	}
 	return systemPromptBase + systemPromptWithTools
 }
 
-func (h *Handler) toolList() []llm.Tool {
+func (h *Handler) toolList(withActions bool) []llm.Tool {
 	if h.tools == nil {
 		return nil
 	}
-	defs := h.tools.List()
+	defs := h.tools.List(withActions)
 	out := make([]llm.Tool, 0, len(defs))
 	for _, def := range defs {
 		out = append(out, llm.Tool{Name: def.Name, Description: def.Description, Parameters: def.Parameters})
@@ -285,14 +314,16 @@ func (h *Handler) toolList() []llm.Tool {
 }
 
 // runTurn drives one user message to the model's answer, running any tools
-// it asks for along the way. When it fails, unfinished is the text of the
-// step that was cut short, which the session hasn't kept.
+// it asks for along the way, and putting any actions to the user through
+// acts (nil in a chat without actions). When it fails, unfinished is the
+// text of the step that was cut short, which the session hasn't kept.
 func (h *Handler) runTurn(
 	ctx context.Context,
 	send func(any) error,
 	onStatus func(string),
 	provider llm.Provider,
 	session llm.Session,
+	acts *turnActions,
 ) (unfinished string, err error) {
 	// Every step's text goes out as one reply. When a step that ran tools
 	// had already said something ("Let me check your pools."), the next
@@ -349,15 +380,26 @@ func (h *Handler) runTurn(
 		// Tool calls to dispatch. Emit a user-facing status line for each so
 		// the iOS UI can render "Checking pools…" rather than a silent pause,
 		// and a `tool_used` frame once the dispatch completes so the UI can
-		// leave a persistent chip in the chat thread.
-		results := make([]llm.ToolResult, 0, len(result.ToolCalls))
-		for _, call := range result.ToolCalls {
+		// leave a persistent chip in the chat thread. Actions wait for the
+		// reads, then go to the user as cards.
+		results := make([]llm.ToolResult, len(result.ToolCalls))
+		var proposed []proposal
+		for i, call := range result.ToolCalls {
+			if action := h.tools.Action(call.Name); action != nil && acts != nil {
+				proposed = append(proposed, proposal{index: i, call: call, action: action})
+				continue
+			}
+			// An action named in a chat without actions isn't one of its
+			// tools, and Dispatch refuses it as unknown.
 			onStatus(h.tools.StatusLine(call.Name))
 			slog.Info("chat: dispatching tool", "name", call.Name, "args", string(call.Arguments))
 			content, isError := h.tools.Dispatch(ctx, call.Name, call.Arguments)
 			use := conversations.NewToolUse(call.Name, call.Arguments, content, isError, time.Now())
 			_ = send(toolUsedEvent{Type: "tool_used", ToolUse: use})
-			results = append(results, llm.ToolResult{CallID: call.ID, Content: content, IsError: isError})
+			results[i] = llm.ToolResult{CallID: call.ID, Content: content, IsError: isError}
+		}
+		if len(proposed) > 0 {
+			acts.run(ctx, send, onStatus, proposed, results)
 		}
 		session.AddToolResults(results)
 		stepEnded = true

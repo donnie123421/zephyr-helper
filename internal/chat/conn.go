@@ -9,15 +9,23 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/llm"
 )
 
-// chatFeatures are what the app can use in a chat, announced in the ready
-// frame: "stop" ends the answer being written, keeping what's arrived, and
-// "retry" writes the last answer again.
-var chatFeatures = []string{"stop", "retry"}
+// features are what the app can use in a chat, announced in the ready
+// frame: "stop" ends the answer being written, keeping what's arrived,
+// "retry" writes the last answer again, and "actions" means the helper can
+// take actions in chats that ask for them.
+func (h *Handler) features() []string {
+	features := []string{"stop", "retry"}
+	if h.actionsAvailable() {
+		features = append(features, "actions")
+	}
+	return features
+}
 
-// readyEvent opens every chat.
+// readyEvent opens every chat. Actions says this chat has them on.
 type readyEvent struct {
 	Type     string   `json:"type"`
 	Features []string `json:"features"`
+	Actions  bool     `json:"actions,omitempty"`
 }
 
 // doneEvent ends a turn. Stopped marks one the user stopped partway.
@@ -37,6 +45,9 @@ type chatConn struct {
 	provider llm.Provider
 	session  llm.Session
 	saved    *savedChat
+	// actions is on when the app asked for them and the helper has them.
+	actions   bool
+	approvals *approvals
 	// transcript is the chat as both sides saw it, so Retry can start the
 	// session again without the answer it's replacing.
 	transcript []conversations.Message
@@ -76,7 +87,7 @@ func (c *chatConn) retry(connCtx, turnCtx context.Context) bool {
 		return c.send(outboundEvent{Type: "error", Code: codeNothingToRetry, Message: "There's no question to answer again."}) == nil
 	}
 	c.transcript = c.transcript[:last+1]
-	c.session = c.provider.NewSession(c.h.systemPrompt(), c.h.toolList())
+	c.session = c.provider.NewSession(c.h.systemPrompt(c.actions), c.h.toolList(c.actions))
 	for _, m := range replayable(c.transcript) {
 		if m.Role == conversations.RoleUser {
 			c.session.AddUserMessage(m.Content)
@@ -93,7 +104,7 @@ func (c *chatConn) retry(connCtx, turnCtx context.Context) bool {
 // connection has gone.
 func (c *chatConn) answer(connCtx, turnCtx context.Context) bool {
 	turn := &turnRecord{}
-	unfinished, err := c.h.runTurn(turnCtx, turn.observe(c.send), c.onStatus, c.provider, c.session)
+	unfinished, err := c.h.runTurn(turnCtx, turn.observe(c.send), c.onStatus, c.provider, c.session, c.turnActions())
 	c.h.recordUsage(connCtx, c.provider, turn.usage)
 	reply := turn.text.String()
 	switch {
@@ -124,6 +135,15 @@ func (c *chatConn) answer(connCtx, turnCtx context.Context) bool {
 		c.saved.turnEnded(connCtx, c.provider, turn, false)
 		return c.send(outboundEvent{Type: "error", Message: err.Error()}) == nil
 	}
+}
+
+// turnActions puts a reply's actions to the user; nil in a chat without
+// actions.
+func (c *chatConn) turnActions() *turnActions {
+	if !c.actions {
+		return nil
+	}
+	return &turnActions{tools: c.h.tools, approvals: c.approvals, log: c.h.actions, timeout: approvalTimeout}
 }
 
 // remember adds a reply to the transcript. One with no text isn't a reply.

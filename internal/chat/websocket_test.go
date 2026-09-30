@@ -16,10 +16,12 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/donnie123421/zephyr-helper/internal/actions"
 	"github.com/donnie123421/zephyr-helper/internal/conversations"
 	"github.com/donnie123421/zephyr-helper/internal/llm"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/tools"
+	"github.com/donnie123421/zephyr-helper/internal/truenas"
 	"github.com/donnie123421/zephyr-helper/internal/usage"
 )
 
@@ -158,6 +160,13 @@ func claudeHelper(t *testing.T, claudeURL string, saved *conversations.Store) *h
 // counting tokens in spent when it isn't nil.
 func claudeHelperWithTools(t *testing.T, claudeURL string, saved *conversations.Store, reg *tools.Registry, spent *usage.Store) *httptest.Server {
 	t.Helper()
+	return claudeHelperWithActions(t, claudeURL, saved, reg, spent, nil)
+}
+
+// claudeHelperWithActions is claudeHelperWithTools that can take actions,
+// recording them in acts.
+func claudeHelperWithActions(t *testing.T, claudeURL string, saved *conversations.Store, reg *tools.Registry, spent *usage.Store, acts *actions.Log) *httptest.Server {
+	t.Helper()
 	store := llm.NewConfigStore(filepath.Join(t.TempDir(), "llm.json"))
 	if err := store.Save(llm.Config{
 		Provider:  llm.ProviderAnthropic,
@@ -166,7 +175,7 @@ func claudeHelperWithTools(t *testing.T, claudeURL string, saved *conversations.
 		t.Fatalf("save config: %v", err)
 	}
 	sw := llm.NewSwitch(store, llm.NewOllama(ollama.NewClient("http://127.0.0.1:1", "unused")))
-	helper := httptest.NewServer(NewHandler(sw, reg, saved, spent))
+	helper := httptest.NewServer(NewHandler(sw, reg, saved, spent, acts))
 	t.Cleanup(helper.Close)
 	return helper
 }
@@ -183,16 +192,27 @@ func openConversations(t *testing.T) *conversations.Store {
 
 func dial(ctx context.Context, t *testing.T, helper *httptest.Server, query string) *websocket.Conn {
 	t.Helper()
+	conn, ready := dialReady(ctx, t, helper, query)
+	if fmt.Sprint(ready["features"]) != "[stop retry]" {
+		t.Fatalf("first frame = %v, want ready with stop and retry", ready)
+	}
+	return conn
+}
+
+// dialReady opens a chat and returns its ready frame.
+func dialReady(ctx context.Context, t *testing.T, helper *httptest.Server, query string) (*websocket.Conn, map[string]any) {
+	t.Helper()
 	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(helper.URL, "http")+query, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close(websocket.StatusNormalClosure, "") })
 	// Every chat opens by saying what the helper can do.
-	if ready := readFrame(ctx, t, conn); ready["type"] != "ready" || fmt.Sprint(ready["features"]) != "[stop retry]" {
-		t.Fatalf("first frame = %v, want ready with stop and retry", ready)
+	ready := readFrame(ctx, t, conn)
+	if ready["type"] != "ready" {
+		t.Fatalf("first frame = %v, want ready", ready)
 	}
-	return conn
+	return conn, ready
 }
 
 func readFrame(ctx context.Context, t *testing.T, conn *websocket.Conn) map[string]any {
@@ -718,5 +738,92 @@ func TestTokensAreCountedForTheMonth(t *testing.T) {
 	}
 	if got := fmt.Sprint(totals); got != "[{anthropic claude-opus-5 {150 15 0 0} 3}]" {
 		t.Errorf("counted %s", got)
+	}
+}
+
+func TestActionsOverWebSocket(t *testing.T) {
+	fake := &fakeAction{}
+	reg := tools.NewWith(append(testRegistryTools(), fake.tool("scrub_pool"))...)
+	script := &claudeScript{steps: []any{"Hello.", toolCall{name: "scrub_pool", input: `{"pool":"tank"}`}, "The scrub is running."}}
+	claude := httptest.NewServer(script)
+	defer claude.Close()
+	saved := openConversations(t)
+	acts := actions.New(context.Background(), openEvents(t), fakeJobs{ended: truenas.Job{State: "SUCCESS"}})
+	helper := claudeHelperWithActions(t, claude.URL, saved, reg, nil, acts)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	sent := func(i int) string {
+		script.mu.Lock()
+		defer script.mu.Unlock()
+		return string(script.bodies[i])
+	}
+
+	// A chat that doesn't ask for actions: the helper says it has them,
+	// but the model isn't offered any.
+	plain, ready := dialReady(ctx, t, helper, "")
+	if fmt.Sprint(ready["features"]) != "[stop retry actions]" || ready["actions"] != nil {
+		t.Fatalf("ready = %v", ready)
+	}
+	if got := ask(ctx, t, plain, "hi"); got[len(got)-1]["type"] != "done" {
+		t.Fatalf("plain chat = %v", got)
+	}
+	if body := sent(0); strings.Contains(body, "scrub_pool") || strings.Contains(body, "action tools") {
+		t.Errorf("a chat without actions offered them: %s", body)
+	}
+
+	conn, ready := dialReady(ctx, t, helper, "?actions=1")
+	if ready["actions"] != true {
+		t.Fatalf("ready = %v, want actions on", ready)
+	}
+	if err := wsjson.Write(ctx, conn, inboundEvent{Type: "user_message", Content: "Scrub tank"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var got []map[string]any
+	for {
+		frame := readFrame(ctx, t, conn)
+		got = append(got, frame)
+		if frame["type"] == "approval_request" {
+			if fake.runs() != 0 {
+				t.Fatalf("the action ran before it was approved")
+			}
+			answer := inboundEvent{Type: "approval_response", ID: frame["id"].(string), Approved: true}
+			if err := wsjson.Write(ctx, conn, answer); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+		}
+		if frame["type"] == "done" || frame["type"] == "error" {
+			break
+		}
+	}
+	if fake.runs() != 1 {
+		t.Fatalf("ran %d times, want 1; frames %v", fake.runs(), got)
+	}
+	var id string
+	var result map[string]any
+	for _, f := range got {
+		switch f["type"] {
+		case "conversation":
+			id, _ = f["id"].(string)
+		case "action_result":
+			result = f
+		}
+	}
+	if result == nil || result["status"] != "done" {
+		t.Fatalf("action_result = %v in %v", result, got)
+	}
+	if body := sent(1); !strings.Contains(body, `"scrub_pool"`) || !strings.Contains(body, "action tools") {
+		t.Errorf("the chat with actions didn't offer them: %s", body)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	// The saved chat keeps the card and what became of it.
+	conv, err := saved.Get(ctx, id)
+	if err != nil || len(conv.Messages) != 2 {
+		t.Fatalf("saved = %+v, %v", conv, err)
+	}
+	kept := conv.Messages[1].Tools
+	if len(kept) != 1 || kept[0].Action == nil || kept[0].Action.Status != "done" ||
+		kept[0].Action.Title != "Start a scrub on tank" || kept[0].Action.ID != result["id"] {
+		t.Fatalf("saved tools = %+v", kept)
 	}
 }

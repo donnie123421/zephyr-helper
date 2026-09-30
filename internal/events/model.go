@@ -10,6 +10,7 @@ package events
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,34 @@ const (
 	KindSnapshot Kind = "snapshot"
 	KindSecurity Kind = "security"
 )
+
+// The assistant's actions are recorded as job events, which every app
+// version can show: older apps reject a feed holding a kind they don't
+// know. Their dedupe keys start with AssistantKeyPrefix, which is how newer
+// apps and the push policy tell them apart.
+const AssistantKeyPrefix = "assistant|"
+
+// The entries an assistant action can leave.
+const (
+	// AssistantRan: it ran, and was done, started a job or failed.
+	AssistantRan = "ran"
+	// AssistantJobDone: a job it started ended well.
+	AssistantJobDone = "job_done"
+	// AssistantJobFailed: a job it started failed or was cancelled.
+	AssistantJobFailed = "job_failed"
+)
+
+// AssistantKey is the dedupe key of one entry for one action.
+func AssistantKey(actionID, entry string) string {
+	return AssistantKeyPrefix + actionID + "|" + entry
+}
+
+// IsAssistantJobFailure reports whether ev is a job an assistant action
+// started failing, which happens after the chat has moved on.
+func IsAssistantJobFailure(ev Event) bool {
+	return strings.HasPrefix(ev.DedupeKey, AssistantKeyPrefix) &&
+		strings.HasSuffix(ev.DedupeKey, "|"+AssistantJobFailed)
+}
 
 // Event is one row in the store. `Body` holds the original TrueNAS
 // payload verbatim so the detail view can surface raw data and so we can

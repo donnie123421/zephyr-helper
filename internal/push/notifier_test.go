@@ -29,6 +29,15 @@ func TestShouldPush(t *testing.T) {
 		{"warning job", events.Event{Kind: events.KindJob, Severity: events.SeverityWarning}, false},
 		{"warning security", events.Event{Kind: events.KindSecurity, Severity: events.SeverityWarning}, false},
 
+		// A job the user approved in a chat pushes when it fails later;
+		// failing in the chat, in front of them, doesn't.
+		{"assistant job failed", events.Event{Kind: events.KindJob, Severity: events.SeverityWarning,
+			DedupeKey: events.AssistantKey("a1", events.AssistantJobFailed)}, true},
+		{"assistant action failed in the chat", events.Event{Kind: events.KindJob, Severity: events.SeverityWarning,
+			DedupeKey: events.AssistantKey("a1", events.AssistantRan)}, false},
+		{"assistant job done", events.Event{Kind: events.KindJob, Severity: events.SeverityInfo,
+			DedupeKey: events.AssistantKey("a1", events.AssistantJobDone)}, false},
+
 		// Info never pushes.
 		{"info alert", events.Event{Kind: events.KindAlert, Severity: events.SeverityInfo}, false},
 		{"info pool", events.Event{Kind: events.KindPool, Severity: events.SeverityInfo}, false},

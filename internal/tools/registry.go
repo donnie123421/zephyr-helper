@@ -6,8 +6,9 @@
 //   - a short human-readable status line the chat handler emits while the tool runs
 //     so the iOS UI can show "Checking pools…" instead of spinning silently.
 //
-// All v1 tools are read-only. Write operations live behind a future approval
-// flow — not plumbed here.
+// Most tools only read. Actions change the NAS: they're offered only in chats
+// with actions switched on, and each one runs only after the user approves a
+// card the tool writes itself (see Action).
 package tools
 
 import (
@@ -31,6 +32,55 @@ type Tool struct {
 	Def        Definition
 	StatusLine string // e.g. "Checking pool status…" — shown to the user while the tool runs
 	Handler    func(ctx context.Context, args json.RawMessage) (string, error)
+	// Action, set instead of Handler, makes the tool change the NAS.
+	Action *Action
+}
+
+// Action is a tool that changes the NAS. Nothing runs without the user's
+// approval: Describe writes the card they're shown, and Run does it once
+// they approve.
+type Action struct {
+	// Describe checks the arguments against the NAS and writes the card.
+	// Its error goes back to the model, and no card is shown.
+	Describe func(ctx context.Context, args json.RawMessage) (Card, error)
+	// Run does what the card said.
+	Run func(ctx context.Context, args json.RawMessage) (Outcome, error)
+}
+
+// Risk says who an action disturbs.
+type Risk string
+
+const (
+	// RiskRoutine: nobody is interrupted (a snapshot, a scrub, a backup).
+	RiskRoutine Risk = "routine"
+	// RiskDisruptive: something people use stops for a while (an app, a
+	// VM or a service), and the card says what.
+	RiskDisruptive Risk = "disruptive"
+)
+
+// Card is what the user approves. Its words come from the tool, built from
+// checked arguments and what the NAS reports, never from the model, so a
+// crafted dataset or app name can't make a card say what it isn't.
+type Card struct {
+	Title  string
+	Detail string
+	Risk   Risk
+}
+
+// Outcome is what an approved action did.
+type Outcome struct {
+	// Message says what happened, for the user and the model.
+	Message string
+	// Job is set when TrueNAS carries on after Run returns: how it ends
+	// lands in the activity feed.
+	Job *Job
+}
+
+// Job is a TrueNAS job an action left running.
+type Job struct {
+	ID int64
+	// Done and Failed title the activity entry when the job ends.
+	Done, Failed string
 }
 
 // Registry owns the set of registered tools and dispatches calls.
@@ -66,13 +116,29 @@ func NewWith(ts ...Tool) *Registry {
 // TrueNAS credentials).
 func (r *Registry) Empty() bool { return len(r.tools) == 0 }
 
-// List returns every tool definition, sorted by name. The list is part of
-// every prompt, and hosted model APIs only reuse a cached prompt whose
-// prefix is byte-identical — map order would make every request a cache
-// miss.
-func (r *Registry) List() []Definition {
+// Len is how many tools there are, actions included.
+func (r *Registry) Len() int { return len(r.tools) }
+
+// HasActions reports whether any tool changes the NAS.
+func (r *Registry) HasActions() bool {
+	for _, t := range r.tools {
+		if t.Action != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// List returns the tool definitions, sorted by name, leaving out actions
+// unless withActions. The list is part of every prompt, and hosted model
+// APIs only reuse a cached prompt whose prefix is byte-identical — map
+// order would make every request a cache miss.
+func (r *Registry) List(withActions bool) []Definition {
 	names := make([]string, 0, len(r.tools))
-	for name := range r.tools {
+	for name, t := range r.tools {
+		if t.Action != nil && !withActions {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -84,17 +150,9 @@ func (r *Registry) List() []Definition {
 	return out
 }
 
-// Definitions returns List in the shape Ollama's /api/chat expects.
-func (r *Registry) Definitions() []map[string]any {
-	defs := r.List()
-	out := make([]map[string]any, 0, len(defs))
-	for _, def := range defs {
-		out = append(out, map[string]any{
-			"type":     "function",
-			"function": def,
-		})
-	}
-	return out
+// Action returns the named tool's action, or nil when it isn't one.
+func (r *Registry) Action(name string) *Action {
+	return r.tools[name].Action
 }
 
 // StatusLine returns the short human-readable line for a tool, or a generic
@@ -109,11 +167,12 @@ func (r *Registry) StatusLine(name string) string {
 // Dispatch runs the named tool with the given arguments, returning the
 // JSON-encoded result the LLM should see as the tool message content, and
 // whether it's an error. Unknown tool names aren't a fatal error — we return
-// the error as the tool result so the model can recover.
+// the error as the tool result so the model can recover. Actions never run
+// here: they go through the user's approval.
 func (r *Registry) Dispatch(ctx context.Context, name string, args json.RawMessage) (string, bool) {
 	t, ok := r.tools[name]
-	if !ok {
-		return toolErrorf("unknown tool: %s", name), true
+	if !ok || t.Handler == nil {
+		return ToolError(fmt.Sprintf("unknown tool: %s", name)), true
 	}
 	result, err := t.Handler(ctx, args)
 	if err != nil {
@@ -123,7 +182,12 @@ func (r *Registry) Dispatch(ctx context.Context, name string, args json.RawMessa
 }
 
 func toolErrorf(format string, a ...any) string {
-	// Encode as JSON so the model parses it uniformly with success results.
-	b, _ := json.Marshal(map[string]string{"error": fmt.Sprintf(format, a...)})
+	return ToolError(fmt.Sprintf(format, a...))
+}
+
+// ToolError is a tool result reporting an error, encoded as JSON so the
+// model parses it uniformly with success results.
+func ToolError(message string) string {
+	b, _ := json.Marshal(map[string]string{"error": message})
 	return string(b)
 }

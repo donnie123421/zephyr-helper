@@ -15,6 +15,7 @@ import (
 	// alpine container (which ships no /usr/share/zoneinfo).
 	_ "time/tzdata"
 
+	"github.com/donnie123421/zephyr-helper/internal/actions"
 	"github.com/donnie123421/zephyr-helper/internal/auth"
 	"github.com/donnie123421/zephyr-helper/internal/capacity"
 	"github.com/donnie123421/zephyr-helper/internal/chat"
@@ -66,7 +67,7 @@ func main() {
 	if toolRegistry.Empty() {
 		slog.Warn("tools: registry empty — TRUENAS_URL or TRUENAS_API_KEY missing; chat will run without NAS tools")
 	} else {
-		slog.Info("tools: registered", "count", len(toolRegistry.Definitions()))
+		slog.Info("tools: registered", "count", toolRegistry.Len(), "actions", toolRegistry.HasActions())
 	}
 
 	ollamaClient := ollama.NewClient(cfg.OllamaURL, cfg.OllamaModel)
@@ -91,7 +92,6 @@ func main() {
 	} else {
 		defer usageStore.Close()
 	}
-	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore, usageStore)
 	llmHandler := &llm.Handler{Switch: llmSwitch, Ollama: ollamaClient}
 	modelsHandler := models.NewHandler(ollamaClient)
 
@@ -106,6 +106,14 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// What the assistant does with the user's approval goes in the
+	// activity feed, along with how the jobs it starts end.
+	var actionLog *actions.Log
+	if tnClient.Configured() {
+		actionLog = actions.New(ctx, eventsStore, tnClient)
+	}
+	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore, usageStore, actionLog)
 
 	// Retention: prune events older than the configured window, once at
 	// boot and then daily. Without this the archive grows unbounded now
@@ -159,6 +167,8 @@ func main() {
 		slog.Info("alerts poller started", "interval", pollers.DefaultAlertInterval)
 
 		jobsPoller := pollers.NewJobs(tnClient, eventsStore, pollers.DefaultJobInterval, pollers.DefaultJobMergeWindow)
+		// Jobs the assistant started get their own entry from the log.
+		jobsPoller.Skip = actionLog.Following
 		go jobsPoller.Run(ctx)
 		slog.Info("jobs poller started", "interval", pollers.DefaultJobInterval)
 

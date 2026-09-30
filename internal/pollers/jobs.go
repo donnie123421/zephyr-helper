@@ -34,6 +34,10 @@ type Jobs struct {
 	interval time.Duration
 	merge    time.Duration
 
+	// Skip, when set, names jobs recorded elsewhere: the ones the
+	// assistant started, which get their own entries.
+	Skip func(id int64) bool
+
 	// seen maps job id -> terminal state we last observed. Replaced
 	// each poll with whatever the current response contains, so the
 	// map is bounded by the API's returned window rather than lifetime
@@ -98,6 +102,10 @@ func (j *Jobs) poll(ctx context.Context) {
 			continue
 		}
 		if prev, already := j.seen[id]; already && prev == upper {
+			current[id] = upper
+			continue
+		}
+		if j.Skip != nil && j.Skip(id) {
 			current[id] = upper
 			continue
 		}

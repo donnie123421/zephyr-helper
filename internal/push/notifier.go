@@ -242,6 +242,11 @@ func shouldPush(ev events.Event) bool {
 	if ev.Severity == events.SeverityCritical {
 		return true
 	}
+	// A job the user approved in a chat failing: they're waiting to hear,
+	// and the chat has moved on.
+	if events.IsAssistantJobFailure(ev) {
+		return true
+	}
 	// Warning is push-worthy only for hardware / pool integrity kinds.
 	// Warning-level alerts and job failures stay feed-only — they're
 	// frequent enough that pushing each one trains the user to ignore
