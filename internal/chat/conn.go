@@ -37,6 +37,10 @@ type doneEvent struct {
 // codeNothingToRetry: Retry in a chat with no question to answer.
 const codeNothingToRetry = "nothing_to_retry"
 
+// codeRetryAfterActions: Retry of an answer whose actions ran. Writing it
+// again would lose what was done, and invite doing it twice.
+const codeRetryAfterActions = "retry_after_actions"
+
 // chatConn is one app's chat over one connection.
 type chatConn struct {
 	h        *Handler
@@ -86,6 +90,12 @@ func (c *chatConn) retry(connCtx, turnCtx context.Context) bool {
 	if last < 0 {
 		return c.send(outboundEvent{Type: "error", Code: codeNothingToRetry, Message: "There's no question to answer again."}) == nil
 	}
+	for _, m := range c.transcript[last+1:] {
+		if ranActions(m.Tools) {
+			return c.send(outboundEvent{Type: "error", Code: codeRetryAfterActions,
+				Message: "This answer made changes on your NAS, so it can't be written again. Ask again instead."}) == nil
+		}
+	}
 	c.transcript = c.transcript[:last+1]
 	c.session = c.provider.NewSession(c.h.systemPrompt(c.actions), c.h.toolList(c.actions))
 	for _, m := range replayable(c.transcript) {
@@ -109,7 +119,7 @@ func (c *chatConn) answer(connCtx, turnCtx context.Context) bool {
 	reply := turn.text.String()
 	switch {
 	case err == nil:
-		c.remember(reply)
+		c.remember(reply, turn.tools)
 		c.saved.turnEnded(connCtx, c.provider, turn, true)
 		return c.send(doneEvent{Type: "done"}) == nil
 
@@ -124,7 +134,7 @@ func (c *chatConn) answer(connCtx, turnCtx context.Context) bool {
 		if partial := strings.TrimSpace(unfinished); partial != "" {
 			c.session.AddAssistantMessage(partial)
 		}
-		c.remember(reply)
+		c.remember(reply, turn.tools)
 		c.saved.turnEnded(connCtx, c.provider, turn, true)
 		return c.send(doneEvent{Type: "done", Stopped: true}) == nil
 
@@ -132,6 +142,10 @@ func (c *chatConn) answer(connCtx, turnCtx context.Context) bool {
 		// Report it and keep the chat open: a rate limit or a flaky
 		// connection shouldn't cost the user the conversation.
 		slog.Error("chat: turn failed", "provider", c.provider.Name(), "err", err)
+		if ranActions(turn.tools) {
+			// What the actions did stands, even though the reply didn't.
+			c.remember(reply, turn.tools)
+		}
 		c.saved.turnEnded(connCtx, c.provider, turn, false)
 		return c.send(outboundEvent{Type: "error", Message: err.Error()}) == nil
 	}
@@ -146,9 +160,10 @@ func (c *chatConn) turnActions() *turnActions {
 	return &turnActions{tools: c.h.tools, approvals: c.approvals, log: c.h.actions, timeout: approvalTimeout}
 }
 
-// remember adds a reply to the transcript. One with no text isn't a reply.
-func (c *chatConn) remember(reply string) {
-	if strings.TrimSpace(reply) != "" {
-		c.transcript = append(c.transcript, conversations.Message{Role: conversations.RoleAssistant, Content: reply})
+// remember adds a reply to the transcript. One with no text isn't a reply,
+// unless its actions ran.
+func (c *chatConn) remember(reply string, tools []conversations.ToolUse) {
+	if strings.TrimSpace(reply) != "" || ranActions(tools) {
+		c.transcript = append(c.transcript, conversations.Message{Role: conversations.RoleAssistant, Content: reply, Tools: tools})
 	}
 }

@@ -224,6 +224,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if msg.Type == "stop" {
+				// Answers after the stop don't count, even ones the turn
+				// hasn't got to yet.
+				chat.approvals.stop()
 				stopMu.Lock()
 				if stopTurn != nil {
 					stopTurn()

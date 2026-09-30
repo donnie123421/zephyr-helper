@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -81,11 +82,19 @@ func (c *savedChat) resume(ctx context.Context, id string, session llm.Session) 
 // replayable tidies saved messages into a transcript every model accepts:
 // no blank text (Claude rejects whitespace-only blocks), user first, and
 // strictly alternating roles, which some servers' chat templates require.
-// A failed turn leaves two user messages in a row; they're joined.
+// A failed turn leaves two user messages in a row; they're joined. Replies
+// that proposed actions say what became of them, so a model carrying the
+// chat on knows what was done.
 func replayable(messages []conversations.Message) []conversations.Message {
 	var out []conversations.Message
 	for _, m := range messages {
-		if strings.TrimSpace(m.Content) == "" {
+		content := m.Content
+		if m.Role == conversations.RoleAssistant {
+			if note := actionNote(m.Tools); note != "" {
+				content = strings.TrimSpace(content + "\n\n" + note)
+			}
+		}
+		if strings.TrimSpace(content) == "" {
 			continue
 		}
 		if m.Role != conversations.RoleUser && m.Role != conversations.RoleAssistant {
@@ -95,12 +104,54 @@ func replayable(messages []conversations.Message) []conversations.Message {
 			continue
 		}
 		if len(out) > 0 && out[len(out)-1].Role == m.Role {
-			out[len(out)-1].Content += "\n\n" + m.Content
+			out[len(out)-1].Content += "\n\n" + content
 			continue
 		}
-		out = append(out, conversations.Message{Role: m.Role, Content: m.Content})
+		out = append(out, conversations.Message{Role: m.Role, Content: content})
 	}
 	return out
+}
+
+// ranActions reports whether any of a reply's actions ran: done, started
+// or failed.
+func ranActions(uses []conversations.ToolUse) bool {
+	for _, use := range uses {
+		if use.Action == nil {
+			continue
+		}
+		switch use.Action.Status {
+		case actionDone, actionStarted, actionFailed:
+			return true
+		}
+	}
+	return false
+}
+
+// actionNote says what became of a reply's actions, for the model.
+func actionNote(uses []conversations.ToolUse) string {
+	var lines []string
+	for _, use := range uses {
+		a := use.Action
+		if a == nil {
+			continue
+		}
+		var what string
+		switch a.Status {
+		case actionDone, actionStarted:
+			what = a.Message
+		case actionFailed:
+			what = "it failed: " + a.Message
+		case actionDeclined:
+			what = "the user declined it"
+		default:
+			what = "it wasn't done"
+		}
+		lines = append(lines, fmt.Sprintf("“%s”: %s", a.Title, strings.TrimSpace(what)))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "(Actions in this reply, which the user was asked to approve: " + strings.Join(lines, "; ") + ")"
 }
 
 // userSaid saves the user's message. The first one starts the conversation,
@@ -146,9 +197,14 @@ func (c *savedChat) turnEnded(ctx context.Context, provider llm.Provider, turn *
 
 	// A turn that failed partway isn't saved: the model never finished
 	// the reply, and the session doesn't keep it either. Nor is a reply
-	// with no text, which can't be replayed.
+	// with no text, which can't be replayed. Unless an action ran: that
+	// happened, so a reopened chat shows it, and the model carrying the
+	// chat on is told (replayable).
 	reply := turn.text.String()
 	answered := keep && strings.TrimSpace(reply) != ""
+	if !answered && ranActions(turn.tools) {
+		answered = true
+	}
 
 	if c.id == "" {
 		if len(c.pending) == 0 || !answered {

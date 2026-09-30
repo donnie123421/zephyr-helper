@@ -78,6 +78,9 @@ type Outcome struct {
 	// Job is set when TrueNAS carries on after Run returns: how it ends
 	// lands in the activity feed.
 	Job *Job
+	// Ran are the TrueNAS jobs the action saw through, so the activity
+	// feed records them once, as this action.
+	Ran []int64
 }
 
 // Job is a TrueNAS job an action left running.

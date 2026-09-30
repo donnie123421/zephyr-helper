@@ -20,9 +20,13 @@ func truenasJob(state, failure string) truenas.Job {
 // quick shortens the actions' waits for a test.
 func quick(t *testing.T) {
 	t.Helper()
-	saved := [...]time.Duration{shortJobWait, quickCheck, jobPoll, scanCheck}
+	saved := [...]time.Duration{shortJobWait, quickCheck, jobPoll, scanCheck, guestSecond, shutdownGrace, serviceWait}
 	shortJobWait, quickCheck, jobPoll, scanCheck = 500*time.Millisecond, 200*time.Millisecond, 20*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { shortJobWait, quickCheck, jobPoll, scanCheck = saved[0], saved[1], saved[2], saved[3] })
+	guestSecond, shutdownGrace, serviceWait = 2*time.Millisecond, 300*time.Millisecond, 500*time.Millisecond
+	t.Cleanup(func() {
+		shortJobWait, quickCheck, jobPoll, scanCheck = saved[0], saved[1], saved[2], saved[3]
+		guestSecond, shutdownGrace, serviceWait = saved[4], saved[5], saved[6]
+	})
 }
 
 // jobs answers core.get_jobs from a table of job states, and hands out
@@ -618,5 +622,176 @@ func TestCardNamesStayTellable(t *testing.T) {
 		if got := appTitle(c.app); got != c.want {
 			t.Errorf("appTitle(%v) = %q, want %q", c.app, got, c.want)
 		}
+	}
+}
+
+// On 26, zpool.scrub.run's job ends at once when TrueNAS declines, and runs
+// for as long as the scrub when it starts. The helper decides from the
+// pool's scan state alone, checked five times.
+func TestScrubOn26ThatStartsAfterTheChecksCountsAsStarted(t *testing.T) {
+	quick(t)
+	nas := newFakeNAS()
+	j := withJobs(nas)
+	var mu sync.Mutex
+	polls := 0
+	var jobID int64
+	nas.on("pool.query", func([]json.RawMessage) (any, *rpcFault) {
+		mu.Lock()
+		defer mu.Unlock()
+		polls++
+		state := "FINISHED"
+		// The planning queries (Describe, Run) and five checks see no scan;
+		// the scrub starts just after (a busy middleware, a long pool history).
+		if jobID != 0 && polls > 8 {
+			state = "SCANNING"
+		}
+		return []any{map[string]any{"id": 7, "name": "tank", "healthy": true,
+			"scan": map[string]any{"function": "SCRUB", "state": state}}}, nil
+	})
+	nas.on("zpool.scrub.run", func([]json.RawMessage) (any, *rpcFault) {
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		j.next++
+		// A job that's still running means the scrub is under way:
+		// START swallows every refusal and returns straight away.
+		j.states[j.next] = map[string]any{"id": j.next, "method": "zpool.scrub.run", "state": "RUNNING"}
+		mu.Lock()
+		jobID = j.next
+		mu.Unlock()
+		return j.next, nil
+	})
+	action := actionNamed(t, scrubPool(nas.client(t)))
+
+	_, _, err := approve(t, action, `{"pool":"tank"}`)
+	time.Sleep(100 * time.Millisecond)
+	j.mu.Lock()
+	state := j.states[jobID]["state"]
+	j.mu.Unlock()
+	if err != nil {
+		t.Errorf("Run = %q, while the scrub's job is %v and the pool is now scanning", err, state)
+	}
+}
+
+// A scrub of a pool with little on it can finish before the first check.
+func TestScrubOn26ThatFinishesBeforeTheFirstCheckCountsAsStarted(t *testing.T) {
+	quick(t)
+	nas := newFakeNAS()
+	j := withJobs(nas)
+	var mu sync.Mutex
+	var finishedAt float64
+	nas.on("pool.query", func([]json.RawMessage) (any, *rpcFault) {
+		mu.Lock()
+		defer mu.Unlock()
+		scan := map[string]any{"function": "SCRUB", "state": "FINISHED", "errors": 0,
+			"end_time": map[string]any{"$date": float64(time.Now().Add(-40 * 24 * time.Hour).UnixMilli())}}
+		if finishedAt != 0 {
+			scan["end_time"] = map[string]any{"$date": finishedAt}
+		}
+		return []any{map[string]any{"id": 7, "name": "tank", "healthy": true, "allocated": 2 << 20, "scan": scan}}, nil
+	})
+	nas.on("zpool.scrub.run", func([]json.RawMessage) (any, *rpcFault) {
+		mu.Lock()
+		finishedAt = float64(time.Now().UnixMilli())
+		mu.Unlock()
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		j.next++
+		j.states[j.next] = map[string]any{"id": j.next, "method": "zpool.scrub.run", "state": "SUCCESS"}
+		return j.next, nil
+	})
+	action := actionNamed(t, scrubPool(nas.client(t)))
+	if _, _, err := approve(t, action, `{"pool":"tank"}`); err != nil {
+		t.Errorf("Run = %q, but the scrub ran and finished just after the call", err)
+	}
+}
+
+// plain promises a name "fit for a card". Bidi overrides and isolates (Cf,
+// not Cc) survive it, so a cloud sync description or alert text can reverse
+// how the rest of the card's line renders.
+func TestCardTextDropsFormatCharacters(t *testing.T) {
+	for _, name := range []string{
+		"Offsite\u202e won", // RIGHT-TO-LEFT OVERRIDE
+		"Offsite\u2066x",    // LEFT-TO-RIGHT ISOLATE
+		"Off\u200bsite",     // ZERO WIDTH SPACE
+	} {
+		got := plain(name)
+		if strings.ContainsAny(got, "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200b\u200e\u200f") {
+			t.Errorf("plain(%q) = %q, still carries a format character", name, got)
+		}
+		if got := firstLine(name, 140); strings.ContainsAny(got, "\u202e\u2066\u200b") {
+			t.Errorf("firstLine(%q) = %q, still carries a format character", name, got)
+		}
+	}
+}
+
+// An app installed with the UI's Custom App wizard is the catalog app
+// "ix-app" (custom_app false). When only its images have updates, 25.10 and
+// 26 answer app.upgrade_summary with the installed version as the upgrade
+// version (upgrade_summary_info), and app.upgrade pulls images.
+func TestAnImageOnlyUpdateIsCardedAsOne(t *testing.T) {
+	quick(t)
+	nas := newFakeNAS()
+	withJobs(nas)
+	nas.returns("app.query", []any{map[string]any{
+		"name": "homer", "state": "RUNNING", "custom_app": false, "upgrade_available": true,
+		"image_updates_available": true, "version": "1.1.8", "human_version": "1.1.8",
+		"metadata": map[string]any{"name": "ix-app", "title": "Custom App"},
+	}})
+	// What upgrade_summary_info returns for it.
+	nas.returns("app.upgrade_summary", map[string]any{"upgrade_version": "1.1.8", "upgrade_human_version": "1.1.8"})
+	action := actionNamed(t, updateApp(nas.client(t)))
+	card, err := action.Describe(context.Background(), json.RawMessage(`{"app":"homer"}`))
+	if err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	t.Logf("card: %s — %s", card.Title, card.Detail)
+	if strings.Contains(card.Detail, "From 1.1.8 to 1.1.8") || strings.Contains(card.Detail, "rolled back") ||
+		!strings.Contains(card.Detail, "newer images") || len(card.Args) != 0 {
+		t.Errorf("an image pull is carded as a version upgrade that can be rolled back: %+v", card)
+	}
+}
+
+// The card for restarting a container promises it's switched off after its
+// shutdown timeout and started again. The helper waits shortJobWait for the
+// stop, whatever the timeout, then gives up without starting it.
+func TestAContainerRestartWaitsForItsShutdownTimeout(t *testing.T) {
+	quick(t) // shortJobWait = 500ms, standing in for 90s
+	nas := newFakeNAS()
+	j := withJobs(nas)
+	// shutdown_timeout 300 (allowed: 5..300); the guest ignores the request,
+	// so TrueNAS switches it off after 300s, well past the helper's wait.
+	nas.returns("container.query", []any{map[string]any{"id": 9, "name": "web", "shutdown_timeout": 300,
+		"status": map[string]any{"state": "RUNNING"}}})
+	// The guest ignores the request; TrueNAS switches it off at its
+	// shutdown timeout, past shortJobWait but within the timeout's wait.
+	var stopped time.Time
+	nas.on("container.stop", func([]json.RawMessage) (any, *rpcFault) {
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		j.next++
+		stopped = time.Now().Add(300*guestSecond + 50*time.Millisecond)
+		j.states[j.next] = map[string]any{"id": j.next, "method": "container.stop", "state": "RUNNING"}
+		id := j.next
+		go func() {
+			time.Sleep(time.Until(stopped))
+			j.mu.Lock()
+			// A new map: the old one may be being encoded for a reply.
+			j.states[id] = map[string]any{"id": id, "method": "container.stop", "state": "SUCCESS"}
+			j.mu.Unlock()
+		}()
+		return id, nil
+	})
+	nas.returns("container.start", nil)
+	action := actionNamed(t, containerAction(nas.client(t)))
+
+	card, _, err := approve(t, action, `{"name":"web","action":"restart"}`)
+	t.Logf("card: %s — %s", card.Title, card.Detail)
+	if !strings.Contains(card.Detail, "then starts again") || !strings.Contains(card.Detail, "300 seconds") {
+		t.Fatalf("card = %+v", card)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err != nil || len(nas.called("container.start")) == 0 {
+		t.Errorf("Run = %v; container.start called %d times: the restart the card promised left it stopped",
+			err, len(nas.called("container.start")))
 	}
 }

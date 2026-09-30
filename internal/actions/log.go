@@ -94,8 +94,33 @@ func (l *Log) Record(ctx context.Context, e Entry) {
 	ev.Body = body(e, status, ev.Summary)
 	l.ingest(ctx, ev)
 
+	// Jobs the action saw through have their entry: this one.
+	for _, id := range e.Outcome.Ran {
+		l.mark(id)
+	}
+	if id, ok := tools.FailedJobID(e.Err); ok {
+		l.mark(id)
+	}
 	if e.Err == nil && e.Outcome.Job != nil {
 		l.follow(e)
+	}
+}
+
+// mark notes a finished job as recorded here, so the jobs poller leaves it.
+func (l *Log) mark(id int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.following[id] = time.Now().Add(forgetAfter)
+	l.sweep()
+}
+
+// sweep forgets jobs past their time. The caller holds mu.
+func (l *Log) sweep() {
+	now := time.Now()
+	for id, until := range l.following {
+		if !until.IsZero() && now.After(until) {
+			delete(l.following, id)
+		}
 	}
 }
 
@@ -120,6 +145,7 @@ func (l *Log) Wait() { l.wg.Wait() }
 func (l *Log) follow(e Entry) {
 	job := *e.Outcome.Job
 	l.mu.Lock()
+	l.sweep()
 	l.following[job.ID] = time.Time{}
 	l.mu.Unlock()
 

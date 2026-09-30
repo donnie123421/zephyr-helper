@@ -24,10 +24,10 @@ const maxActionsPerReply = 5
 // as declined.
 const approvalTimeout = 5 * time.Minute
 
-// actionTimeout bounds an approved action's call to TrueNAS. Jobs return
-// their id straight away; the longest waits are the short jobs an action
-// sees through (an app starting, a service restarting).
-const actionTimeout = 2 * time.Minute
+// actionTimeout bounds an approved action's run. Jobs return their id
+// straight away; the longest waits are the jobs an action sees through,
+// such as a VM shutting down, which TrueNAS gives up to five minutes.
+const actionTimeout = 6 * time.Minute
 
 // systemPromptWithActions is added in chats with actions on.
 const systemPromptWithActions = ` You can also make changes with the action tools. Each one shows the user a card, ` +
@@ -70,15 +70,25 @@ type actionResultEvent struct {
 }
 
 // approvals routes the app's answers to the cards waiting for them. The
-// reader goroutine delivers; the turn waits.
+// reader goroutine delivers answers and stops, in the order the app sent
+// them; the turn waits.
 type approvals struct {
 	mu      sync.Mutex
 	waiting map[string]chan<- answer
+	// seq numbers answers and stops in the order the reader saw them.
+	seq uint64
+	// stopSeq is the last stop's number; 0 for none.
+	stopSeq uint64
 }
 
 type answer struct {
 	id       string
 	approved bool
+	// seq and at place the answer against a stop and the cards'
+	// deadline: an approved action can hold up the loop for minutes, and
+	// answers queue meanwhile, so they're decided by when they came.
+	seq uint64
+	at  time.Time
 }
 
 func newApprovals() *approvals {
@@ -107,6 +117,8 @@ func (a *approvals) drop(ids []string) {
 // a card that isn't waiting (it expired, or never existed) is dropped.
 func (a *approvals) deliver(id string, approved bool) {
 	a.mu.Lock()
+	a.seq++
+	seq := a.seq
 	ch, ok := a.waiting[id]
 	delete(a.waiting, id)
 	a.mu.Unlock()
@@ -114,7 +126,24 @@ func (a *approvals) deliver(id string, approved bool) {
 		slog.Info("chat: an answer arrived for a card that isn't waiting", "id", id)
 		return
 	}
-	ch <- answer{id: id, approved: approved}
+	ch <- answer{id: id, approved: approved, seq: seq, at: time.Now()}
+}
+
+// stop notes the app stopping the reply, in order with its answers: an
+// answer after it counts for nothing. The reader calls it before it
+// cancels the turn.
+func (a *approvals) stop() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seq++
+	a.stopSeq = a.seq
+}
+
+// mark is where the order has got to, and the last stop.
+func (a *approvals) mark() (seq, stop uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.seq, a.stopSeq
 }
 
 // turnActions runs one reply's actions past the user.
@@ -173,35 +202,65 @@ func (t *turnActions) run(ctx context.Context, send func(any) error, onStatus fu
 	t.approvals.expect(ids, answers)
 	defer t.approvals.drop(ids)
 
-	expires := time.Now().Add(t.timeout).UTC().Truncate(time.Second)
+	deadline := time.Now().Add(t.timeout)
 	for _, c := range cards {
 		_ = send(approvalRequestEvent{
 			Type: "approval_request", ID: c.id, Tool: c.call.Name,
 			Title: c.card.Title, Detail: c.card.Detail, Risk: string(c.card.Risk),
-			ExpiresAt: expires,
+			ExpiresAt: deadline.UTC().Truncate(time.Second),
 		})
 	}
 
-	timer := time.NewTimer(t.timeout)
+	// An answer counts only if it came before any stop of this reply and
+	// before the deadline, whenever the loop gets to it. (A stop from a
+	// disconnect needs no ordering: no answers come after it.)
+	base, _ := t.approvals.mark()
+	open := len(cards)
+	handle := func(a answer) {
+		c := findCard(cards, a.id)
+		if c == nil || c.settled {
+			return
+		}
+		c.settled = true
+		open--
+		_, stop := t.approvals.mark()
+		switch {
+		case stop > base && a.seq > stop:
+			t.settle(send, c, actionCancelled, "The reply was stopped before the user answered, so nothing was done.", results)
+		case a.at.After(deadline):
+			t.settle(send, c, actionExpired, "The user didn't answer within 5 minutes, so nothing was done.", results)
+		case a.approved:
+			t.execute(ctx, send, onStatus, c, results)
+		default:
+			t.settle(send, c, actionDeclined, "The user declined, so nothing was done. Don't propose it again unless they ask.", results)
+		}
+	}
+	// drain handles the answers that arrived before a stop or the deadline
+	// was seen, so they're decided by when they came, not by which the
+	// loop happened to pick first.
+	drain := func() {
+		for {
+			select {
+			case a := <-answers:
+				handle(a)
+			default:
+				return
+			}
+		}
+	}
+
+	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
-	for open := len(cards); open > 0; {
+	for open > 0 {
 		select {
 		case a := <-answers:
-			c := findCard(cards, a.id)
-			if c == nil || c.settled {
-				continue
-			}
-			c.settled = true
-			open--
-			if a.approved {
-				t.execute(ctx, send, onStatus, c, results)
-			} else {
-				t.settle(send, c, actionDeclined, "The user declined, so nothing was done. Don't propose it again unless they ask.", results)
-			}
+			handle(a)
 		case <-timer.C:
+			drain()
 			t.settleRest(send, cards, actionExpired, "The user didn't answer within 5 minutes, so nothing was done.", results)
 			open = 0
 		case <-ctx.Done():
+			drain()
 			t.settleRest(send, cards, actionCancelled, "The reply was stopped before the user answered, so nothing was done.", results)
 			open = 0
 		}

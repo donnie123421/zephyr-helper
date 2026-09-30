@@ -384,10 +384,12 @@ func scrubPool(tn *truenas.Client) Tool {
 					return Outcome{}, err
 				}
 				if p.cancel {
-					if err := cancelScrub(ctx, tn, p.name); err != nil {
+					run, err := cancelScrub(ctx, tn, p.name)
+					if err != nil {
 						return Outcome{}, err
 					}
-					return Outcome{Message: "Cancelled the scrub on " + plain(p.name) + "."}, nil
+					return run.outcome("Cancelled the scrub on "+plain(p.name)+".", "Cancelling the scrub on "+plain(p.name)+".",
+						"Cancelled the scrub on "+plain(p.name), "Couldn't cancel the scrub on "+plain(p.name)), nil
 				}
 				jobID, err := startScrub(ctx, tn, p.name)
 				if err != nil {
@@ -431,14 +433,30 @@ func startScrub(ctx context.Context, tn *truenas.Client, name string) (int64, er
 		return 0, fmt.Errorf("zpool.scrub.run: %w", err)
 	}
 	// zpool.scrub.run succeeds even when it declines (the pool unhealthy,
-	// a resilver running, too many scrubs), so ask the pool whether it's
-	// scanning.
+	// a resilver running, too many scrubs): it returns at once, while a
+	// scrub that starts keeps its job running until it's done. So the
+	// pool scanning, or the job still running, means it started; a job
+	// that ended says so only if the pool's last scrub ended after the call
+	// (a small pool scrubs in seconds).
+	called := time.Now()
 	for i := 0; i < 5; i++ {
 		rows, err := query(ctx, tn, "pool.query", []any{[]any{"name", "=", name}})
+		var scan map[string]any
 		if err == nil && len(rows) > 0 {
-			if scan, ok := rows[0]["scan"].(map[string]any); ok && strings.EqualFold(str(scan, "state"), "SCANNING") {
+			scan, _ = rows[0]["scan"].(map[string]any)
+			if strings.EqualFold(str(scan, "state"), "SCANNING") {
 				return jobID, nil
 			}
+		}
+		if job, err := tn.GetJob(ctx, jobID); err == nil && job.Finished() {
+			if !job.Succeeded() {
+				return 0, jobError{id: jobID, reason: job.Failure()}
+			}
+			if ended, ok := trueNASTime(scan["end_time"]); ok && strings.EqualFold(str(scan, "function"), "SCRUB") &&
+				ended.After(called.Add(-5*time.Second)) {
+				return jobID, nil
+			}
+			break
 		}
 		select {
 		case <-ctx.Done():
@@ -446,18 +464,20 @@ func startScrub(ctx context.Context, tn *truenas.Client, name string) (int64, er
 		case <-time.After(scanCheck):
 		}
 	}
+	if job, err := tn.GetJob(ctx, jobID); err == nil && !job.Finished() {
+		return jobID, nil
+	}
 	return 0, errors.New("TrueNAS didn't start it. The pool may be unhealthy, or already running a scrub or resilver")
 }
 
 // cancelScrub stops a scrub: CANCEL to 26's zpool.scrub.run, STOP to
 // pool.scrub.scrub before.
-func cancelScrub(ctx context.Context, tn *truenas.Client, name string) error {
-	_, err := runJob(ctx, tn, shortJobWait, "zpool.scrub.run", map[string]any{"pool_name": name, "scan_type": "SCRUB", "action": "CANCEL"})
+func cancelScrub(ctx context.Context, tn *truenas.Client, name string) (jobRun, error) {
+	run, err := runJob(ctx, tn, shortJobWait, "zpool.scrub.run", map[string]any{"pool_name": name, "scan_type": "SCRUB", "action": "CANCEL"})
 	if !truenas.IsMethodNotFound(err) {
-		return err
+		return run, err
 	}
-	_, err = runJob(ctx, tn, shortJobWait, "pool.scrub.scrub", name, "STOP")
-	return err
+	return runJob(ctx, tn, shortJobWait, "pool.scrub.scrub", name, "STOP")
 }
 
 // scrubReport says how a scrub the assistant started went, from the pool's
@@ -866,7 +886,9 @@ func appAction(tn *truenas.Client) Tool {
 					if err != nil {
 						return Outcome{}, fmt.Errorf("it stopped, but didn't start again: %w", err)
 					}
-					return run.outcome("Restarted "+title+".", "Stopped "+title+"; it's starting again.", "Restarted "+title, title+" didn't start again"), nil
+					out := run.outcome("Restarted "+title+".", "Stopped "+title+"; it's starting again.", "Restarted "+title, title+" didn't start again")
+					out.Ran = append(out.Ran, stop.id)
+					return out, nil
 				}
 			},
 		},
@@ -919,6 +941,11 @@ func updateApp(tn *truenas.Client) Tool {
 		}
 		if err := json.Unmarshal(raw2, &summary); err != nil || summary.UpgradeVersion == "" {
 			return plan{}, fmt.Errorf("TrueNAS didn't say which version %s would update to", appTitle(app))
+		}
+		if summary.UpgradeVersion == str(app, "version") {
+			// Only its images have updates, as for apps from TrueNAS's
+			// Custom App form: newer ones are pulled, as for custom apps.
+			return plan{app: app, custom: true}, nil
 		}
 		p := plan{app: app, to: summary.UpgradeHumanVersion, toApp: summary.UpgradeVersion, from: str(app, "human_version"), fromApp: str(app, "version")}
 		if p.to == "" {
@@ -1238,7 +1265,9 @@ func machineTool(tn *truenas.Client, m machine, name, description string) Tool {
 						}
 						return run.outcome("Restarted "+label+".", "Restarting "+label+".", "Restarted "+label, "Couldn't restart "+label), nil
 					}
-					stop, err := runJob(ctx, tn, shortJobWait, m.stop, id, stopOptions)
+					// TrueNAS switches the guest off once its shutdown
+					// timeout has passed, so wait that long, and a margin.
+					stop, err := runJob(ctx, tn, shutdownWait(row), m.stop, id, stopOptions)
 					if err != nil {
 						return Outcome{}, fmt.Errorf("it didn't stop: %w", err)
 					}
@@ -1248,11 +1277,22 @@ func machineTool(tn *truenas.Client, m machine, name, description string) Tool {
 					if err := startMachine(ctx, tn, m, id); err != nil {
 						return Outcome{}, fmt.Errorf("it stopped, but didn't start again: %w", err)
 					}
-					return Outcome{Message: "Restarted " + label + "."}, nil
+					return Outcome{Message: "Restarted " + label + ".", Ran: []int64{stop.id}}, nil
 				}
 			},
 		},
 	}
+}
+
+// shutdownWait is how long stopping a VM or container can take: its
+// shutdown timeout (90 seconds unless set), after which TrueNAS switches it
+// off, and a margin.
+func shutdownWait(row map[string]any) time.Duration {
+	secs, ok := num(row, "shutdown_timeout")
+	if !ok || secs <= 0 {
+		secs = 90
+	}
+	return time.Duration(secs)*guestSecond + shutdownGrace
 }
 
 // stopOptions stop a VM or container cleanly, switching it off if it
@@ -1411,50 +1451,64 @@ func serviceAction(tn *truenas.Client) Tool {
 				}
 				service := str(row, "service")
 				label := serviceLabel(service)
-				if err := controlService(ctx, tn, action, service); err != nil {
+				jobID, err := controlService(ctx, tn, action, service)
+				if err != nil {
 					return Outcome{}, err
+				}
+				var ran []int64
+				if jobID != 0 {
+					ran = []int64{jobID}
 				}
 				switch action {
 				case "start":
-					return Outcome{Message: "Started the " + label + " service."}, nil
+					return Outcome{Message: "Started the " + label + " service.", Ran: ran}, nil
 				case "stop":
-					return Outcome{Message: "Stopped the " + label + " service."}, nil
+					return Outcome{Message: "Stopped the " + label + " service.", Ran: ran}, nil
 				default:
-					return Outcome{Message: "Restarted the " + label + " service."}, nil
+					return Outcome{Message: "Restarted the " + label + " service.", Ran: ran}, nil
 				}
 			},
 		},
 	}
 }
 
-// controlService starts, stops or restarts a service: service.control, a
-// job, on 25.10 and later; service.start and friends before.
-func controlService(ctx context.Context, tn *truenas.Client, action, service string) error {
+// serviceWait is how long a service gets to start or stop: TrueNAS's own
+// limit is 120 seconds.
+var serviceWait = 130 * time.Second
+
+// controlService starts, stops or restarts a service, returning the job it
+// ran: service.control, a job, on 25.10 and later; service.start and
+// friends before.
+func controlService(ctx context.Context, tn *truenas.Client, action, service string) (int64, error) {
+	slow := fmt.Errorf("%s is taking a while; check it in Services", serviceLabel(service))
 	raw, err := tn.Call(ctx, "service.control", strings.ToUpper(action), service, map[string]any{"silent": false})
 	if err != nil {
 		if !truenas.IsMethodNotFound(err) {
-			return errors.New(truenas.Reason(err))
+			return 0, errors.New(truenas.Reason(err))
 		}
 		raw, err = call(ctx, tn, "service."+action, service, map[string]any{"silent": false})
-		if err != nil {
-			return err
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, slow
 		}
-		return serviceResult(raw, action, service)
+		if err != nil {
+			return 0, err
+		}
+		return 0, serviceResult(raw, action, service)
 	}
 	jobID, err := truenas.JobID(raw)
 	if err != nil {
-		return serviceResult(raw, action, service)
+		return 0, serviceResult(raw, action, service)
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, shortJobWait)
+	waitCtx, cancel := context.WithTimeout(ctx, serviceWait)
 	defer cancel()
 	job, err := tn.WaitJob(waitCtx, jobID, jobPoll)
 	if err != nil || !job.Finished() {
-		return fmt.Errorf("%s is taking a while; check it in Services", serviceLabel(service))
+		return jobID, slow
 	}
 	if !job.Succeeded() {
-		return errors.New(job.Failure())
+		return jobID, jobError{id: jobID, reason: job.Failure()}
 	}
-	return serviceResult(job.Result, action, service)
+	return jobID, serviceResult(job.Result, action, service)
 }
 
 // serviceResult reads the true or false a service call returns: whether a
