@@ -217,6 +217,16 @@ func (r *rig) feed(t *testing.T) []events.Event {
 
 func at(t time.Time) *time.Time { return &t }
 
+// waitFor waits for ch to close, or fails the test.
+func waitFor(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
 func TestADueActionRunsAndBooksItsNextRun(t *testing.T) {
 	r := newRig(t)
 	job := r.book(t, Job{Kind: KindAction, Tool: "scrub_pool", Arguments: json.RawMessage(`{"pool":"tank"}`),
@@ -475,14 +485,20 @@ func TestAShutdownMidRuleWritesNothingFalse(t *testing.T) {
 	r.nas.returns("pool.query", []any{map[string]any{"name": "tank", "status": "ONLINE", "healthy": true}})
 	apps := standardApps()
 	apps[1].hangUpdate = true
-	r.apps(apps...)
+	_, onUpdate := r.apps(apps...)
+	updating := make(chan struct{})
+	*onUpdate = func(name string) {
+		if name == "plex" {
+			close(updating)
+		}
+	}
 	settings, _ := json.Marshal(UpdateRule{})
 	due := r.now.Add(-time.Minute)
 	job := r.book(t, Job{Kind: KindUpdateRule, Arguments: settings, Title: "Update apps automatically every day at 2:29 pm",
 		When: When{Repeat: "daily", Time: "14:29"}, NextRun: &due})
 	ctx, stop := context.WithCancel(context.Background())
 	r.sched.runDue(ctx)
-	time.Sleep(30 * time.Millisecond)
+	waitFor(t, updating)
 	stop()
 	evs := r.feed(t)
 	if len(evs) != 0 || r.nas.called("app.rollback") != 0 {
@@ -508,7 +524,7 @@ func TestPausingARuleStopsItBeforeTheNextApp(t *testing.T) {
 	if fmt.Sprint(updated()) != "[plex]" {
 		t.Errorf("updated %v after the pause", updated())
 	}
-	if len(evs) != 1 || !strings.Contains(evs[0].Summary, "paused or removed partway through, so Sonarr was left alone") {
+	if len(evs) != 1 || !strings.Contains(evs[0].Summary, "paused or removed while it ran, so Sonarr was left alone") {
 		t.Errorf("feed = %+v", evs)
 	}
 }
@@ -860,5 +876,95 @@ func TestARepeatingSnapshotsCardDoesntNameIt(t *testing.T) {
 	}
 	if !strings.HasPrefix(card.Detail, "Named for when it's taken. Of tank/media alone.") {
 		t.Errorf("detail = %q", card.Detail)
+	}
+}
+
+// Run Now runs a paused rule: the pause it started with doesn't stop it.
+func TestRunNowUpdatesWithAPausedRule(t *testing.T) {
+	r := newRig(t)
+	r.nas.returns("pool.query", []any{map[string]any{"name": "tank", "status": "ONLINE", "healthy": true}})
+	updated, _ := r.apps(standardApps()...)
+	settings, _ := json.Marshal(UpdateRule{})
+	job := r.book(t, Job{Kind: KindUpdateRule, Arguments: settings, Title: "Update apps automatically every Sunday at 3:00 am",
+		Paused: true, When: When{Repeat: "weekly", Weekday: "sunday", Time: "03:00"}, NextRun: at(r.now.Add(48 * time.Hour))})
+	if err := r.sched.RunNow(context.Background(), job.ID); err != nil {
+		t.Fatalf("RunNow: %v", err)
+	}
+	evs := r.feed(t)
+	if fmt.Sprint(updated()) != "[plex sonarr]" || len(evs) != 1 || evs[0].Title != "Updated Plex and Sonarr" {
+		t.Errorf("updated %v, feed %+v", updated(), evs)
+	}
+}
+
+// A rule paused before it reached any app says it didn't update them.
+func TestARulePausedBeforeAnyAppSaysSo(t *testing.T) {
+	r := newRig(t)
+	updated, _ := r.apps(standardApps()...)
+	settings, _ := json.Marshal(UpdateRule{})
+	job := r.book(t, Job{Kind: KindUpdateRule, Arguments: settings, Title: "Update apps automatically every day at 2:29 pm",
+		When: When{Repeat: "daily", Time: "14:29"}, NextRun: at(r.now.Add(-time.Minute))})
+	r.nas.on("pool.query", func([]any) (any, error) {
+		_ = r.store.Pause(context.Background(), job.ID)
+		return []any{map[string]any{"name": "tank", "status": "ONLINE", "healthy": true}}, nil
+	})
+	r.sched.runDue(context.Background())
+	evs := r.feed(t)
+	if len(updated()) != 0 || len(evs) != 1 || !strings.HasPrefix(evs[0].Title, "Didn't update apps:") ||
+		evs[0].Summary != "It was paused or removed while it ran, so Plex and Sonarr were left alone." {
+		t.Errorf("updated %v, feed %+v", updated(), evs)
+	}
+	got, _ := r.store.Get(context.Background(), job.ID)
+	if got.LastStatus != "skipped" {
+		t.Errorf("job = %+v", got)
+	}
+}
+
+// The helper stopping partway through a rule still says what it did.
+func TestARuleStoppedPartwaySaysWhatItDid(t *testing.T) {
+	r := newRig(t)
+	r.nas.returns("pool.query", []any{map[string]any{"name": "tank", "status": "ONLINE", "healthy": true}})
+	apps := standardApps()
+	apps[2].hangUpdate = true
+	_, onUpdate := r.apps(apps...)
+	updating := make(chan struct{})
+	*onUpdate = func(name string) {
+		if name == "sonarr" {
+			close(updating)
+		}
+	}
+	settings, _ := json.Marshal(UpdateRule{})
+	job := r.book(t, Job{Kind: KindUpdateRule, Arguments: settings, Title: "Update apps automatically every day at 2:29 pm",
+		When: When{Repeat: "daily", Time: "14:29"}, NextRun: at(r.now.Add(-time.Minute))})
+	ctx, stop := context.WithCancel(context.Background())
+	r.sched.runDue(ctx)
+	waitFor(t, updating)
+	stop()
+	evs := r.feed(t)
+	if len(evs) != 1 || evs[0].Title != "Updated Plex" || !strings.Contains(evs[0].Summary, "stopped while updating Sonarr") {
+		t.Errorf("feed = %+v", evs)
+	}
+	got, _ := r.store.Get(context.Background(), job.ID)
+	if got.LastStatus != "running" {
+		t.Errorf("job = %+v, want it left unfinished", got)
+	}
+}
+
+// A Run Now started before the scheduler's first pass isn't taken for a
+// run the helper stopped partway through.
+func TestTheFirstPassLeavesARunNowAlone(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	job := r.book(t, Job{Kind: KindCheckIn, Title: "Check in on the NAS every day at 8:00 am",
+		When: When{Repeat: "daily", Time: "08:00"}, NextRun: at(r.now.Add(17 * time.Hour))})
+	r.sched.reserve(job.ID)
+	defer r.sched.release(job.ID)
+	if err := r.store.Started(ctx, job.ID, r.now); err != nil {
+		t.Fatalf("started: %v", err)
+	}
+	r.sched.interrupted(ctx)
+	evs := r.feed(t)
+	got, _ := r.store.Get(ctx, job.ID)
+	if len(evs) != 0 || got.LastStatus != "running" {
+		t.Errorf("feed = %+v, job = %+v", evs, got)
 	}
 }

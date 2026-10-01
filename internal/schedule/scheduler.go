@@ -113,6 +113,10 @@ func (s *Scheduler) interrupted(ctx context.Context) {
 		return
 	}
 	for _, job := range jobs {
+		if s.isRunning(job.ID) {
+			// Run Now started it in this run of the helper, before this.
+			continue
+		}
 		why := "The helper stopped while it was running, so it may not have finished."
 		if job.Kind == KindUpdateRule {
 			why = "The helper stopped partway through, so an app may have been left mid-update. Check your apps in the Apps tab."

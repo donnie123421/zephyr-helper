@@ -71,24 +71,35 @@ func (s *Scheduler) runUpdateRule(ctx context.Context, job Job, runID string) (s
 	var results []appResult
 	var left string
 	for i, app := range apps {
-		// Paused or removed since the run began: the rest wait.
-		if current, err := s.store.Get(ctx, job.ID); errors.Is(err, ErrNotFound) || (err == nil && current.Paused) {
-			left = fmt.Sprintf("It was paused or removed partway through, so %s %s left alone.",
+		// Removed, or paused, since the run began: the rest wait. (Run
+		// Now runs a paused rule, so only a pause since counts.)
+		if current, err := s.store.Get(ctx, job.ID); errors.Is(err, ErrNotFound) || (err == nil && current.Paused && !job.Paused) {
+			left = fmt.Sprintf("It was paused or removed while it ran, so %s %s left alone.",
 				joinNames(titles(apps[i:])), map[bool]string{true: "was", false: "were"}[len(apps[i:]) == 1])
 			break
 		}
 		result, finished := s.updateOne(ctx, app)
 		if !finished {
+			// What's done is known: say so. The run stays unfinished, to
+			// show as interrupted when the helper starts again.
+			if len(results) > 0 {
+				title, summary, _ := ruleSummary(results)
+				s.note(ctx, runID, events.AssistantRule, events.SeverityWarning, title,
+					summary+" The helper stopped while updating "+app.title+".", job, "interrupted", nil)
+			}
 			return stopped, ""
 		}
 		results = append(results, result)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && i < len(apps)-1 {
 			left = "The helper was stopping, so the rest were left for the next run."
 			break
 		}
 	}
 	for _, name := range unchecked {
 		results = append(results, appResult{title: name, outcome: "couldn't be checked for an update", bad: true})
+	}
+	if len(results) == 0 {
+		return s.ruleSkipped(ctx, job, runID, left)
 	}
 	title, summary, bad := ruleSummary(results)
 	if left != "" {
