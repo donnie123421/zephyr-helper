@@ -30,6 +30,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/pollers"
 	"github.com/donnie123421/zephyr-helper/internal/push"
 	"github.com/donnie123421/zephyr-helper/internal/remoteaccess"
+	"github.com/donnie123421/zephyr-helper/internal/schedule"
 	"github.com/donnie123421/zephyr-helper/internal/tailnet"
 	"github.com/donnie123421/zephyr-helper/internal/tlscert"
 	"github.com/donnie123421/zephyr-helper/internal/tlsmux"
@@ -114,6 +115,26 @@ func main() {
 		actionLog = actions.New(ctx, eventsStore, tnClient)
 	}
 	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore, usageStore, actionLog)
+
+	// What's booked for later through the assistant: actions, the app
+	// update rule and check-ins. Booking takes the same approval cards as
+	// actions, so its tools come with them.
+	var scheduler *schedule.Scheduler
+	scheduleStore, err := schedule.Open(cfg.ScheduleDBPath)
+	if err != nil {
+		slog.Warn("schedule store open; nothing can be booked", "err", err, "path", cfg.ScheduleDBPath)
+	} else {
+		defer scheduleStore.Close()
+		if actionLog != nil {
+			toolRegistry.Add(schedule.Booking{
+				Store: scheduleStore, Registry: toolRegistry, NAS: tnClient,
+				Model: func() (string, bool) { return modelLabel(llmSwitch.Current()) },
+			}.Tools()...)
+			scheduler = schedule.New(scheduleStore, toolRegistry, actionLog, eventsStore, tnClient, chatHandler)
+			go scheduler.Run(ctx)
+			slog.Info("scheduler started", "path", cfg.ScheduleDBPath)
+		}
+	}
 
 	// Retention: prune events older than the configured window, once at
 	// boot and then daily. Without this the archive grows unbounded now
@@ -261,6 +282,9 @@ func main() {
 		return auth.Require(cfg.PairingToken, h)
 	})
 	// The same goes for the month's token counts.
+	(&schedule.Handler{Store: scheduleStore, Scheduler: scheduler}).RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
 	(&usage.Handler{Store: usageStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
@@ -358,4 +382,18 @@ func handleVersion(w http.ResponseWriter, _ *http.Request) {
 
 func handleAuthVerify(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// modelLabel names the model that writes check-ins, for their card, and
+// says whether it's hosted, so runs on the user's API key.
+func modelLabel(p llm.Provider) (string, bool) {
+	switch p.Name() {
+	case llm.ProviderAnthropic:
+		return "Claude (" + p.Model() + ")", true
+	case llm.ProviderOpenAI:
+		return "ChatGPT (" + p.Model() + ")", true
+	case llm.ProviderCustom:
+		return "your custom server (" + p.Model() + ")", true
+	}
+	return "the model on your NAS (" + p.Model() + ")", false
 }

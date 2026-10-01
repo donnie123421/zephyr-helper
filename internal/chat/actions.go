@@ -38,7 +38,10 @@ const systemPromptWithActions = ` You can also make changes with the action tool
 	`snapshots, change configuration (shares, users, permissions, datasets, networking) or replace disks. For ` +
 	`those, tell the user where to do it in the Zephyr app: TrueNAS updates, and rebooting or shutting down, ` +
 	`are in More → System Admin; snapshots in More → Snapshots; shares, datasets and disk replacement in the ` +
-	`Storage tab; accounts in More → Users & Groups; networking in More → Network.`
+	`Storage tab; accounts in More → Users & Groups; networking in More → Network. ` +
+	`You can also book these for later with schedule_action, set up automatic app updates with ` +
+	`create_update_rule, and set up regular check-ins with create_checkin; each is approved on a card too. ` +
+	`Times are the NAS's local time; if the user doesn't say when, ask rather than guess.`
 
 // What became of a card, in action_result frames and saved chats.
 const (

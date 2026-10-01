@@ -130,6 +130,13 @@ func NewWith(ts ...Tool) *Registry {
 	return r
 }
 
+// Add registers more tools, such as those other packages provide.
+func (r *Registry) Add(ts ...Tool) {
+	for _, t := range ts {
+		r.tools[t.Def.Name] = t
+	}
+}
+
 // Empty reports whether the registry has no tools (helper was started without
 // TrueNAS credentials).
 func (r *Registry) Empty() bool { return len(r.tools) == 0 }

@@ -37,6 +37,16 @@ func TestShouldPush(t *testing.T) {
 			DedupeKey: events.AssistantKey("a1", events.AssistantRan)}, false},
 		{"assistant job done", events.Event{Kind: events.KindJob, Severity: events.SeverityInfo,
 			DedupeKey: events.AssistantKey("a1", events.AssistantJobDone)}, false},
+		// Booked work and rules run unwatched: failures notify, the rest
+		// stays in the feed. A check-in's briefing always notifies.
+		{"scheduled run failed", events.Event{Kind: events.KindJob, Severity: events.SeverityWarning,
+			DedupeKey: events.AssistantKey("j1-a", events.AssistantScheduled)}, true},
+		{"scheduled run done", events.Event{Kind: events.KindJob, Severity: events.SeverityInfo,
+			DedupeKey: events.AssistantKey("j1-a", events.AssistantScheduled)}, false},
+		{"rule rolled an app back", events.Event{Kind: events.KindJob, Severity: events.SeverityWarning,
+			DedupeKey: events.AssistantKey("r1-a", events.AssistantRule)}, true},
+		{"check-in ready", events.Event{Kind: events.KindJob, Severity: events.SeverityInfo,
+			DedupeKey: events.AssistantKey("c1-a", events.AssistantCheckIn)}, true},
 
 		// Info never pushes.
 		{"info alert", events.Event{Kind: events.KindAlert, Severity: events.SeverityInfo}, false},

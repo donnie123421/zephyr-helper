@@ -32,6 +32,9 @@ const forgetAfter = time.Hour
 // approvedSummary says where an entry came from.
 const approvedSummary = "You approved this in a chat with Zephyr."
 
+// scheduledSummary says where a booked action's entry came from.
+const scheduledSummary = "It ran on schedule, as booked in a chat with Zephyr."
+
 // JobWaiter waits for TrueNAS jobs. *truenas.Client is one.
 type JobWaiter interface {
 	WaitJob(ctx context.Context, id int64, interval time.Duration) (truenas.Job, error)
@@ -68,17 +71,24 @@ type Entry struct {
 	Outcome   tools.Outcome
 	// Err is why it failed.
 	Err error
+	// Scheduled marks an action booked for later, running on its own.
+	Scheduled bool
 }
 
 // Record adds an approved action to the activity feed, and follows the job
 // it left running.
 func (l *Log) Record(ctx context.Context, e Entry) {
+	summary, entry := approvedSummary, events.AssistantRan
+	if e.Scheduled {
+		// Nobody was watching: a failure notifies.
+		summary, entry = scheduledSummary, events.AssistantScheduled
+	}
 	ev := events.Event{
 		Kind:      events.KindJob,
 		Severity:  events.SeverityInfo,
 		Title:     title(e.Outcome.Message),
-		Summary:   approvedSummary,
-		DedupeKey: events.AssistantKey(e.ID, events.AssistantRan),
+		Summary:   summary,
+		DedupeKey: events.AssistantKey(e.ID, entry),
 	}
 	status := "done"
 	switch {
@@ -89,7 +99,7 @@ func (l *Log) Record(ctx context.Context, e Entry) {
 		ev.Summary = e.Err.Error()
 	case e.Outcome.Job != nil:
 		status = "started"
-		ev.Summary = approvedSummary + " How it ends will show here."
+		ev.Summary = summary + " How it ends will show here."
 	}
 	ev.Body = body(e, status, ev.Summary)
 	l.ingest(ctx, ev)

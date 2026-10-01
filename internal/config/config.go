@@ -41,6 +41,8 @@ type Config struct {
 	LLMConfigPath string
 	// UsageDBPath is the SQLite file counting the tokens hosted models use.
 	UsageDBPath string
+	// ScheduleDBPath is the SQLite file holding what's booked for later.
+	ScheduleDBPath string
 	// ConversationsDBPath is the SQLite file holding the assistant's saved
 	// chats, readable only by the helper.
 	ConversationsDBPath string
@@ -119,6 +121,7 @@ func Load() (*Config, error) {
 	cfg.LLMConfigPath = filepath.Join(cfg.DataDir, "llm.json")
 	cfg.ConversationsDBPath = filepath.Join(cfg.DataDir, "conversations.db")
 	cfg.UsageDBPath = filepath.Join(cfg.DataDir, "usage.db")
+	cfg.ScheduleDBPath = filepath.Join(cfg.DataDir, "schedule.db")
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,
 	// mint one and print it so the operator can pair by hand.

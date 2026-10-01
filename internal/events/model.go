@@ -54,6 +54,12 @@ const (
 	AssistantJobDone = "job_done"
 	// AssistantJobFailed: a job it started failed or was cancelled.
 	AssistantJobFailed = "job_failed"
+	// AssistantScheduled: something booked ran, or didn't, on its own.
+	AssistantScheduled = "scheduled"
+	// AssistantRule: what a standing rule did on one of its runs.
+	AssistantRule = "rule"
+	// AssistantCheckIn: a check-in's briefing is ready.
+	AssistantCheckIn = "checkin"
 )
 
 // AssistantKey is the dedupe key of one entry for one action.
@@ -64,8 +70,32 @@ func AssistantKey(actionID, entry string) string {
 // IsAssistantJobFailure reports whether ev is a job an assistant action
 // started failing, which happens after the chat has moved on.
 func IsAssistantJobFailure(ev Event) bool {
-	return strings.HasPrefix(ev.DedupeKey, AssistantKeyPrefix) &&
-		strings.HasSuffix(ev.DedupeKey, "|"+AssistantJobFailed)
+	return assistantEntry(ev) == AssistantJobFailed
+}
+
+// IsAssistantPush reports whether an assistant entry should notify: what
+// happened while the user wasn't watching and went wrong (a job failing
+// after the chat moved on, something booked or a rule going wrong), and a
+// check-in's briefing being ready, which the user asked to be told of.
+func IsAssistantPush(ev Event) bool {
+	switch assistantEntry(ev) {
+	case AssistantJobFailed:
+		return true
+	case AssistantScheduled, AssistantRule:
+		return ev.Severity == SeverityWarning || ev.Severity == SeverityCritical
+	case AssistantCheckIn:
+		return true
+	}
+	return false
+}
+
+// assistantEntry is which entry for an assistant action ev is, or "".
+func assistantEntry(ev Event) string {
+	if !strings.HasPrefix(ev.DedupeKey, AssistantKeyPrefix) {
+		return ""
+	}
+	i := strings.LastIndexByte(ev.DedupeKey, '|')
+	return ev.DedupeKey[i+1:]
 }
 
 // Event is one row in the store. `Body` holds the original TrueNAS
