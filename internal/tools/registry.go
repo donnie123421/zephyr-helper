@@ -130,6 +130,21 @@ func NewWith(ts ...Tool) *Registry {
 	return r
 }
 
+type forLaterKey struct{}
+
+// ForLater marks a Describe made to book an action for later. What it would
+// act on being in that state already (an app running, a scrub under way)
+// doesn't stop it being booked: things will have changed by then, and the
+// action is checked against the NAS again when it runs.
+func ForLater(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forLaterKey{}, true)
+}
+
+func isForLater(ctx context.Context) bool {
+	v, _ := ctx.Value(forLaterKey{}).(bool)
+	return v
+}
+
 // Add registers more tools, such as those other packages provide.
 func (r *Registry) Add(ts ...Tool) {
 	for _, t := range ts {

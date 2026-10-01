@@ -44,6 +44,13 @@ type toolCall struct {
 	name, input string
 }
 
+// textThenTool is a step that says something, then calls a tool, as a model
+// does before looking: "I'll look the NAS over now."
+type textThenTool struct {
+	text string
+	call toolCall
+}
+
 func (c *claudeScript) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	c.mu.Lock()
@@ -56,6 +63,27 @@ func (c *claudeScript) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		fmt.Fprint(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+		return
+	}
+	if both, ok := step.(textThenTool); ok {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, e := range []string{
+			`{"type":"message_start","message":{"id":"msg_tt","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":50,"output_tokens":1}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%q}}`, both.text),
+			`{"type":"content_block_stop","index":0}`,
+			fmt.Sprintf(`{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":%q,"input":{}}}`, both.call.name),
+			fmt.Sprintf(`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":%q}}`, both.call.input),
+			`{"type":"content_block_stop","index":1}`,
+			`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":12}}`,
+			`{"type":"message_stop"}`,
+		} {
+			var probe struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal([]byte(e), &probe)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", probe.Type, e)
+		}
 		return
 	}
 	if call, ok := step.(toolCall); ok {

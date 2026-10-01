@@ -159,7 +159,7 @@ func TestAnApprovedActionRunsAndIsRecorded(t *testing.T) {
 	var statuses []string
 	onStatus := func(s string) { statuses = append(statuses, s) }
 
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), onStatus, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), onStatus, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 
@@ -207,7 +207,7 @@ func TestADeclinedActionDoesNotRun(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"OK, I won't."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(false), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(false), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if fake.runs() != 0 {
@@ -232,7 +232,7 @@ func TestAnUnansweredCardExpires(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"Let me know."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.out.send, func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.out.send, func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if fake.runs() != 0 {
@@ -265,7 +265,7 @@ func TestStoppingWhileACardWaitsCancelsIt(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{err: context.Canceled},
 	}}
-	if _, err := turn.h.runTurn(ctx, send, func(string) {}, &fakeProvider{}, session, turn.acts); !errors.Is(err, context.Canceled) {
+	if _, err := turn.h.runTurn(ctx, send, func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); !errors.Is(err, context.Canceled) {
 		t.Fatalf("runTurn err = %v, want cancelled", err)
 	}
 	if fake.runs() != 0 {
@@ -292,7 +292,7 @@ func TestAtMostFiveActionsPerReply(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: calls}},
 		{deltas: []string{"Done."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if cards := turn.framesOf("approval_request"); len(cards) != 5 {
@@ -315,7 +315,7 @@ func TestReadsAndActionsInOneStepKeepTheirOrder(t *testing.T) {
 		}}},
 		{deltas: []string{"Done."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	var ids []string
@@ -334,7 +334,7 @@ func TestADescribeErrorGoesBackToTheModelWithoutACard(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"Which pool?"}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if cards := turn.framesOf("approval_request"); len(cards) != 0 {
@@ -352,7 +352,7 @@ func TestActionsDontRunInAChatWithoutThem(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"I can't."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, nil); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, nil, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if fake.runs() != 0 || len(turn.framesOf("approval_request")) != 0 {
@@ -376,7 +376,7 @@ func TestAFailedActionIsReportedAndRecorded(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"It didn't work."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	results := turn.framesOf("action_result")
@@ -401,7 +401,7 @@ func TestAJobAnActionStartedIsFollowedToItsEnd(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"It's updating."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	if results := turn.framesOf("action_result"); len(results) != 1 || results[0]["status"] != "started" {
@@ -438,7 +438,7 @@ func TestAnActionRunsWithTheArgumentsItsCardSettledOn(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"Done."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	fake.mu.Lock()
@@ -457,7 +457,7 @@ func TestAJobCanReportHowItEnded(t *testing.T) {
 		{result: llm.StepResult{ToolCalls: []llm.ToolCall{scrubCall("call_1")}}},
 		{deltas: []string{"Scrubbing."}},
 	}}
-	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts); err != nil {
+	if _, err := turn.h.runTurn(context.Background(), turn.answering(true), func(string) {}, &fakeProvider{}, session, turn.acts, maxToolIterations); err != nil {
 		t.Fatalf("runTurn: %v", err)
 	}
 	var found *events.Event

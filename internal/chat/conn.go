@@ -114,7 +114,7 @@ func (c *chatConn) retry(connCtx, turnCtx context.Context) bool {
 // connection has gone.
 func (c *chatConn) answer(connCtx, turnCtx context.Context) bool {
 	turn := &turnRecord{}
-	unfinished, err := c.h.runTurn(turnCtx, turn.observe(c.send), c.onStatus, c.provider, c.session, c.turnActions())
+	unfinished, err := c.h.runTurn(turnCtx, turn.observe(c.send), c.onStatus, c.provider, c.session, c.turnActions(), maxToolIterations)
 	c.h.recordUsage(connCtx, c.provider, turn.usage)
 	reply := turn.text.String()
 	switch {

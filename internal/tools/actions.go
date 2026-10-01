@@ -320,6 +320,8 @@ func scrubPool(tn *truenas.Client) Tool {
 		scanning := strings.EqualFold(str(p.scan, "state"), "SCANNING")
 		scrubbing := scanning && strings.EqualFold(str(p.scan, "function"), "SCRUB")
 		switch {
+		case isForLater(ctx):
+			// Checked again when it runs.
 		case p.cancel && !scrubbing:
 			return plan{}, fmt.Errorf("%s isn't running a scrub", p.name)
 		case !p.cancel && scanning:
@@ -574,7 +576,7 @@ func runBackupTask(tn *truenas.Client) Tool {
 		}
 		task := rows[0]
 		name := quoted(taskName(a.Kind, task))
-		if backupRunning(task) {
+		if backupRunning(task) && !isForLater(ctx) {
 			return plan{}, fmt.Errorf("the %s %s is already running", kind.noun, name)
 		}
 		if locked, _ := task["locked"].(bool); locked {
@@ -813,6 +815,8 @@ func appAction(tn *truenas.Client) Tool {
 		}
 		state := strings.ToUpper(str(app, "state"))
 		switch {
+		case isForLater(ctx):
+			// Checked again when it runs.
 		case action == "start" && (state == "RUNNING" || state == "DEPLOYING"):
 			return "", nil, fmt.Errorf("%s is already %s", appTitle(app), strings.ToLower(state))
 		case action == "stop" && state == "STOPPED":
@@ -1193,6 +1197,8 @@ func machineTool(tn *truenas.Client, m machine, name, description string) Tool {
 		status, _ := rows[0]["status"].(map[string]any)
 		running := strings.EqualFold(str(status, "state"), "RUNNING")
 		switch {
+		case isForLater(ctx):
+			// Checked again when it runs.
 		case action == "start" && running:
 			return "", nil, fmt.Errorf("%s is already running", quoted(str(rows[0], "name")))
 		case action != "start" && !running:
@@ -1389,6 +1395,8 @@ func serviceAction(tn *truenas.Client) Tool {
 		// The state can be UNKNOWN when TrueNAS couldn't tell in time.
 		state := strings.ToUpper(str(rows[0], "state"))
 		switch {
+		case isForLater(ctx):
+			// Checked again when it runs.
 		case action == "start" && state == "RUNNING":
 			return "", nil, fmt.Errorf("%s is already running", serviceLabel(name))
 		case action == "stop" && state == "STOPPED":

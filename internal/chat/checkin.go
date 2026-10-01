@@ -13,9 +13,13 @@ import (
 // checkInPrompt asks for a check-in's briefing. It's the conversation's
 // first message, which the app keeps out of sight.
 const checkInPrompt = `This is a scheduled check-in, and the user isn't in the chat: they'll read what you write later. ` +
-	`Look the NAS over with your tools (pools, alerts, disks, apps, backup tasks and snapshots), then write a short ` +
-	`briefing: one sentence on how things are, then what needs attention, if anything, and what to do about it. ` +
-	`Keep it under 200 words. You can't make changes now: suggest them, and the user can ask for them in a chat.`
+	`Look the NAS over with your tools (pools, alerts, disks, apps, backup tasks and snapshots; call several at once), ` +
+	`then write a short briefing: one sentence on how things are, then what needs attention, if anything, and what to ` +
+	`do about it. Keep it under 200 words. You can't make changes now: suggest them, and the user can ask for them in a chat.`
+
+// checkInSteps is how many steps a check-in gets: room for a model that
+// looks at each thing in turn, then writes.
+const checkInSteps = 10
 
 // CheckIn has the current model look the NAS over and write a briefing,
 // saved as a conversation titled title. It only reads: no action tool is
@@ -31,13 +35,27 @@ func (h *Handler) CheckIn(ctx context.Context, title string) (schedule.CheckInRe
 	session := provider.NewSession(h.systemPrompt(false), h.toolList(false))
 	session.AddUserMessage(checkInPrompt)
 
+	// The briefing is the last step's text: what the model said before
+	// looking ("I'll look the NAS over") isn't part of it.
 	turn := &turnRecord{}
-	_, err := h.runTurn(ctx, turn.observe(func(any) error { return nil }), func(string) {}, provider, session, nil)
+	var final strings.Builder
+	observe := turn.observe(func(v any) error {
+		switch ev := v.(type) {
+		case outboundEvent:
+			if ev.Type == "delta" {
+				final.WriteString(ev.Content)
+			}
+		case toolUsedEvent:
+			final.Reset()
+		}
+		return nil
+	})
+	_, err := h.runTurn(ctx, observe, func(string) {}, provider, session, nil, checkInSteps)
 	h.recordUsage(ctx, provider, turn.usage)
 	if err != nil {
 		return schedule.CheckInResult{}, err
 	}
-	briefing := strings.TrimSpace(turn.text.String())
+	briefing := strings.TrimSpace(final.String())
 	if briefing == "" {
 		return schedule.CheckInResult{}, errors.New("the model wrote nothing")
 	}

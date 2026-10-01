@@ -19,10 +19,13 @@ type ruleTiming struct {
 	// runningFor is how long an updated app gets to be running again
 	// before it's rolled back.
 	runningFor time.Duration
-	poll       time.Duration
+	// settle is how long an app has to stay running to count: one that
+	// crashes as it starts shows as running at first.
+	settle time.Duration
+	poll   time.Duration
 }
 
-var defaultRuleTiming = ruleTiming{upgradeFor: 15 * time.Minute, runningFor: 5 * time.Minute, poll: 5 * time.Second}
+var defaultRuleTiming = ruleTiming{upgradeFor: 15 * time.Minute, runningFor: 5 * time.Minute, settle: 30 * time.Second, poll: 5 * time.Second}
 
 // UpdateRule is an update rule's scope, fixed when it was approved: the
 // apps it may update, or all of them.
@@ -37,39 +40,75 @@ type appResult struct {
 }
 
 // runUpdateRule updates the apps in the rule's scope that have updates,
-// one at a time. An app that isn't running again afterwards is rolled back
-// to the version it had. Nothing runs while a pool is unhealthy.
+// one at a time. An app that isn't running on its new version afterwards
+// is rolled back to the version it had. Nothing runs while a pool is
+// unhealthy.
 func (s *Scheduler) runUpdateRule(ctx context.Context, job Job, runID string) (string, string) {
 	var rule UpdateRule
 	_ = json.Unmarshal(job.Arguments, &rule)
 
-	if pool, status, err := s.unhealthyPool(ctx); err != nil {
+	pool, status, err := s.unhealthyPool(ctx)
+	switch {
+	case ctx.Err() != nil:
+		return stopped, ""
+	case err != nil:
 		return s.ruleSkipped(ctx, job, runID, "TrueNAS couldn't say how the pools are: "+truenas.Reason(err)+".")
-	} else if pool != "" {
+	case pool != "":
 		return s.ruleSkipped(ctx, job, runID, fmt.Sprintf("Pool %s is %s, and nothing is updated while a pool isn't healthy.", pool, strings.ToLower(status)))
 	}
 
-	apps, err := s.updatable(ctx, rule)
-	if err != nil {
+	apps, unchecked, err := s.updatable(ctx, rule)
+	switch {
+	case ctx.Err() != nil:
+		return stopped, ""
+	case err != nil:
 		return s.ruleSkipped(ctx, job, runID, "TrueNAS couldn't list the apps: "+truenas.Reason(err)+".")
-	}
-	if len(apps) == 0 {
+	case len(apps) == 0 && len(unchecked) == 0:
 		// Nothing to say in the feed on a quiet run.
 		return "done", "No apps had updates."
 	}
 
 	var results []appResult
-	for _, app := range apps {
-		results = append(results, s.updateOne(ctx, app))
+	var left string
+	for i, app := range apps {
+		// Paused or removed since the run began: the rest wait.
+		if current, err := s.store.Get(ctx, job.ID); errors.Is(err, ErrNotFound) || (err == nil && current.Paused) {
+			left = fmt.Sprintf("It was paused or removed partway through, so %s %s left alone.",
+				joinNames(titles(apps[i:])), map[bool]string{true: "was", false: "were"}[len(apps[i:]) == 1])
+			break
+		}
+		result, finished := s.updateOne(ctx, app)
+		if !finished {
+			return stopped, ""
+		}
+		results = append(results, result)
+		if ctx.Err() != nil {
+			left = "The helper was stopping, so the rest were left for the next run."
+			break
+		}
+	}
+	for _, name := range unchecked {
+		results = append(results, appResult{title: name, outcome: "couldn't be checked for an update", bad: true})
 	}
 	title, summary, bad := ruleSummary(results)
+	if left != "" {
+		summary += " " + left
+	}
 	severity := events.SeverityInfo
-	status := "done"
+	status = "done"
 	if bad {
 		severity, status = events.SeverityWarning, "failed"
 	}
 	s.note(ctx, runID, events.AssistantRule, severity, title, summary, job, status, nil)
 	return status, title
+}
+
+func titles(apps []ruleApp) []string {
+	out := make([]string, len(apps))
+	for i, a := range apps {
+		out[i] = a.title
+	}
+	return out
 }
 
 func (s *Scheduler) ruleSkipped(ctx context.Context, job Job, runID, why string) (string, string) {
@@ -107,13 +146,14 @@ type ruleApp struct {
 // updatable lists the apps in scope with an update the rule can undo: a
 // catalog app's new version, running now (TrueNAS updates only running
 // apps). Custom apps, and apps whose only update is newer images, have no
-// version to roll back to, so they're left alone.
-func (s *Scheduler) updatable(ctx context.Context, rule UpdateRule) ([]ruleApp, error) {
+// version to roll back to, so they're left alone. unchecked names apps
+// TrueNAS couldn't say about.
+func (s *Scheduler) updatable(ctx context.Context, rule UpdateRule) (apps []ruleApp, unchecked []string, err error) {
 	raw, err := s.nas.Call(ctx, "app.query")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var apps []struct {
+	var rows []struct {
 		Name             string `json:"name"`
 		State            string `json:"state"`
 		Version          string `json:"version"`
@@ -123,8 +163,8 @@ func (s *Scheduler) updatable(ctx context.Context, rule UpdateRule) ([]ruleApp, 
 			Title string `json:"title"`
 		} `json:"metadata"`
 	}
-	if err := json.Unmarshal(raw, &apps); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, nil, err
 	}
 	inScope := func(name string) bool {
 		if len(rule.Apps) == 0 {
@@ -137,13 +177,20 @@ func (s *Scheduler) updatable(ctx context.Context, rule UpdateRule) ([]ruleApp, 
 		}
 		return false
 	}
-	var out []ruleApp
-	for _, a := range apps {
+	for _, a := range rows {
 		if !a.UpgradeAvailable || a.CustomApp || !inScope(a.Name) || !strings.EqualFold(a.State, "RUNNING") {
 			continue
 		}
+		title := a.Metadata.Title
+		if title == "" {
+			title = a.Name
+		}
 		raw, err := s.nas.Call(ctx, "app.upgrade_summary", a.Name, map[string]any{"app_version": "latest"})
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			unchecked = append(unchecked, title)
 			continue
 		}
 		var summary struct {
@@ -152,88 +199,173 @@ func (s *Scheduler) updatable(ctx context.Context, rule UpdateRule) ([]ruleApp, 
 		if json.Unmarshal(raw, &summary) != nil || summary.UpgradeVersion == "" || summary.UpgradeVersion == a.Version {
 			continue
 		}
-		title := a.Metadata.Title
-		if title == "" {
-			title = a.Name
-		}
-		out = append(out, ruleApp{name: a.Name, title: title, version: a.Version})
+		apps = append(apps, ruleApp{name: a.Name, title: title, version: a.Version})
 	}
-	return out, nil
+	return apps, unchecked, nil
 }
 
-// errStillWorking: a job outlasted the wait.
-var errStillWorking = errors.New("TrueNAS was still working on it")
-
-// updateOne updates an app, and rolls it back if it isn't running again.
-func (s *Scheduler) updateOne(ctx context.Context, app ruleApp) appResult {
+// updateOne updates an app, and rolls it back if it isn't running on its
+// new version. finished is false when the helper stopped partway, and how
+// it went isn't known.
+func (s *Scheduler) updateOne(ctx context.Context, app ruleApp) (result appResult, finished bool) {
 	t := s.ruleTiming
-	upgradeErr := s.waitForJob(ctx, t.upgradeFor, "app.upgrade", app.name, map[string]any{"app_version": "latest"})
-	if errors.Is(upgradeErr, errStillWorking) {
+	result.title = app.title
+	upgrade := s.runJob(ctx, t.upgradeFor, "app.upgrade", app.name, map[string]any{"app_version": "latest"})
+	switch {
+	case upgrade.stopped:
+		return result, false
+	case upgrade.unsent != nil:
+		// Whether it began isn't known, so nothing is undone.
+		result.outcome, result.bad = "couldn't be updated: "+upgrade.unsent.Error(), true
+		return result, true
+	case upgrade.stillWorking:
 		// Rolling back under an update still going would make things worse.
-		return appResult{title: app.title, outcome: fmt.Sprintf("was still updating after %d minutes, so it was left to finish", int(t.upgradeFor.Minutes())), bad: true}
+		result.outcome = fmt.Sprintf("was still updating after %d minutes, so it was left to finish", int(t.upgradeFor.Minutes()))
+		result.bad = true
+		return result, true
 	}
-	state := s.waitForRunning(ctx, app.name, t.runningFor)
-	if strings.EqualFold(state, "RUNNING") {
-		if upgradeErr != nil {
-			// Still on its old version, and still working.
-			return appResult{title: app.title, outcome: "didn't update: " + upgradeErr.Error(), bad: true}
+
+	state, version, done := s.settle(ctx, app.name, t.runningFor)
+	if !done {
+		return result, false
+	}
+	running := strings.EqualFold(state, "RUNNING")
+	result.bad = true
+	switch {
+	case state == "" && version == "":
+		result.outcome = "couldn't be checked after its update"
+		return result, true
+	case version == "" || version == app.version:
+		// Still on the version it had, as far as can be told: nothing to
+		// roll back.
+		reason := "TrueNAS finished, but it's still on " + app.version
+		if upgrade.failed != nil || upgrade.gone {
+			reason = upgrade.reason()
 		}
-		return appResult{title: app.title, outcome: "updated"}
+		if running {
+			result.outcome = "didn't update: " + reason
+		} else {
+			result.outcome = "didn't update, and isn't running: " + reason
+		}
+		return result, true
 	}
-	// Not running: roll back to the version it had.
-	if err := s.waitForJob(ctx, t.upgradeFor, "app.rollback", app.name,
-		map[string]any{"app_version": app.version, "rollback_snapshot": true}); err != nil {
-		return appResult{title: app.title, outcome: "isn't running after its update, and couldn't be rolled back: " + err.Error(), bad: true}
+	result.bad = false
+	if running {
+		result.outcome = "updated"
+		return result, true
 	}
-	return appResult{title: app.title, outcome: "wasn't running after its update, so it was rolled back to " + app.version, bad: true}
+
+	// On its new version, but not running: back to the version it had.
+	rollback := s.runJob(ctx, t.upgradeFor, "app.rollback", app.name,
+		map[string]any{"app_version": app.version, "rollback_snapshot": true})
+	result.bad = true
+	switch {
+	case rollback.stopped:
+		return result, false
+	case rollback.ok():
+		result.outcome = "wasn't running after its update, so it was rolled back to " + app.version
+	default:
+		result.outcome = "isn't running after its update, and couldn't be rolled back: " + rollback.reason()
+	}
+	return result, true
 }
 
-// waitForJob starts a job and waits for it to end.
-func (s *Scheduler) waitForJob(ctx context.Context, within time.Duration, method string, params ...any) error {
+// jobEnd is how a TrueNAS job the rule started went.
+type jobEnd struct {
+	// unsent: the call failed, so whether the job began isn't known.
+	unsent error
+	// failed: TrueNAS says it failed.
+	failed error
+	// stillWorking: it outlasted the wait.
+	stillWorking bool
+	// stopped: the helper is stopping.
+	stopped bool
+	// gone: TrueNAS no longer lists it, so how it ended isn't known.
+	gone bool
+}
+
+func (e jobEnd) ok() bool {
+	return e.unsent == nil && e.failed == nil && !e.stillWorking && !e.stopped && !e.gone
+}
+
+func (e jobEnd) reason() string {
+	switch {
+	case e.unsent != nil:
+		return e.unsent.Error()
+	case e.failed != nil:
+		return e.failed.Error()
+	case e.stillWorking:
+		return "TrueNAS was still working on it"
+	case e.gone:
+		return "TrueNAS no longer lists the job, so how it ended isn't known"
+	}
+	return ""
+}
+
+// runJob starts a job and waits for it to end.
+func (s *Scheduler) runJob(ctx context.Context, within time.Duration, method string, params ...any) jobEnd {
 	raw, err := s.nas.Call(ctx, method, params...)
 	if err != nil {
-		return errors.New(truenas.Reason(err))
+		if ctx.Err() != nil {
+			return jobEnd{stopped: true}
+		}
+		return jobEnd{unsent: errors.New(truenas.Reason(err))}
 	}
 	id, err := truenas.JobID(raw)
 	if err != nil {
-		return err
+		return jobEnd{unsent: err}
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, within)
 	defer cancel()
 	job, err := s.nas.WaitJob(waitCtx, id, s.ruleTiming.poll)
-	if err != nil || !job.Finished() {
-		return errStillWorking
+	switch {
+	case ctx.Err() != nil:
+		return jobEnd{stopped: true}
+	case errors.Is(err, truenas.ErrJobGone):
+		return jobEnd{gone: true}
+	case err != nil || !job.Finished():
+		return jobEnd{stillWorking: true}
+	case !job.Succeeded():
+		return jobEnd{failed: errors.New(job.Failure())}
 	}
-	if !job.Succeeded() {
-		return errors.New(job.Failure())
-	}
-	return nil
+	return jobEnd{}
 }
 
-// waitForRunning waits for an app to be running, and returns its last
-// state.
-func (s *Scheduler) waitForRunning(ctx context.Context, name string, within time.Duration) string {
+// settle waits for an app to be running, and still running a little later
+// (one that crashes as it starts shows as running at first), and returns
+// its state and version then. done is false when the helper is stopping.
+func (s *Scheduler) settle(ctx context.Context, name string, within time.Duration) (state, version string, done bool) {
 	deadline := time.Now().Add(within)
-	var state string
+	var runningSince time.Time
 	for {
 		raw, err := s.nas.Call(ctx, "app.query", []any{[]any{"name", "=", name}})
+		if ctx.Err() != nil {
+			return "", "", false
+		}
 		if err == nil {
 			var apps []struct {
-				State string `json:"state"`
+				State   string `json:"state"`
+				Version string `json:"version"`
 			}
 			if json.Unmarshal(raw, &apps) == nil && len(apps) > 0 {
-				state = apps[0].State
-				if strings.EqualFold(state, "RUNNING") {
-					return state
+				state, version = apps[0].State, apps[0].Version
+				switch {
+				case !strings.EqualFold(state, "RUNNING"):
+					runningSince = time.Time{}
+				case runningSince.IsZero():
+					runningSince = time.Now()
+				}
+				if !runningSince.IsZero() && time.Since(runningSince) >= s.ruleTiming.settle {
+					return state, version, true
 				}
 			}
 		}
 		if time.Now().After(deadline) {
-			return state
+			return state, version, true
 		}
 		select {
 		case <-ctx.Done():
-			return state
+			return "", "", false
 		case <-time.After(s.ruleTiming.poll):
 		}
 	}

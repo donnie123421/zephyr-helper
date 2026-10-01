@@ -131,8 +131,6 @@ func main() {
 				Model: func() (string, bool) { return modelLabel(llmSwitch.Current()) },
 			}.Tools()...)
 			scheduler = schedule.New(scheduleStore, toolRegistry, actionLog, eventsStore, tnClient, chatHandler)
-			go scheduler.Run(ctx)
-			slog.Info("scheduler started", "path", cfg.ScheduleDBPath)
 		}
 	}
 
@@ -233,6 +231,21 @@ func main() {
 	go pushNotifier.Run(ctx)
 	if cfg.PushRelayURL != "" {
 		slog.Info("push notifier started", "relay", cfg.PushRelayURL)
+	}
+
+	// The scheduler starts by noting runs missed or cut short while the
+	// helper was down; with the notifier listening first, those notify.
+	if scheduler != nil {
+		go func() {
+			select {
+			case <-pushNotifier.Ready():
+			case <-time.After(15 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+			slog.Info("scheduler started", "path", cfg.ScheduleDBPath)
+			scheduler.Run(ctx)
+		}()
 	}
 
 	// Optional: join the user's tailnet so /remote-access can resolve
@@ -347,10 +360,24 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	// A booked run under way gets the same time to finish; one that
+	// doesn't shows as interrupted when the helper starts again.
+	runsDone := make(chan struct{})
+	go func() {
+		if scheduler != nil {
+			scheduler.Wait()
+		}
+		close(runsDone)
+	}()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown", "err", err)
+	}
+	select {
+	case <-runsDone:
+	case <-shutdownCtx.Done():
+		slog.Warn("shutdown: a booked run was still going")
 	}
 }
 

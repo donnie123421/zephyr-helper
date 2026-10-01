@@ -398,6 +398,22 @@ func TestRestartingAnAppStopsThenStarts(t *testing.T) {
 	}
 }
 
+// Booking an action for later isn't refused for the state things are in
+// now: by then they'll have changed, and it's checked again when it runs.
+func TestABookingsCardSkipsTheStateCheck(t *testing.T) {
+	nas := newFakeNAS()
+	nas.returns("app.query", []any{map[string]any{"name": "plex", "state": "RUNNING", "metadata": map[string]any{"title": "Plex"}}})
+	action := actionNamed(t, appAction(nas.client(t)))
+	args := json.RawMessage(`{"app":"plex","action":"start"}`)
+	if _, err := action.Describe(context.Background(), args); err == nil {
+		t.Fatal("offered to start an app that's running")
+	}
+	card, err := action.Describe(ForLater(context.Background()), args)
+	if err != nil || card.Title != "Start Plex" {
+		t.Errorf("for later: card %+v, err %v", card, err)
+	}
+}
+
 func TestUpdatingAnAppGoesToTheVersionOnTheCard(t *testing.T) {
 	quick(t)
 	nas := newFakeNAS()

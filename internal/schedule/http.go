@@ -91,7 +91,7 @@ func (h *Handler) pause(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.Store.SetPaused(r.Context(), job.ID, true, job.NextRun); err != nil {
+	if err := h.Store.Pause(r.Context(), job.ID); err != nil {
 		h.failed(w, err)
 		return
 	}
@@ -111,7 +111,7 @@ func (h *Handler) resume(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Its time has passed. Book it again in a chat."})
 		return
 	}
-	if err := h.Store.SetPaused(r.Context(), job.ID, false, &next); err != nil {
+	if err := h.Store.Resume(r.Context(), job.ID, next); err != nil {
 		h.failed(w, err)
 		return
 	}

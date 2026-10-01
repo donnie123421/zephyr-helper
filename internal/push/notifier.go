@@ -53,6 +53,10 @@ type Notifier struct {
 
 	mu         sync.Mutex
 	lastPushed map[string]time.Time // event id → last push timestamp
+
+	// ready closes once Run is listening for events, or knows it won't.
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
 // New builds a Notifier. The caller must call Run to actually start
@@ -79,14 +83,22 @@ func New(
 		log:          log.With("component", "push"),
 		dedupeWindow: 6 * time.Hour,
 		lastPushed:   make(map[string]time.Time),
+		ready:        make(chan struct{}),
 	}
 }
+
+// Ready closes once the notifier is listening for events, or knows it
+// won't be (push isn't set up), so what's noted from then on notifies.
+func (n *Notifier) Ready() <-chan struct{} { return n.ready }
+
+func (n *Notifier) markReady() { n.readyOnce.Do(func() { close(n.ready) }) }
 
 // Run subscribes to the events.Store and forwards qualifying events to
 // the relay. Blocks until ctx is cancelled. Safe to spawn as a
 // goroutine — internal panics are caught and logged so a single bad
 // event can't tear the helper down.
 func (n *Notifier) Run(ctx context.Context) {
+	defer n.markReady()
 	if n.relayURL == "" || n.subscriptionID == "" || n.installToken == "" {
 		n.log.Info("notifier disabled (missing config)")
 		return
@@ -109,6 +121,7 @@ func (n *Notifier) Run(ctx context.Context) {
 
 	feed, cancel := n.store.Subscribe(64)
 	defer cancel()
+	n.markReady()
 
 	// Delivery runs on its own goroutine. A send can take ~35s in the worst
 	// case (two 15s attempts either side of a 5s backoff), and while this

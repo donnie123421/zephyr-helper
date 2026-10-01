@@ -77,15 +77,35 @@ func (w When) location() (*time.Location, error) {
 
 func (w When) clock() (hour, minute int, err error) {
 	parts := strings.Split(w.Time, ":")
-	if len(parts) != 2 {
+	digits := func(s string, min, max int) bool {
+		if len(s) < min || len(s) > max {
+			return false
+		}
+		for _, r := range s {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if len(parts) != 2 || !digits(parts[0], 1, 2) || !digits(parts[1], 2, 2) {
 		return 0, 0, fmt.Errorf("time %q isn't HH:MM", w.Time)
 	}
-	hour, err1 := strconv.Atoi(parts[0])
-	minute, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+	hour, _ = strconv.Atoi(parts[0])
+	minute, _ = strconv.Atoi(parts[1])
+	if hour > 23 || minute > 59 {
 		return 0, 0, fmt.Errorf("time %q isn't HH:MM", w.Time)
 	}
 	return hour, minute, nil
+}
+
+// clockText is Time as HH:MM, "09:30" for "9:30".
+func (w When) clockText() string {
+	hour, minute, err := w.clock()
+	if err != nil {
+		return w.Time
+	}
+	return fmt.Sprintf("%02d:%02d", hour, minute)
 }
 
 // Next is the first run after `after`, and false for a one-off whose time
@@ -101,7 +121,24 @@ func (w When) Next(after time.Time) (time.Time, bool) {
 	}
 	local := after.In(loc)
 	at := func(y int, m time.Month, d int) time.Time {
-		return time.Date(y, m, d, hour, minute, 0, 0, loc)
+		t := time.Date(y, m, d, hour, minute, 0, 0, loc)
+		// A time the clocks skip doesn't happen; the run is at the first
+		// time after. time.Date gives that in some zones (Sydney: 2:00
+		// comes out 3:00) but in others the time before the change (New
+		// York: 2:30 comes out 1:30), so that's moved on by the gap.
+		day := time.Date(y, m, d, 12, 0, 0, 0, loc) // noon is never skipped
+		got := t.Hour()*60 + t.Minute()
+		if t.YearDay() != day.YearDay() {
+			if t.Before(day) {
+				got -= 24 * 60
+			} else {
+				got += 24 * 60
+			}
+		}
+		if want := hour*60 + minute; got < want {
+			t = t.Add(time.Duration(want-got) * time.Minute)
+		}
+		return t
 	}
 	switch w.Repeat {
 	case "once":

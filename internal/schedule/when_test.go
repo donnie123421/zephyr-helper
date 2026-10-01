@@ -48,6 +48,28 @@ func TestNextAcrossDaylightSaving(t *testing.T) {
 	}
 }
 
+// In every zone, a time the clocks skip runs at the first time after,
+// moved on by the gap: time.Date puts it before the change in some zones.
+func TestASkippedTimeRunsAfterTheGap(t *testing.T) {
+	for _, c := range []struct {
+		zone, time      string
+		from            string
+		day, hour, mins int
+	}{
+		{"America/New_York", "02:30", "2026-03-07 12:00", 8, 3, 30},
+		{"Europe/London", "01:30", "2026-03-28 12:00", 29, 2, 30},
+		{"Australia/Sydney", "02:00", "2026-10-03 12:00", 4, 3, 0},
+	} {
+		loc, _ := time.LoadLocation(c.zone)
+		from, _ := time.ParseInLocation("2006-01-02 15:04", c.from, loc)
+		got, _ := When{Repeat: "daily", Time: c.time, Zone: c.zone}.Next(from)
+		got = got.In(loc)
+		if got.Day() != c.day || got.Hour() != c.hour || got.Minute() != c.mins {
+			t.Errorf("%s %s: Next = %v", c.zone, c.time, got)
+		}
+	}
+}
+
 func TestValidateRefusesWhatDoesntRead(t *testing.T) {
 	for _, w := range []When{
 		{Repeat: "hourly", Time: "03:00"},

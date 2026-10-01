@@ -1,7 +1,10 @@
 package push
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/donnie123421/zephyr-helper/internal/events"
 )
@@ -105,5 +108,36 @@ func TestMarkIfFresh(t *testing.T) {
 	n.forget("event-1")
 	if !n.markIfFresh("event-1") {
 		t.Error("markIfFresh after forget should return true")
+	}
+}
+
+// Ready closes once the notifier is listening, or straight away when push
+// isn't set up, so the scheduler never waits on it for nothing.
+func TestReadyClosesWhenListeningOrDisabled(t *testing.T) {
+	store, err := events.Open(filepath.Join(t.TempDir(), "events.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	disabled := New(store, "", "", "", nil, nil)
+	go disabled.Run(ctx)
+	select {
+	case <-disabled.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a disabled notifier never said it was ready")
+	}
+
+	listening := New(store, "http://127.0.0.1:1", "sub", "token", nil, nil)
+	go listening.Run(ctx)
+	select {
+	case <-listening.Ready():
+		if store.SubscriberCount() == 0 {
+			t.Error("ready before subscribing")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("never ready")
 	}
 }

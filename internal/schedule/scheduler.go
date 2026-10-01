@@ -3,6 +3,7 @@ package schedule
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -23,7 +24,13 @@ const (
 	lateBy = 2 * time.Hour
 	// actionRunFor bounds one action's run, as in a chat.
 	actionRunFor = 6 * time.Minute
+	// checkInFor bounds a check-in, which may wait on the model loading.
+	checkInFor = 15 * time.Minute
 )
+
+// stopped is the status of a run cut short by the helper stopping. It isn't
+// recorded: the job shows as interrupted when the helper starts again.
+const stopped = ""
 
 // NAS is what the update rule needs of TrueNAS. *truenas.Client is one.
 type NAS interface {
@@ -74,11 +81,13 @@ func New(store *Store, reg *tools.Registry, log *actions.Log, evs *events.Store,
 	}
 }
 
-// Run looks for due jobs until ctx ends.
+// Run looks for due jobs until ctx ends. It first notes runs the helper
+// stopped partway through, last time.
 func (s *Scheduler) Run(ctx context.Context) {
 	s.mu.Lock()
 	s.base = ctx
 	s.mu.Unlock()
+	s.interrupted(ctx)
 	s.runDue(ctx)
 	ticker := time.NewTicker(s.tick)
 	defer ticker.Stop()
@@ -96,6 +105,25 @@ func (s *Scheduler) Run(ctx context.Context) {
 // Wait blocks until every run under way has finished.
 func (s *Scheduler) Wait() { s.wg.Wait() }
 
+// interrupted notes the runs the helper stopped partway through.
+func (s *Scheduler) interrupted(ctx context.Context) {
+	jobs, err := s.store.Unfinished(ctx)
+	if err != nil {
+		slog.Error("schedule: couldn't read unfinished runs", "err", err)
+		return
+	}
+	for _, job := range jobs {
+		why := "The helper stopped while it was running, so it may not have finished."
+		if job.Kind == KindUpdateRule {
+			why = "The helper stopped partway through, so an app may have been left mid-update. Check your apps in the Apps tab."
+		}
+		s.note(ctx, job.ID+"-"+newID()[:6], entryFor(job), events.SeverityWarning, "Interrupted: "+job.Title, why, job, "interrupted", nil)
+		if err := s.store.Finish(ctx, job.ID, "interrupted", why); err != nil && !errors.Is(err, ErrNotFound) {
+			slog.Error("schedule: couldn't record an interrupted run", "job", job.ID, "err", err)
+		}
+	}
+}
+
 func (s *Scheduler) runDue(ctx context.Context) {
 	now := s.now()
 	due, err := s.store.Due(ctx, now)
@@ -104,12 +132,37 @@ func (s *Scheduler) runDue(ctx context.Context) {
 		return
 	}
 	for _, job := range due {
-		if job.NextRun != nil && now.Sub(*job.NextRun) > lateBy {
+		if s.isRunning(job.ID) {
+			// A run of it from Run Now is still going; this one waits.
+			continue
+		}
+		if now.Sub(*job.NextRun) > lateBy {
 			s.missed(ctx, job, now)
 			continue
 		}
-		s.start(ctx, job, false)
+		s.startDue(ctx, job, now)
 	}
+}
+
+// startDue claims a due job's run, its next run booked first, and starts
+// it.
+func (s *Scheduler) startDue(ctx context.Context, job Job, now time.Time) {
+	var next *time.Time
+	if t, ok := job.When.Next(now); ok && job.When.Repeat != "once" {
+		next = &t
+	}
+	if !s.reserve(job.ID) {
+		return
+	}
+	claimed, err := s.store.Claim(ctx, job.ID, *job.NextRun, now, next)
+	if err != nil || !claimed {
+		s.release(job.ID)
+		if err != nil {
+			slog.Error("schedule: couldn't claim a run", "job", job.ID, "err", err)
+		}
+		return
+	}
+	s.launch(ctx, job)
 }
 
 // RunNow runs a job straight away, as the app's Run Now does, leaving its
@@ -120,51 +173,59 @@ func (s *Scheduler) RunNow(ctx context.Context, id string) error {
 		return err
 	}
 	// The run carries on after the request that asked for it is answered.
-	s.mu.Lock()
-	base := s.base
-	s.mu.Unlock()
+	base := s.baseContext()
 	if base == nil {
 		base = context.WithoutCancel(ctx)
 	}
-	if !s.start(base, job, true) {
+	if !s.reserve(job.ID) {
 		return fmt.Errorf("%s is already running", job.Title)
 	}
+	if err := s.store.Started(ctx, job.ID, s.now()); err != nil {
+		s.release(job.ID)
+		return err
+	}
+	s.launch(base, job)
 	return nil
 }
 
-// start runs a job in the background, unless it's running already.
-func (s *Scheduler) start(ctx context.Context, job Job, manual bool) bool {
+func (s *Scheduler) reserve(id string) bool {
 	s.mu.Lock()
-	if s.running[job.ID] {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.running[id] {
 		return false
 	}
-	s.running[job.ID] = true
-	s.mu.Unlock()
+	s.running[id] = true
+	return true
+}
 
+func (s *Scheduler) release(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.running, id)
+}
+
+func (s *Scheduler) isRunning(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running[id]
+}
+
+// launch does a reserved job's run in the background, and records how it
+// went.
+func (s *Scheduler) launch(ctx context.Context, job Job) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		defer func() {
-			s.mu.Lock()
-			delete(s.running, job.ID)
-			s.mu.Unlock()
-		}()
+		defer s.release(job.ID)
 		runID := job.ID + "-" + newID()[:6]
 		status, message := s.run(ctx, job, runID)
-		ran := s.now()
-		next := job.NextRun
-		if !manual {
-			next = nil
-			if t, ok := job.When.Next(ran); ok && job.When.Repeat != "once" {
-				next = &t
-			}
+		if status == stopped {
+			return
 		}
-		if err := s.store.Finish(context.WithoutCancel(ctx), job.ID, ran, status, message, next); err != nil && err != ErrNotFound {
+		if err := s.store.Finish(context.WithoutCancel(ctx), job.ID, status, message); err != nil && !errors.Is(err, ErrNotFound) {
 			slog.Error("schedule: couldn't record a run", "job", job.ID, "err", err)
 		}
 	}()
-	return true
 }
 
 // run does the job, and says how it went.
@@ -190,6 +251,9 @@ func (s *Scheduler) runAction(ctx context.Context, job Job, runID string) (strin
 	}
 	card, err := action.Describe(ctx, job.Arguments)
 	if err != nil {
+		if ctx.Err() != nil {
+			return stopped, ""
+		}
 		// What it would act on has changed: the pool's scrubbing already,
 		// or the app has no update.
 		return s.skipped(ctx, job, runID, upperFirst(err.Error())+".")
@@ -198,10 +262,11 @@ func (s *Scheduler) runAction(ctx context.Context, job Job, runID string) (strin
 	if len(card.Args) > 0 {
 		args = card.Args
 	}
+	// Once started, it finishes even if the helper is stopping.
 	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), actionRunFor)
 	outcome, err := action.Run(runCtx, args)
 	cancel()
-	s.log.Record(ctx, actions.Entry{
+	s.log.Record(context.WithoutCancel(ctx), actions.Entry{
 		ID: runID, Tool: job.Tool, Arguments: args, Card: card, Outcome: outcome, Err: err, Scheduled: true,
 	})
 	switch {
@@ -219,22 +284,34 @@ func (s *Scheduler) skipped(ctx context.Context, job Job, runID, why string) (st
 	return "skipped", why
 }
 
-// missed notes a job whose time passed while the helper wasn't running.
-// A one-off is done with; a repeating job carries on from its next time.
+// missed notes a job whose time passed more than lateBy ago. A one-off is
+// done with; a repeating job carries on from its next time.
 func (s *Scheduler) missed(ctx context.Context, job Job, now time.Time) {
-	runID := job.ID + "-" + newID()[:6]
 	at := job.NextRun.In(locationOf(job.When)).Format("3:04 pm on Mon 2 Jan")
-	why := fmt.Sprintf("It was due at %s, while the helper wasn't running.", at)
+	why := fmt.Sprintf("It was due at %s, and didn't run within two hours of then; the helper may not have been running.", at)
 	var next *time.Time
 	severity := events.SeverityWarning
 	if t, ok := job.When.Next(now); ok && job.When.Repeat != "once" {
 		next = &t
 		severity = events.SeverityInfo
 	}
-	s.note(ctx, runID, events.AssistantScheduled, severity, "Missed: "+job.Title, why, job, "missed", nil)
-	if err := s.store.Finish(ctx, job.ID, now, "missed", why, next); err != nil {
-		slog.Error("schedule: couldn't record a missed run", "job", job.ID, "err", err)
+	recorded, err := s.store.Miss(ctx, job.ID, *job.NextRun, now, why, next)
+	if err != nil || !recorded {
+		if err != nil {
+			slog.Error("schedule: couldn't record a missed run", "job", job.ID, "err", err)
+		}
+		return
 	}
+	s.note(ctx, job.ID+"-"+newID()[:6], entryFor(job), severity, "Missed: "+job.Title, why, job, "missed", nil)
+}
+
+// entryFor is the feed entry for a job's own notes: a rule's are the
+// rule's.
+func entryFor(job Job) string {
+	if job.Kind == KindUpdateRule {
+		return events.AssistantRule
+	}
+	return events.AssistantScheduled
 }
 
 // note puts an entry for a job in the activity feed, with anything extra

@@ -17,6 +17,9 @@ import (
 // MaxJobs bounds what can be booked at once.
 const MaxJobs = 50
 
+// keepFinished is how long a one-off that's done with stays listed.
+const keepFinished = 30 * 24 * time.Hour
+
 // ErrNotFound: no job has that id.
 var ErrNotFound = errors.New("schedule: no such job")
 
@@ -50,7 +53,8 @@ type Job struct {
 	NextRun *time.Time `json:"next_run,omitempty"`
 	Paused  bool       `json:"paused"`
 	LastRun *time.Time `json:"last_run,omitempty"`
-	// LastStatus is done, started, failed, skipped or missed.
+	// LastStatus is running, done, started, failed, skipped, missed or
+	// interrupted (the helper stopped partway through a run).
 	LastStatus  string `json:"last_status,omitempty"`
 	LastMessage string `json:"last_message,omitempty"`
 }
@@ -103,10 +107,15 @@ CREATE INDEX IF NOT EXISTS jobs_next_run ON jobs(next_run);`
 // Close releases the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Add books a job, giving it an id.
+// Add books a job, giving it an id. One-offs done with a while ago go, and
+// don't count towards MaxJobs before then.
 func (s *Store) Add(ctx context.Context, job Job) (Job, error) {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM jobs WHERE next_run IS NULL AND COALESCE(last_run, created_at) < ?`,
+		time.Now().Add(-keepFinished).UnixMilli()); err != nil {
+		return Job{}, err
+	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE next_run IS NOT NULL`).Scan(&count); err != nil {
 		return Job{}, err
 	}
 	if count >= MaxJobs {
@@ -161,9 +170,14 @@ func (s *Store) Get(ctx context.Context, id string) (Job, error) {
 	return jobs[0], nil
 }
 
-// SetPaused pauses or resumes a job, with its next run when resumed.
-func (s *Store) SetPaused(ctx context.Context, id string, paused bool, next *time.Time) error {
-	return s.exec(ctx, `UPDATE jobs SET paused = ?, next_run = ? WHERE id = ?`, paused, millis(next), id)
+// Pause stops a job running until it's resumed.
+func (s *Store) Pause(ctx context.Context, id string) error {
+	return s.exec(ctx, `UPDATE jobs SET paused = 1 WHERE id = ?`, id)
+}
+
+// Resume lets a job run again, next at next.
+func (s *Store) Resume(ctx context.Context, id string, next time.Time) error {
+	return s.exec(ctx, `UPDATE jobs SET paused = 0, next_run = ? WHERE id = ?`, next.UnixMilli(), id)
 }
 
 // Delete removes a job.
@@ -171,10 +185,50 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	return s.exec(ctx, `DELETE FROM jobs WHERE id = ?`, id)
 }
 
-// Finish records a run and the next, nil when there won't be one.
-func (s *Store) Finish(ctx context.Context, id string, ran time.Time, status, message string, next *time.Time) error {
-	return s.exec(ctx, `UPDATE jobs SET last_run = ?, last_status = ?, last_message = ?, next_run = ? WHERE id = ?`,
-		ran.UnixMilli(), status, message, millis(next), id)
+// Claim takes a due job's run, booking its next (nil when there won't be
+// one) before it starts, so a restart partway through doesn't run it again.
+// It's false when the run isn't there to take: the job was paused, moved
+// or removed since it was read.
+func (s *Store) Claim(ctx context.Context, id string, due, at time.Time, next *time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE jobs SET next_run = ?, last_run = ?, last_status = 'running', last_message = ''
+WHERE id = ? AND paused = 0 AND next_run = ?`, millis(next), at.UnixMilli(), id, due.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// Started notes a run begun out of turn, as Run Now does, leaving the
+// schedule as it is.
+func (s *Store) Started(ctx context.Context, id string, at time.Time) error {
+	return s.exec(ctx, `UPDATE jobs SET last_run = ?, last_status = 'running', last_message = '' WHERE id = ?`,
+		at.UnixMilli(), id)
+}
+
+// Finish records how a run went.
+func (s *Store) Finish(ctx context.Context, id, status, message string) error {
+	return s.exec(ctx, `UPDATE jobs SET last_status = ?, last_message = ? WHERE id = ?`, status, message, id)
+}
+
+// Miss records a run missed at due, and books the next, nil when there
+// won't be one. It's false when the job changed since it was read.
+func (s *Store) Miss(ctx context.Context, id string, due, at time.Time, message string, next *time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE jobs SET next_run = ?, last_run = ?, last_status = 'missed', last_message = ?
+WHERE id = ? AND paused = 0 AND next_run = ?`, millis(next), at.UnixMilli(), message, id, due.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
+// Unfinished is the jobs whose run never finished: the helper stopped
+// partway through.
+func (s *Store) Unfinished(ctx context.Context) ([]Job, error) {
+	return s.query(ctx, `SELECT `+columns+` FROM jobs WHERE last_status = 'running'`)
 }
 
 func (s *Store) exec(ctx context.Context, query string, args ...any) error {

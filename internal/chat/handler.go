@@ -317,9 +317,10 @@ func (h *Handler) toolList(withActions bool) []llm.Tool {
 }
 
 // runTurn drives one user message to the model's answer, running any tools
-// it asks for along the way, and putting any actions to the user through
-// acts (nil in a chat without actions). When it fails, unfinished is the
-// text of the step that was cut short, which the session hasn't kept.
+// it asks for along the way, in at most steps steps, and putting any
+// actions to the user through acts (nil in a chat without actions). When it
+// fails, unfinished is the text of the step that was cut short, which the
+// session hasn't kept.
 func (h *Handler) runTurn(
 	ctx context.Context,
 	send func(any) error,
@@ -327,6 +328,7 @@ func (h *Handler) runTurn(
 	provider llm.Provider,
 	session llm.Session,
 	acts *turnActions,
+	steps int,
 ) (unfinished string, err error) {
 	// Every step's text goes out as one reply. When a step that ran tools
 	// had already said something ("Let me check your pools."), the next
@@ -360,7 +362,7 @@ func (h *Handler) runTurn(
 		}
 	}()
 
-	for iter := 0; iter < maxToolIterations; iter++ {
+	for iter := 0; iter < steps; iter++ {
 		stepText.Reset()
 		result, err := session.Step(ctx, onDelta)
 		if errors.Is(err, llm.ErrModelNotReady) {
@@ -408,5 +410,5 @@ func (h *Handler) runTurn(
 		stepEnded = true
 	}
 
-	return "", fmt.Errorf("tool-call loop exceeded %d iterations", maxToolIterations)
+	return "", fmt.Errorf("tool-call loop exceeded %d iterations", steps)
 }

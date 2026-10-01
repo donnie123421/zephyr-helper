@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/donnie123421/zephyr-helper/internal/events"
@@ -15,10 +16,19 @@ func (s *Scheduler) runCheckIn(ctx context.Context, job Job, runID string) (stri
 		return s.checkInFailed(ctx, job, runID, "There's no model set up to write it.")
 	}
 	title := "Check-in · " + s.now().In(locationOf(job.When)).Format("Mon 2 Jan")
-	result, err := s.checkIns.CheckIn(ctx, title)
+	runCtx, cancel := context.WithTimeout(ctx, checkInFor)
+	defer cancel()
+	result, err := s.checkIns.CheckIn(runCtx, title)
 	if err != nil {
+		if ctx.Err() != nil {
+			return stopped, ""
+		}
 		slog.Warn("schedule: check-in failed", "job", job.ID, "err", err)
-		return s.checkInFailed(ctx, job, runID, upperFirst(err.Error()))
+		why := upperFirst(err.Error())
+		if runCtx.Err() != nil {
+			why = fmt.Sprintf("The model took longer than %d minutes.", int(checkInFor.Minutes()))
+		}
+		return s.checkInFailed(ctx, job, runID, why)
 	}
 	s.note(ctx, runID, events.AssistantCheckIn, events.SeverityInfo, "Your check-in is ready", result.Summary, job, "done",
 		map[string]any{"conversation_id": result.ConversationID, "conversation_title": title})

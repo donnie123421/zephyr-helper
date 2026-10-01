@@ -17,7 +17,7 @@ import (
 func TestACheckInSavesItsBriefing(t *testing.T) {
 	saved := openConversations(t)
 	claude := &claudeScript{steps: []any{
-		toolCall{name: "list_pools", input: `{}`},
+		textThenTool{text: "I'll look the NAS over now.", call: toolCall{name: "list_pools", input: `{}`}},
 		"**All is well.** tank is healthy. Nothing needs you this week.",
 	}}
 	server := httptest.NewServer(claude)
