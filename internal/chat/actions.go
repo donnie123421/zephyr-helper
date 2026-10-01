@@ -46,7 +46,7 @@ const systemPromptWithActions = ` You can also make changes with the action tool
 // What became of a card, in action_result frames and saved chats.
 const (
 	actionDone      = "done"
-	actionStarted   = "started" // TrueNAS carries on; the activity feed has the rest
+	actionStarted   = "started" // TrueNAS carries on; Events has the rest
 	actionFailed    = "failed"
 	actionDeclined  = "declined"
 	actionExpired   = "expired"   // no answer in time
@@ -298,7 +298,7 @@ func (t *turnActions) execute(ctx context.Context, send func(any) error, onStatu
 		t.finish(send, c, actionFailed, upperFirst(err.Error()), tools.ToolError(err.Error()), true, results)
 	case outcome.Job != nil:
 		t.finish(send, c, actionStarted, outcome.Message, statusResult(actionStarted,
-			outcome.Message+" TrueNAS carries on in the background, and how it ends will appear in the activity feed."), false, results)
+			outcome.Message+" TrueNAS carries on in the background, and how it ends will appear in Events, on the app's Assistant tab."), false, results)
 	default:
 		t.finish(send, c, actionDone, outcome.Message, statusResult(actionDone, outcome.Message), false, results)
 	}

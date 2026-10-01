@@ -101,9 +101,16 @@ func (b Booking) zone(ctx context.Context) string {
 	return general.Timezone
 }
 
-// firstRun says when a booking first runs: "2:00 am on Sun 4 Oct".
+// firstRun says when a booking first runs: "2:00 am on Sun 4 Oct". When
+// its time doesn't happen that night, as the clocks go forward through it,
+// the run is at the first time after, and it says why.
 func firstRun(t time.Time, w When) string {
-	return t.In(locationOf(w)).Format("3:04 pm on Mon 2 Jan")
+	local := t.In(locationOf(w))
+	text := local.Format("3:04 pm on Mon 2 Jan")
+	if local.Format("15:04") != w.Time {
+		text += " (the clocks go forward that night)"
+	}
+	return text
 }
 
 // ----- schedule_action -----------------------------------------------------------

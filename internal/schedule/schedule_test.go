@@ -127,9 +127,15 @@ type fakeCheckIns struct {
 	err error
 }
 
-func (c fakeCheckIns) CheckIn(_ context.Context, title string) (CheckInResult, error) {
+func (c fakeCheckIns) CheckIn(ctx context.Context, title string) (CheckInResult, error) {
 	if c.err != nil {
 		return CheckInResult{}, c.err
+	}
+	// A model takes a while; a run whose context ends meanwhile fails.
+	select {
+	case <-ctx.Done():
+		return CheckInResult{}, ctx.Err()
+	case <-time.After(20 * time.Millisecond):
 	}
 	return CheckInResult{ConversationID: "conv1", Summary: "All three pools are healthy."}, nil
 }
@@ -263,6 +269,31 @@ func TestAnActionWithNothingToDoIsSkipped(t *testing.T) {
 	}
 	if len(evs) != 1 || evs[0].Summary != "Tank is already running a scrub." || events.IsAssistantPush(evs[0]) {
 		t.Errorf("feed = %+v", evs)
+	}
+}
+
+// Run Now is asked for over HTTP, and the request is answered before the
+// run ends: the run mustn't end with it.
+func TestRunNowOutlivesItsRequest(t *testing.T) {
+	r := newRig(t)
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go r.sched.Run(ctx)
+	job := r.book(t, Job{Kind: KindCheckIn, Title: "Check in on the NAS every day at 8:00 am",
+		When: When{Repeat: "daily", Time: "08:00"}, NextRun: at(r.now.Add(17 * time.Hour))})
+	for r.sched.baseContext() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	request, answered := context.WithCancel(context.Background())
+	if err := r.sched.RunNow(request, job.ID); err != nil {
+		t.Fatalf("RunNow: %v", err)
+	}
+	answered()
+	time.Sleep(5 * time.Millisecond)
+	r.sched.Wait()
+	got, _ := r.store.Get(context.Background(), job.ID)
+	if got.LastStatus != "done" {
+		t.Errorf("after Run Now: %s, %s", got.LastStatus, got.LastMessage)
 	}
 }
 
@@ -413,6 +444,24 @@ func TestBookingAnActionWritesItsCardFromTheAction(t *testing.T) {
 		if _, err := action.Describe(context.Background(), json.RawMessage(args)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Describe(%s) = %v, want %q", args, err, want)
 		}
+	}
+}
+
+// 2:00 am doesn't happen in Sydney on Sun 4 Oct 2026: the clocks go
+// forward through it. The run is at 3:00 am, and the card says why.
+func TestACardSaysWhenTheClocksMoveARun(t *testing.T) {
+	r := newRig(t)
+	reg := tools.NewWith(r.action.tool("scrub_pool"))
+	b := Booking{Store: r.store, Registry: reg, NAS: r.nas, Now: func() time.Time { return r.now }}
+	reg.Add(b.Tools()...)
+	card, err := reg.Action("schedule_action").Describe(context.Background(), json.RawMessage(
+		`{"action":"scrub_pool","arguments_json":"{\"pool\":\"tank\"}","repeat":"weekly","weekday":"sunday","time":"02:00"}`))
+	if err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	if card.Title != "Start a scrub on tank every Sunday at 2:00 am" ||
+		!strings.Contains(card.Detail, "First runs at 3:00 am on Sun 4 Oct (the clocks go forward that night), NAS time.") {
+		t.Errorf("card = %+v", card)
 	}
 }
 

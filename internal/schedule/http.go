@@ -27,13 +27,15 @@ func (h *Handler) RegisterMux(mux *http.ServeMux, wrap func(http.Handler) http.H
 
 // jobView is a job as the app shows it.
 type jobView struct {
-	ID          string     `json:"id"`
-	Kind        Kind       `json:"kind"`
-	Title       string     `json:"title"`
-	Detail      string     `json:"detail"`
-	Risk        string     `json:"risk"`
-	Repeats     bool       `json:"repeats"`
-	Schedule    string     `json:"schedule"`
+	ID       string `json:"id"`
+	Kind     Kind   `json:"kind"`
+	Title    string `json:"title"`
+	Detail   string `json:"detail"`
+	Risk     string `json:"risk"`
+	Repeats  bool   `json:"repeats"`
+	Schedule string `json:"schedule"`
+	// Zone is the time zone Schedule is in: the NAS's when it was booked.
+	Zone        string     `json:"zone"`
 	NextRun     *time.Time `json:"next_run,omitempty"`
 	Paused      bool       `json:"paused"`
 	Running     bool       `json:"running"`
@@ -59,7 +61,7 @@ func (h *Handler) view(job Job) jobView {
 	}
 	return jobView{
 		ID: job.ID, Kind: job.Kind, Title: job.Title, Detail: job.Detail, Risk: job.Risk,
-		Repeats: job.When.Repeat != "once", Schedule: job.When.Phrase(),
+		Repeats: job.When.Repeat != "once", Schedule: job.When.Phrase(), Zone: job.When.Zone,
 		NextRun: trunc(job.NextRun), Paused: job.Paused, Running: running,
 		LastRun: trunc(job.LastRun), LastStatus: job.LastStatus, LastMessage: job.LastMessage,
 		CreatedAt: job.CreatedAt.UTC().Truncate(time.Second),

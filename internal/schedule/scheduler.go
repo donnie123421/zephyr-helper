@@ -58,6 +58,9 @@ type Scheduler struct {
 	mu      sync.Mutex
 	running map[string]bool
 	wg      sync.WaitGroup
+	// base is what Run was given: runs end with it, not with the request
+	// that asked for one.
+	base context.Context
 	// timing for the update rule; shortened in tests.
 	ruleTiming ruleTiming
 }
@@ -73,6 +76,9 @@ func New(store *Store, reg *tools.Registry, log *actions.Log, evs *events.Store,
 
 // Run looks for due jobs until ctx ends.
 func (s *Scheduler) Run(ctx context.Context) {
+	s.mu.Lock()
+	s.base = ctx
+	s.mu.Unlock()
 	s.runDue(ctx)
 	ticker := time.NewTicker(s.tick)
 	defer ticker.Stop()
@@ -113,7 +119,14 @@ func (s *Scheduler) RunNow(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if !s.start(ctx, job, true) {
+	// The run carries on after the request that asked for it is answered.
+	s.mu.Lock()
+	base := s.base
+	s.mu.Unlock()
+	if base == nil {
+		base = context.WithoutCancel(ctx)
+	}
+	if !s.start(base, job, true) {
 		return fmt.Errorf("%s is already running", job.Title)
 	}
 	return nil
@@ -266,4 +279,11 @@ func upperFirst(s string) string {
 		break
 	}
 	return s
+}
+
+// baseContext is what Run was given, or nil before it starts.
+func (s *Scheduler) baseContext() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.base
 }

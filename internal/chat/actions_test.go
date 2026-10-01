@@ -407,7 +407,7 @@ func TestAJobAnActionStartedIsFollowedToItsEnd(t *testing.T) {
 	if results := turn.framesOf("action_result"); len(results) != 1 || results[0]["status"] != "started" {
 		t.Errorf("action_result = %v", results)
 	}
-	if r := session.results[0][0]; !strings.Contains(r.Content, `"status":"started"`) || !strings.Contains(r.Content, "activity feed") {
+	if r := session.results[0][0]; !strings.Contains(r.Content, `"status":"started"`) || !strings.Contains(r.Content, "appear in Events") {
 		t.Errorf("result = %+v", r)
 	}
 
