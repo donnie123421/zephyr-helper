@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -259,6 +260,12 @@ func shouldPush(ev events.Event) bool {
 	// the chat moved on, something booked or a rule), and a check-in's
 	// briefing being ready.
 	if events.IsAssistantPush(ev) {
+		return true
+	}
+	// A resilver finishing ends the wait after a disk is replaced: the
+	// pool has its redundancy back. Starting one is no news to whoever
+	// started it.
+	if ev.Kind == events.KindResilver && strings.HasSuffix(ev.DedupeKey, "|finished") {
 		return true
 	}
 	// Warning is push-worthy only for hardware / pool integrity kinds.

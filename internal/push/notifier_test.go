@@ -27,6 +27,12 @@ func TestShouldPush(t *testing.T) {
 		{"warning resilver", events.Event{Kind: events.KindResilver, Severity: events.SeverityWarning}, true},
 		{"warning scrub", events.Event{Kind: events.KindScrub, Severity: events.SeverityWarning}, true},
 
+		// The pool rebuilt after a disk replacement: worth knowing.
+		{"resilver finished", events.Event{Kind: events.KindResilver, Severity: events.SeverityInfo,
+			DedupeKey: "resilver|backup|finished"}, true},
+		{"resilver started", events.Event{Kind: events.KindResilver, Severity: events.SeverityInfo,
+			DedupeKey: "resilver|backup|started"}, false},
+
 		// Warning for noisy kinds stays feed-only.
 		{"warning alert", events.Event{Kind: events.KindAlert, Severity: events.SeverityWarning}, false},
 		{"warning job", events.Event{Kind: events.KindJob, Severity: events.SeverityWarning}, false},
