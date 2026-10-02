@@ -29,7 +29,7 @@ func TestShouldPush(t *testing.T) {
 
 		// The pool rebuilt after a disk replacement: worth knowing.
 		{"resilver finished", events.Event{Kind: events.KindResilver, Severity: events.SeverityInfo,
-			DedupeKey: "resilver|backup|finished"}, true},
+			DedupeKey: events.RebuiltKeyPrefix + "backup|1791090720000"}, true},
 		{"resilver started", events.Event{Kind: events.KindResilver, Severity: events.SeverityInfo,
 			DedupeKey: "resilver|backup|started"}, false},
 

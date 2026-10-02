@@ -191,6 +191,11 @@ func main() {
 		go jobsPoller.Run(ctx)
 		slog.Info("jobs poller started", "interval", pollers.DefaultJobInterval)
 
+		// TrueNAS raises nothing when a resilver finishes; this notices.
+		resilvers := pollers.NewResilvers(tnClient, eventsStore, pollers.DefaultResilverInterval)
+		go resilvers.Run(ctx)
+		slog.Info("resilver watcher started", "interval", pollers.DefaultResilverInterval)
+
 		securityPoller := pollers.NewSecurity(tnClient, eventsStore, pollers.DefaultSecurityInterval)
 		go securityPoller.Run(ctx)
 		slog.Info("security poller started", "interval", pollers.DefaultSecurityInterval)

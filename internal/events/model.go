@@ -40,6 +40,11 @@ const (
 	KindSecurity Kind = "security"
 )
 
+// RebuiltKeyPrefix starts the key of a resilver-finished event, keyed by
+// pool and end time: the news worth a notification after a disk is
+// replaced. The resilver watcher (pollers.Resilvers) records them.
+const RebuiltKeyPrefix = "pool-rebuilt|"
+
 // The assistant's actions are recorded as job events, which every app
 // version can show: older apps reject a feed holding a kind they don't
 // know. Their dedupe keys start with AssistantKeyPrefix, which is how newer

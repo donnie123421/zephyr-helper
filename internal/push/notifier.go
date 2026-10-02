@@ -265,7 +265,7 @@ func shouldPush(ev events.Event) bool {
 	// A resilver finishing ends the wait after a disk is replaced: the
 	// pool has its redundancy back. Starting one is no news to whoever
 	// started it.
-	if ev.Kind == events.KindResilver && strings.HasSuffix(ev.DedupeKey, "|finished") {
+	if ev.Kind == events.KindResilver && strings.HasPrefix(ev.DedupeKey, events.RebuiltKeyPrefix) {
 		return true
 	}
 	// Warning is push-worthy only for hardware / pool integrity kinds.
