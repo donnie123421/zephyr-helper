@@ -395,3 +395,68 @@ func TestCustomAppsGoByName(t *testing.T) {
 		t.Errorf("appVersion = %q", appVersion("2024_10_1_1.2.3"))
 	}
 }
+
+func TestAFullPoolIsOneThing(t *testing.T) {
+	r := newRig(t)
+	tb := int64(1_000_000_000_000)
+	r.nas.set("pool.query", []any{map[string]any{"name": "tank", "status": "ONLINE", "size": 10 * tb, "allocated": 96 * tb / 10}})
+	r.nas.set("alert.list", []any{map[string]any{"uuid": "cap", "level": "CRITICAL", "klass": "ZpoolCapacityCritical"}})
+	body, _ := json.Marshal(map[string]any{"uuid": "cap", "klass": "ZpoolCapacityCritical", "args": map[string]any{"volume": "tank", "capacity": 96}})
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Space usage for pool 'tank' is 95%.", Body: body, DedupeKey: "cap95", OccurredAt: now.AddDate(0, 0, -3)})
+	// The same alert's text changed later in the week.
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Space usage for pool 'tank' is 96%.", Body: body, DedupeKey: "cap96", OccurredAt: now.AddDate(0, 0, -1)})
+	d, _ := r.sources.Assemble(context.Background(), false)
+	if d.Issues != 1 || d.Headline != "Worth a look: Space usage for pool 'tank' is 96%." {
+		t.Errorf("issues %d, headline %q", d.Issues, d.Headline)
+	}
+	if d.Alerts.Raised != 1 || len(d.Alerts.Notable) != 1 || d.Alerts.Notable[0].Title != "Space usage for pool 'tank' is 96%." {
+		t.Errorf("alerts = %+v", d.Alerts)
+	}
+}
+
+func TestACloudSyncFailureIsOneThing(t *testing.T) {
+	r := newRig(t)
+	r.nas.set("pool.query", []any{})
+	r.nas.set("alert.list", []any{map[string]any{"uuid": "cs", "level": "CRITICAL", "klass": "CloudSyncTaskFailed"}})
+	body, _ := json.Marshal(map[string]any{"uuid": "cs", "klass": "CloudSyncTaskFailed", "args": map[string]any{"id": 3, "name": "Offsite"}})
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Cloud sync task \"Offsite\" failed.", Body: body, DedupeKey: "cs"})
+	r.ingest(t, events.Event{Kind: events.KindJob, Severity: events.SeverityWarning, Title: "cloudsync.sync failed", Body: jobJSON("cloudsync.sync", "FAILED", 3), DedupeKey: "j"})
+	d, _ := r.sources.Assemble(context.Background(), false)
+	if d.Issues != 1 {
+		t.Errorf("issues %d, headline %q", d.Issues, d.Headline)
+	}
+}
+
+func TestAHeldNotificationSurvivesARestart(t *testing.T) {
+	r := newRig(t)
+	sydney, _ := time.LoadLocation("Australia/Sydney")
+	at := time.Date(2026, 10, 4, 9, 30, 0, 0, sydney)
+	r.sources.Now = func() time.Time { return at }
+	_, _ = r.settings.Set(Settings{Enabled: true}, at.AddDate(0, 0, -3))
+	quiet := true
+	calls := 0
+	runner := &Runner{Sources: r.sources, Settings: r.settings, Zone: func(context.Context) *time.Location { return sydney },
+		Quiet: func(time.Time) bool { calls++; return calls > 1 && quiet }}
+	runner.check(context.Background()) // kept, held for quiet hours
+	if last, ok := r.store.Latest(); !ok || last.Announced {
+		t.Fatalf("kept %v, announced %v", ok, last.Announced)
+	}
+	// The helper restarts; quiet hours end.
+	quiet = false
+	reopened, _ := OpenStore(r.store.path)
+	r.sources.Store = reopened
+	again := &Runner{Sources: r.sources, Settings: r.settings, Zone: func(context.Context) *time.Location { return sydney },
+		Quiet: func(time.Time) bool { return false }}
+	again.check(context.Background())
+	again.check(context.Background())
+	evs, _ := r.events.List(context.Background(), events.ListFilter{})
+	announced := 0
+	for _, ev := range evs {
+		if strings.HasPrefix(ev.DedupeKey, events.DigestKeyPrefix) {
+			announced++
+		}
+	}
+	if last, _ := reopened.Latest(); announced != 1 || !last.Announced || len(reopened.List()) != 1 {
+		t.Errorf("announced %d, flag %v, kept %d", announced, last.Announced, len(reopened.List()))
+	}
+}

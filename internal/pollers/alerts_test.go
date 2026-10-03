@@ -202,3 +202,29 @@ func TestAStandingAlertIsOneEvent(t *testing.T) {
 		t.Errorf("occurred %v, raised %v", evs[0].OccurredAt, time.UnixMilli(int64(raised)).UTC())
 	}
 }
+
+// An alert whose text changes is news when it changes: its new row sits at
+// the top of the feed, not back at the time it was first raised.
+func TestAChangedAlertIsDatedWhenItChanged(t *testing.T) {
+	store, err := events.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	raised := float64(time.Now().Add(-48 * time.Hour).UnixMilli())
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	list := func(text string) map[string]any {
+		return map[string]any{"alert.list": []any{map[string]any{
+			"uuid": "u-1", "level": "WARNING", "klass": "ZpoolCapacityWarning", "formatted": text,
+			"datetime": map[string]any{"$date": raised}, "last_occurrence": map[string]any{"$date": float64(now.UnixMilli())},
+		}}}
+	}
+	p := NewAlerts(testClient(t, list("Space usage for pool 'tank' is 85%.")), store, time.Minute, time.Hour)
+	p.poll(context.Background())
+	p.tn = testClient(t, list("Space usage for pool 'tank' is 88%."))
+	p.poll(context.Background())
+	evs, _ := store.List(context.Background(), events.ListFilter{})
+	if len(evs) != 2 || !evs[0].OccurredAt.Equal(now) || evs[0].Title != "Space usage for pool 'tank' is 88%." {
+		t.Errorf("events %+v", evs)
+	}
+}

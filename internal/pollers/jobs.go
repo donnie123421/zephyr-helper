@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -44,6 +45,10 @@ type Jobs struct {
 	// job count. Jobs that age out of the window have already been
 	// ingested on an earlier tick (or they never mattered).
 	seen map[int64]string
+	// running are the jobs last seen running or waiting. One that leaves
+	// the newest hundred before it ends (a scrub that takes days) is
+	// asked for by id, so its end isn't missed.
+	running map[int64]bool
 }
 
 // NewJobs builds a poller. Use DefaultJobInterval + DefaultJobMergeWindow
@@ -55,6 +60,7 @@ func NewJobs(tn *truenas.Client, store *events.Store, interval, merge time.Durat
 		interval: interval,
 		merge:    merge,
 		seen:     make(map[int64]string),
+		running:  make(map[int64]bool),
 	}
 }
 
@@ -91,8 +97,21 @@ func (j *Jobs) poll(ctx context.Context) {
 		slog.Warn("jobs: decode", "err", err)
 		return
 	}
+	jobs, unfetched := j.withDeparted(ctx, jobs)
+	// Oldest first. The store merges an event into a same-kind row a few
+	// minutes either side, keeping the newest; in the newest-first order
+	// TrueNAS now answers in, each older job merged into the row after it.
+	sort.SliceStable(jobs, func(a, b int) bool {
+		ida, _ := readJobID(jobs[a])
+		idb, _ := readJobID(jobs[b])
+		return ida < idb
+	})
 
 	current := make(map[int64]string, len(jobs))
+	running := make(map[int64]bool, len(unfetched))
+	for _, id := range unfetched {
+		running[id] = true
+	}
 	ingested := 0
 
 	for _, job := range jobs {
@@ -103,6 +122,7 @@ func (j *Jobs) poll(ctx context.Context) {
 		state, _ := job["state"].(string)
 		upper := strings.ToUpper(state)
 		if !isTerminalJobState(upper) {
+			running[id] = true
 			continue
 		}
 		if prev, already := j.seen[id]; already && prev == upper {
@@ -133,9 +153,43 @@ func (j *Jobs) poll(ctx context.Context) {
 	}
 
 	j.seen = current
+	j.running = running
 	if ingested > 0 {
 		slog.Info("jobs: ingested", "new", ingested, "terminal_window", len(current))
 	}
+}
+
+// withDeparted adds the jobs last seen running that have left the window,
+// asked for by id. It returns the ids it couldn't ask about, to try again.
+func (j *Jobs) withDeparted(ctx context.Context, jobs []map[string]any) ([]map[string]any, []int64) {
+	inWindow := make(map[int64]bool, len(jobs))
+	for _, job := range jobs {
+		if id, ok := readJobID(job); ok {
+			inWindow[id] = true
+		}
+	}
+	var departed []int64
+	for id := range j.running {
+		if !inWindow[id] {
+			departed = append(departed, id)
+		}
+	}
+	if len(departed) == 0 {
+		return jobs, nil
+	}
+	sort.Slice(departed, func(a, b int) bool { return departed[a] < departed[b] })
+	raw, err := j.tn.Call(ctx, "core.get_jobs", []any{[]any{"id", "in", departed}})
+	if err != nil {
+		slog.Warn("jobs: follow departed", "err", err, "ids", departed)
+		return jobs, departed
+	}
+	var more []map[string]any
+	if err := json.Unmarshal(raw, &more); err != nil {
+		return jobs, departed
+	}
+	// A job TrueNAS no longer has (restarted, or past its thousand) is
+	// gone for good.
+	return append(jobs, more...), nil
 }
 
 func readJobID(job map[string]any) (int64, bool) {
@@ -249,7 +303,7 @@ func jobToEvent(job map[string]any) (events.Event, bool) {
 		Title:      title,
 		Summary:    summary,
 		Body:       body,
-		DedupeKey:  jobDedupeKey(method, upper),
+		DedupeKey:  jobDedupeKey(method, upper, job),
 	}, true
 }
 
@@ -279,8 +333,23 @@ func jobSeverity(state string) events.Severity {
 // terminal state onto one row (within the 5-min merge window). The
 // same scheduled task running tomorrow gets a fresh row because it's
 // outside the window, which is what we want for an archive.
-func jobDedupeKey(method, state string) string {
-	return "job|" + method + "|" + strings.ToLower(state)
+func jobDedupeKey(method, state string, job map[string]any) string {
+	key := "job|" + method + "|" + strings.ToLower(state)
+	// Two backup tasks finishing within minutes of each other (both
+	// scheduled at midnight) are two events, not one.
+	if taskJobMethods[method] {
+		if args, ok := job["arguments"].([]any); ok && len(args) > 0 {
+			if id, ok := args[0].(float64); ok && id > 0 {
+				key += fmt.Sprintf("|%d", int64(id))
+			}
+		}
+	}
+	return key
+}
+
+// taskJobMethods run a task given by id as their first argument.
+var taskJobMethods = map[string]bool{
+	"replication.run": true, "cloudsync.sync": true, "cloud_backup.sync": true, "rsynctask.run": true,
 }
 
 func firstLine(s string) string {

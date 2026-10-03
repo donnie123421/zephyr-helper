@@ -69,6 +69,31 @@ func (s *Store) Add(d Digest) error {
 	return nil
 }
 
+// MarkAnnounced notes that a digest's notification has gone.
+func (s *Store) MarkAnnounced(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := append([]Digest(nil), s.digests...)
+	found := false
+	for i := range next {
+		if next[i].ID == id {
+			next[i].Announced, found = true, true
+		}
+	}
+	if !found {
+		return nil
+	}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	if err := writeFile(s.path, data); err != nil {
+		return err
+	}
+	s.digests = next
+	return nil
+}
+
 // Latest is the newest digest kept.
 func (s *Store) Latest() (Digest, bool) {
 	s.mu.Lock()

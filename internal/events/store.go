@@ -129,10 +129,10 @@ func (s *Store) Ingest(ctx context.Context, in Event, mergeWindow time.Duration)
         SELECT id, occurred_at, first_seen, last_seen, count, kind, severity, title,
                summary, body, dedupe_key, correlates_to, acked_at
         FROM events
-        WHERE dedupe_key = ? AND occurred_at >= ?
+        WHERE dedupe_key = ? AND occurred_at >= ? AND occurred_at <= ?
         ORDER BY occurred_at DESC
         LIMIT 1
-    `, in.DedupeKey, in.OccurredAt.Add(-mergeWindow).UnixMilli()).Scan(
+    `, in.DedupeKey, in.OccurredAt.Add(-mergeWindow).UnixMilli(), in.OccurredAt.Add(mergeWindow).UnixMilli()).Scan(
 		&existing.ID, &existingOccurredMs, &existingFirstMs, &existingLastMs,
 		&existing.Count, &existing.Kind, &existing.Severity, &existing.Title,
 		&existing.Summary, &existing.Body, &existing.DedupeKey, &existingParent, &existingAckedMs,
@@ -164,7 +164,13 @@ func (s *Store) Ingest(ctx context.Context, in Event, mergeWindow time.Duration)
 		existing.OccurredAt = time.UnixMilli(existingOccurredMs).UTC()
 		existing.FirstSeen = time.UnixMilli(existingFirstMs).UTC()
 		existing.Count++
-		existing.LastSeen = in.OccurredAt
+		// An older occurrence arriving after a newer one (a poller catching
+		// up) leaves the row's latest time and payload alone.
+		existing.LastSeen = time.UnixMilli(existingLastMs).UTC()
+		late := in.OccurredAt.Before(existing.LastSeen)
+		if !late {
+			existing.LastSeen = in.OccurredAt
+		}
 		if existingParent.Valid {
 			existing.CorrelatesTo = &existingParent.String
 		}
@@ -178,6 +184,9 @@ func (s *Store) Ingest(ctx context.Context, in Event, mergeWindow time.Duration)
 		// returning `existing.Body` here handed every live subscriber the
 		// previous poll's payload.
 		mergedBody := in.Body
+		if late {
+			mergedBody = existing.Body
+		}
 		_, err := tx.ExecContext(ctx, `
             UPDATE events SET count = ?, last_seen = ?, body = ?
             WHERE id = ?

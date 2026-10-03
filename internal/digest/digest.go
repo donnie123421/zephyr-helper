@@ -30,6 +30,9 @@ type Digest struct {
 	CreatedAt time.Time `json:"created_at"`
 	// Preview: the week so far, put together on request, not kept.
 	Preview bool `json:"preview,omitempty"`
+	// Announced: its notification has gone. Kept, so one held for quiet
+	// hours still goes after a restart.
+	Announced bool `json:"announced,omitempty"`
 	// Headline is one line from the facts, for the notification.
 	Headline string `json:"headline"`
 	// Issues is how many things want a look, as the headline counts them.
@@ -175,7 +178,7 @@ func (s Sources) Assemble(ctx context.Context, summary bool) (Digest, error) {
 	}
 	d := Digest{ID: newID(), WeekStart: start, WeekEnd: now, CreatedAt: now}
 	w := &week{d: &d, now: now, poolOnline: map[string]bool{}, tasks: map[string]*task{},
-		diskIndex: map[string]int{}, raised: map[string]bool{}}
+		diskIndex: map[string]int{}, raised: map[string]bool{}, newestAlert: map[string]events.Event{}}
 
 	pools, err := s.pools(ctx)
 	if err != nil {
@@ -198,6 +201,7 @@ func (s Sources) Assemble(ctx context.Context, summary bool) (Digest, error) {
 		d.Alerts.ActiveNow = &active
 	}
 	w.addEvents(evs, alerts)
+	w.addNewestAlerts(alerts)
 	w.addStandingAlerts(alerts)
 	w.finish()
 	s.addApps(ctx, &d, kept)
@@ -236,8 +240,11 @@ type week struct {
 	taskOrder []string
 	// disks are the disk events, by key, the newest kept.
 	diskIndex map[string]int
-	// raised are the uuids of the alerts raised this week.
-	raised map[string]bool
+	// raised are the uuids of the alerts raised this week, in the order
+	// first seen, with the newest event of each.
+	raised      map[string]bool
+	alertOrder  []string
+	newestAlert map[string]events.Event
 	// updatedAt is when an update job was seen to finish.
 	updatedAt *time.Time
 }
@@ -517,11 +524,27 @@ func taskOf(job jobBody) (key, name string) {
 }
 
 type alertBody struct {
-	UUID  string `json:"uuid"`
-	Klass string `json:"klass"`
-	Args  struct {
-		Volume string `json:"volume"`
-	} `json:"args"`
+	UUID  string         `json:"uuid"`
+	Klass string         `json:"klass"`
+	Args  map[string]any `json:"args"`
+}
+
+// alertKey is the issue an alert is part of: a pool's state alert is its
+// pool's trouble; its capacity alerts, its fullness; a cloud sync task's
+// failure alert, that task failing.
+func alertKey(klass string, args map[string]any) (key, pool string) {
+	volume, _ := args["volume"].(string)
+	switch {
+	case klass == "VolumeStatus" && volume != "":
+		return poolHealthKey(volume), volume
+	case strings.HasPrefix(klass, "ZpoolCapacity") && volume != "":
+		return "pool-full|" + volume, volume
+	case klass == "CloudSyncTaskFailed":
+		if id, ok := args["id"].(float64); ok {
+			return fmt.Sprintf("task|cloudsync.sync|%d", int64(id)), ""
+		}
+	}
+	return "", ""
 }
 
 // addEvents adds the week's events. alerts is what alert.list says now,
@@ -551,45 +574,17 @@ func (w *week) addEvents(evs []events.Event, alerts map[string]alertRow) {
 		case ev.Kind == events.KindAlert:
 			var body alertBody
 			_ = json.Unmarshal(ev.Body, &body)
-			// The same alert seen again later in the week is one alert.
+			// The same alert seen again later in the week (its text
+			// changed) is one alert, as it is now.
 			if body.UUID != "" {
-				if w.raised[body.UUID] {
-					continue
+				if !w.raised[body.UUID] {
+					w.raised[body.UUID] = true
+					w.alertOrder = append(w.alertOrder, body.UUID)
 				}
-				w.raised[body.UUID] = true
-			}
-			d.Alerts.Raised++
-			// A dismissed alert stays listed until its cause clears.
-			row, present := alerts[body.UUID]
-			cleared := alerts != nil && body.UUID != "" && !present
-			if cleared {
-				d.Alerts.Cleared++
-			}
-			if ev.Severity != events.SeverityCritical && ev.Severity != events.SeverityWarning {
+				w.newestAlert[body.UUID] = ev
 				continue
 			}
-			item := Item{Title: plainText(ev.Title), At: &at}
-			// A pool's state alert says what its status line does.
-			if body.Klass == "VolumeStatus" {
-				item.Pool = body.Args.Volume
-			}
-			switch {
-			case cleared:
-				item.Detail = "Since cleared"
-			case present && row.Dismissed:
-				item.Detail = "Dismissed"
-			default:
-				item.Bad = ev.Severity == events.SeverityCritical
-				item.Warn = ev.Severity == events.SeverityWarning
-			}
-			if item.Bad {
-				key := ""
-				if item.Pool != "" {
-					key = poolHealthKey(item.Pool)
-				}
-				w.addIssue(item.Title, key)
-			}
-			w.alertItems = append(w.alertItems, ranked{item: item, rank: rankOf(item), at: at})
+			w.addAlert(ev, body, alerts)
 		case ev.Kind == events.KindSecurity:
 			// Routine sign-ins aren't news; warnings and criticals are.
 			if ev.Severity != events.SeverityCritical && ev.Severity != events.SeverityWarning {
@@ -638,6 +633,49 @@ func (w *week) addEvents(evs []events.Event, alerts map[string]alertRow) {
 				w.updatedAt = &at
 			}
 		}
+	}
+}
+
+// addAlert adds an alert raised this week, as it is now: cleared, dismissed
+// or active.
+func (w *week) addAlert(ev events.Event, body alertBody, alerts map[string]alertRow) {
+	d := w.d
+	at := ev.OccurredAt
+	d.Alerts.Raised++
+	// A dismissed alert stays listed until its cause clears.
+	row, present := alerts[body.UUID]
+	cleared := alerts != nil && body.UUID != "" && !present
+	if cleared {
+		d.Alerts.Cleared++
+	}
+	if ev.Severity != events.SeverityCritical && ev.Severity != events.SeverityWarning {
+		return
+	}
+	key, pool := alertKey(body.Klass, body.Args)
+	item := Item{Title: plainText(ev.Title), At: &at, Pool: pool}
+	switch {
+	case cleared:
+		item.Detail = "Since cleared"
+	case present && row.Dismissed:
+		item.Detail = "Dismissed"
+	default:
+		item.Bad = ev.Severity == events.SeverityCritical
+		item.Warn = ev.Severity == events.SeverityWarning
+	}
+	if item.Bad {
+		w.addIssue(item.Title, key)
+	}
+	w.alertItems = append(w.alertItems, ranked{item: item, rank: rankOf(item), at: at})
+}
+
+// addNewestAlerts adds each alert raised this week once, as its newest
+// event has it.
+func (w *week) addNewestAlerts(alerts map[string]alertRow) {
+	for _, uuid := range w.alertOrder {
+		ev := w.newestAlert[uuid]
+		var body alertBody
+		_ = json.Unmarshal(ev.Body, &body)
+		w.addAlert(ev, body, alerts)
 	}
 }
 
@@ -721,18 +759,11 @@ func (w *week) addStandingAlerts(alerts map[string]alertRow) {
 		if title == "" {
 			continue
 		}
-		item := Item{Title: title, Detail: "Raised before this week, still active", Bad: true}
-		if a.Klass == "VolumeStatus" {
-			if args, ok := a.Args.(map[string]any); ok {
-				item.Pool, _ = args["volume"].(string)
-			}
-		}
+		args, _ := a.Args.(map[string]any)
+		key, pool := alertKey(a.Klass, args)
+		item := Item{Title: title, Detail: "Raised before this week, still active", Bad: true, Pool: pool}
 		if raised := timeOf(a.Datetime); !raised.IsZero() {
 			item.At = &raised
-		}
-		key := ""
-		if item.Pool != "" {
-			key = poolHealthKey(item.Pool)
 		}
 		w.addIssue(title, key)
 		at := time.Time{}
@@ -882,13 +913,15 @@ func (s Sources) addTrueNASUpdate(ctx context.Context, d *Digest, kept []Digest)
 // ----- the headline and the facts ------------------------------------------------
 
 func headline(issues []issue) string {
-	switch len(issues) {
-	case 0:
+	if len(issues) == 0 {
 		return "All quiet: nothing needs a look."
-	case 1:
-		return "Worth a look: " + issues[0].title + "."
 	}
-	return fmt.Sprintf("%d things worth a look, first: %s.", len(issues), issues[0].title)
+	// TrueNAS's texts often end in a full stop of their own.
+	first := strings.TrimRight(issues[0].title, ".!? ")
+	if len(issues) == 1 {
+		return "Worth a look: " + first + "."
+	}
+	return fmt.Sprintf("%d things worth a look, first: %s.", len(issues), first)
 }
 
 // roughly says a duration in days or weeks: "about 6 weeks".

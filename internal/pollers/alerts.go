@@ -103,6 +103,15 @@ func (a *Alerts) poll(ctx context.Context) {
 		}
 
 		ev, ok := alertToEvent(al)
+		// One already seen that changed (its text or level) is news now,
+		// not at the time it was first raised.
+		if _, changed := a.seen[uuid]; ok && changed {
+			if t := parseTrueNASTime(al["last_occurrence"]); !t.IsZero() {
+				ev.OccurredAt = t
+			} else {
+				ev.OccurredAt = time.Now().UTC()
+			}
+		}
 		if !ok {
 			// Deterministic conversion failure (no message text at all) —
 			// record it so we don't rebuild the same unusable row every tick.

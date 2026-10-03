@@ -34,9 +34,6 @@ type Runner struct {
 	// unsaved is a digest put together that couldn't be kept, so a retry
 	// doesn't ask the model again.
 	unsaved *Digest
-	// unannounced is a digest kept whose notification waits for quiet
-	// hours to end.
-	unannounced *Digest
 }
 
 // Run checks every minute until ctx ends.
@@ -69,17 +66,18 @@ func lastDue(now time.Time, loc *time.Location) time.Time {
 }
 
 func (r *Runner) check(ctx context.Context) {
-	now := r.Sources.now()
-	quiet := r.Quiet != nil && r.Quiet(now)
-	if r.unannounced != nil {
-		if !quiet {
-			r.announce(ctx, *r.unannounced)
-			r.unannounced = nil
-		}
-		return
-	}
 	settings := r.Settings.Get()
 	if !settings.Enabled {
+		return
+	}
+	now := r.Sources.now()
+	quiet := r.Quiet != nil && r.Quiet(now)
+	// A digest kept whose notification waited for quiet hours to end, or
+	// for the helper to come back, goes first: the flag is kept with it.
+	if last, ok := r.Sources.Store.Latest(); ok && !last.Announced && now.Sub(last.CreatedAt) < lateBy {
+		if !quiet {
+			r.announce(ctx, last)
+		}
 		return
 	}
 	// Without the NAS's time zone there's no knowing when Sunday 9 am is:
@@ -125,7 +123,6 @@ func (r *Runner) check(ctx context.Context) {
 	// Putting it together can take a couple of minutes, with a model: if
 	// quiet hours began meanwhile, the notification waits for them.
 	if r.Quiet != nil && r.Quiet(r.Sources.now()) {
-		r.unannounced = &d
 		return
 	}
 	r.announce(ctx, d)
@@ -149,6 +146,10 @@ func (r *Runner) announce(ctx context.Context, d Digest) {
 	}, time.Hour)
 	if err != nil {
 		slog.Error("digest: couldn't announce it", "err", err)
+		return
+	}
+	if err := r.Sources.Store.MarkAnnounced(d.ID); err != nil {
+		slog.Error("digest: couldn't note it was announced", "err", err)
 	}
 }
 
