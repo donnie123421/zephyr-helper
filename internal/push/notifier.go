@@ -295,8 +295,15 @@ func buildPayload(ev events.Event, quiet bool) pushPayload {
 	// (all pool events for one pool stack, etc.). Refinement later: hash
 	// per-pool, per-app, etc.
 	thread := string(ev.Kind)
-	if strings.HasPrefix(ev.DedupeKey, events.DigestKeyPrefix) {
+	data := map[string]any{
+		"event_id": ev.ID,
+		"kind":     string(ev.Kind),
+		"severity": string(ev.Severity),
+	}
+	// The digest's notification opens the digest.
+	if id, ok := strings.CutPrefix(ev.DedupeKey, events.DigestKeyPrefix); ok {
 		thread = "digest"
+		data["digest_id"] = id
 	}
 	return pushPayload{
 		SubscriptionID: "", // filled by Notifier.send
@@ -307,11 +314,7 @@ func buildPayload(ev events.Event, quiet bool) pushPayload {
 			Category:          category,
 			ThreadID:          thread,
 			InterruptionLevel: interruptionLevelFor(ev, quiet),
-			Data: map[string]any{
-				"event_id": ev.ID,
-				"kind":     string(ev.Kind),
-				"severity": string(ev.Severity),
-			},
+			Data:              data,
 		},
 	}
 }

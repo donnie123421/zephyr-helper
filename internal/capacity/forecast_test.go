@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,5 +96,12 @@ func TestTheCapacityEndpointForecastsEachPool(t *testing.T) {
 	}
 	if len(body.Pools) != 1 || body.Pools[0].Pool != "tank" || body.Pools[0].Status != "growing" || body.MinDays != 14 {
 		t.Errorf("body = %+v", body)
+	}
+}
+
+func TestNoHistoryIsAnEmptyListNotNull(t *testing.T) {
+	data, _ := json.Marshal(ForecastFrom("tank", nil, today))
+	if !strings.Contains(string(data), `"history":[]`) {
+		t.Errorf("forecast = %s", data)
 	}
 }

@@ -46,7 +46,7 @@ type Forecast struct {
 // ForecastFrom reads a forecast from a pool's samples, oldest first, as of
 // now.
 func ForecastFrom(pool string, samples []Sample, now time.Time) Forecast {
-	f := Forecast{Pool: pool, Status: "collecting"}
+	f := Forecast{Pool: pool, Status: "collecting", History: []Point{}}
 	if len(samples) == 0 {
 		return f
 	}

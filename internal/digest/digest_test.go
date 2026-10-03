@@ -91,9 +91,10 @@ func newRig(t *testing.T) *rig {
 		map[string]any{"name": "backup", "status": "DEGRADED", "size": 4 * tb, "allocated": 1 * tb,
 			"scan": map[string]any{"function": "SCRUB", "state": "FINISHED", "end_time": ms(now.AddDate(0, 0, -60)), "errors": 0}},
 	})
-	nas.set("alert.list", []any{map[string]any{"uuid": "active-1", "dismissed": false}, map[string]any{"uuid": "dismissed-1", "dismissed": true}})
+	nas.set("alert.list", []any{map[string]any{"uuid": "active-1", "dismissed": false}, map[string]any{"uuid": "active-2", "dismissed": false},
+		map[string]any{"uuid": "dismissed-1", "dismissed": true}})
 	nas.set("app.query", []any{
-		map[string]any{"name": "plex", "version": "1.2.5", "human_version": "1.41.3", "upgrade_available": false, "metadata": map[string]any{"title": "Plex"}},
+		map[string]any{"name": "plex", "version": "1.2.5", "human_version": "1.41.3_1.2.5", "upgrade_available": false, "metadata": map[string]any{"title": "Plex"}},
 		map[string]any{"name": "sonarr", "version": "2.0.0", "human_version": "4.0.9", "upgrade_available": true, "metadata": map[string]any{"title": "Sonarr"}},
 	})
 	// Thirty days of tank growing 50 GB a day.
@@ -129,12 +130,14 @@ func TestADigestGathersTheWeek(t *testing.T) {
 		b, _ := json.Marshal(map[string]any{"uuid": uuid})
 		return b
 	}
-	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Pool backup is DEGRADED", Body: alert("active-1"), DedupeKey: "c"})
-	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityWarning, Title: "Replication of tank failed", Body: alert("gone-1"), DedupeKey: "e"})
+	poolAlert, _ := json.Marshal(map[string]any{"uuid": "active-2", "klass": "VolumeStatus", "args": map[string]any{"volume": "backup"}})
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Pool backup state is DEGRADED", Body: poolAlert, DedupeKey: "f", OccurredAt: now.AddDate(0, 0, -4)})
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Pool backup is DEGRADED", Body: alert("active-1"), DedupeKey: "c", OccurredAt: now.AddDate(0, 0, -3)})
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityWarning, Title: "Replication of tank failed", Body: alert("gone-1"), DedupeKey: "e", OccurredAt: now.AddDate(0, 0, -2)})
 	r.ingest(t, events.Event{Kind: events.KindDisk, Severity: events.SeverityCritical, Title: "Disk sdb failed in backup", DedupeKey: "disk|backup|fault"})
 	r.ingest(t, events.Event{Kind: events.KindJob, Severity: events.SeverityInfo, Title: "Started a scrub", DedupeKey: events.AssistantKey("x", events.AssistantRan)})
 	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityInfo, Title: "Old", DedupeKey: "d", OccurredAt: now.AddDate(0, 0, -9)})
-	_ = r.store.Add(Digest{ID: "last", CreatedAt: now.AddDate(0, 0, -7), AppVersions: map[string]string{"plex": "1.40.5", "sonarr": "4.0.9"}})
+	_ = r.store.Add(Digest{ID: "last", CreatedAt: now.AddDate(0, 0, -7), AppVersions: map[string]string{"plex": "1.40.5_1.2.4", "sonarr": "4.0.9"}})
 
 	d, err := r.sources.Assemble(context.Background(), true)
 	if err != nil {
@@ -146,7 +149,8 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	if d.Pools[0].At100 == nil {
 		t.Error("no full date for a growing pool")
 	}
-	if len(d.Scrubs) != 2 || d.Scrubs[0].Title != "tank was scrubbed, with no errors" || !strings.HasPrefix(d.Scrubs[1].Title, "backup hasn't been scrubbed for 8 weeks") {
+	if len(d.Scrubs) != 2 || d.Scrubs[0].Title != "tank was scrubbed, with no errors" || !d.Scrubs[0].Good ||
+		!strings.HasPrefix(d.Scrubs[1].Title, "backup hasn't been scrubbed for 8 weeks") || !d.Scrubs[1].Warn {
 		t.Errorf("scrubs = %+v", d.Scrubs)
 	}
 	if len(d.Disks) != 2 || d.Disks[0].Title != "backup is degraded" || d.Disks[1].Pool != "backup" {
@@ -155,8 +159,8 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	if d.Backups.Succeeded != 1 || len(d.Backups.Failed) != 1 {
 		t.Errorf("backups %+v", d.Backups)
 	}
-	if a := d.Alerts; a.Raised != 2 || a.Cleared != 1 || a.ActiveNow != 1 || len(a.Notable) != 2 ||
-		!a.Notable[0].Bad || a.Notable[1].Bad || a.Notable[1].Detail != "Since cleared" {
+	if a := d.Alerts; a.Raised != 3 || a.Cleared != 1 || a.ActiveNow != 2 || len(a.Notable) != 3 ||
+		a.Notable[0].Pool != "backup" || !a.Notable[1].Bad || a.Notable[2].Bad || a.Notable[2].Warn || a.Notable[2].Detail != "Since cleared" {
 		t.Errorf("alerts %+v", d.Alerts)
 	}
 	if len(d.Apps.Updated) != 1 || d.Apps.Updated[0].Detail != "1.40.5 → 1.41.3" || fmt.Sprint(d.Apps.Available) != "[Sonarr]" {
@@ -165,12 +169,12 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	if d.Assistant.Actions != 1 {
 		t.Errorf("assistant = %+v", d.Assistant)
 	}
-	// backup's trouble counts once with its disk event; the cleared
-	// warning doesn't count.
+	// backup's trouble counts once with its disk event and its state
+	// alert; the cleared warning doesn't count.
 	if !strings.HasPrefix(d.Headline, "3 things worth a look, first: backup is degraded") {
 		t.Errorf("headline = %q", d.Headline)
 	}
-	if !strings.Contains(r.sum.facts, "2 alerts raised this week, 1 of them since cleared; 1 active now") {
+	if !strings.Contains(r.sum.facts, "3 alerts raised this week, 1 of them since cleared; 2 active now") {
 		t.Errorf("facts:\n%s", r.sum.facts)
 	}
 	if d.Summary != "A quiet week. tank is filling steadily." || !strings.Contains(r.sum.facts, "Pool tank: online, 60% full, +350.0 GB this week") {

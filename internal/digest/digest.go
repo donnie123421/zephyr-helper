@@ -62,11 +62,14 @@ type PoolWeek struct {
 	At100       *time.Time `json:"at_100,omitempty"`
 }
 
-// Item is one thing that happened.
+// Item is one thing that happened. Bad wants a look; Warn is worth
+// knowing; Good went right.
 type Item struct {
 	Title  string     `json:"title"`
 	Detail string     `json:"detail,omitempty"`
 	Bad    bool       `json:"bad,omitempty"`
+	Warn   bool       `json:"warn,omitempty"`
+	Good   bool       `json:"good,omitempty"`
 	At     *time.Time `json:"at,omitempty"`
 	// Pool is the pool it's about, when it's about one.
 	Pool string `json:"pool,omitempty"`
@@ -227,20 +230,20 @@ func (s Sources) addPools(ctx context.Context, d *Digest, pools []poolRow, now t
 		case fn == "SCRUB" && state == "SCANNING":
 			d.Scrubs = append(d.Scrubs, Item{Title: fmt.Sprintf("%s is being scrubbed now (%.0f%%)", p.Name, p.Scan.Percentage), Pool: p.Name})
 		case fn == "SCRUB" && state == "FINISHED" && inWeek:
-			item := Item{Title: p.Name + " was scrubbed, with no errors", At: &ended, Pool: p.Name}
+			item := Item{Title: p.Name + " was scrubbed, with no errors", Good: true, At: &ended, Pool: p.Name}
 			if p.Scan.Errors > 0 {
 				item = Item{Title: fmt.Sprintf("%s's scrub found %d errors", p.Name, p.Scan.Errors), Bad: true, At: &ended, Pool: p.Name}
 			}
 			d.Scrubs = append(d.Scrubs, item)
 		case fn == "SCRUB" && !ended.IsZero() && now.Sub(ended) > 35*24*time.Hour:
 			d.Scrubs = append(d.Scrubs, Item{Title: fmt.Sprintf("%s hasn't been scrubbed for %d weeks", p.Name, int(now.Sub(ended).Hours()/24/7)),
-				Detail: "A monthly scrub finds problems while there's still redundancy to fix them.", Pool: p.Name})
+				Detail: "A monthly scrub finds problems while there's still redundancy to fix them.", Warn: true, Pool: p.Name})
 		case fn == "RESILVER" && state == "SCANNING":
 			d.Disks = append(d.Disks, Item{Title: fmt.Sprintf("%s is rebuilding onto a new disk (%.0f%%)", p.Name, p.Scan.Percentage), Pool: p.Name})
 		case fn == "RESILVER" && state == "FINISHED" && inWeek:
-			item := Item{Title: p.Name + " finished rebuilding onto a new disk", At: &ended, Pool: p.Name}
+			item := Item{Title: p.Name + " finished rebuilding onto a new disk", Good: true, At: &ended, Pool: p.Name}
 			if p.Scan.Errors > 0 {
-				item.Detail, item.Bad = fmt.Sprintf("It found %d errors.", p.Scan.Errors), true
+				item.Detail, item.Bad, item.Good = fmt.Sprintf("It found %d errors.", p.Scan.Errors), true, false
 			}
 			d.Disks = append(d.Disks, item)
 		}
@@ -259,7 +262,7 @@ var backupMethods = map[string]bool{
 // active now, or nil when they couldn't be read.
 func addEvents(d *Digest, evs []events.Event, active map[string]bool) {
 	// Oldest first reads as the week went.
-	sort.Slice(evs, func(i, j int) bool { return evs[i].OccurredAt.Before(evs[j].OccurredAt) })
+	sort.SliceStable(evs, func(i, j int) bool { return evs[i].OccurredAt.Before(evs[j].OccurredAt) })
 	for _, ev := range evs {
 		at := ev.OccurredAt
 		switch {
@@ -281,7 +284,11 @@ func addEvents(d *Digest, evs []events.Event, active map[string]bool) {
 		case ev.Kind == events.KindAlert:
 			d.Alerts.Raised++
 			var alert struct {
-				UUID string `json:"uuid"`
+				UUID  string `json:"uuid"`
+				Klass string `json:"klass"`
+				Args  struct {
+					Volume string `json:"volume"`
+				} `json:"args"`
 			}
 			_ = json.Unmarshal(ev.Body, &alert)
 			cleared := active != nil && alert.UUID != "" && !active[alert.UUID]
@@ -289,7 +296,12 @@ func addEvents(d *Digest, evs []events.Event, active map[string]bool) {
 				d.Alerts.Cleared++
 			}
 			if (ev.Severity == events.SeverityCritical || ev.Severity == events.SeverityWarning) && len(d.Alerts.Notable) < 5 {
-				item := Item{Title: ev.Title, Bad: ev.Severity == events.SeverityCritical && !cleared, At: &at}
+				item := Item{Title: ev.Title, Bad: ev.Severity == events.SeverityCritical && !cleared,
+					Warn: ev.Severity == events.SeverityWarning && !cleared, At: &at}
+				// A pool's state alert says what its status line does.
+				if alert.Klass == "VolumeStatus" {
+					item.Pool = alert.Args.Volume
+				}
 				if cleared {
 					item.Detail = "Since cleared"
 				}
@@ -297,7 +309,8 @@ func addEvents(d *Digest, evs []events.Event, active map[string]bool) {
 			}
 		case ev.Kind == events.KindSecurity:
 			if len(d.Security) < 5 {
-				d.Security = append(d.Security, Item{Title: ev.Title, Bad: ev.Severity == events.SeverityCritical, At: &at})
+				d.Security = append(d.Security, Item{Title: ev.Title, Bad: ev.Severity == events.SeverityCritical,
+					Warn: ev.Severity == events.SeverityWarning, At: &at})
 			}
 		case ev.Kind == events.KindJob:
 			var job struct {
@@ -311,7 +324,7 @@ func addEvents(d *Digest, evs []events.Event, active map[string]bool) {
 			case backupMethods[job.Method]:
 				d.Backups.Failed = append(d.Backups.Failed, Item{Title: ev.Title, Detail: ev.Summary, Bad: true, At: &at})
 			case (job.Method == "update.run" || job.Method == "update.update") && strings.EqualFold(job.State, "SUCCESS"):
-				d.System = append(d.System, Item{Title: "TrueNAS was updated", At: &at})
+				d.System = append(d.System, Item{Title: "TrueNAS was updated", Good: true, At: &at})
 			}
 		}
 	}
@@ -386,12 +399,25 @@ func (s Sources) addApps(ctx context.Context, d *Digest) {
 			title = a.Name
 		}
 		if was, ok := before[a.Name]; ok && was != version && version != "" {
-			d.Apps.Updated = append(d.Apps.Updated, Item{Title: title, Detail: was + " → " + version})
+			from, to := appVersion(was), appVersion(version)
+			if from == to {
+				from, to = was, version
+			}
+			d.Apps.Updated = append(d.Apps.Updated, Item{Title: title, Detail: from + " → " + to})
 		}
 		if a.UpgradeAvailable {
 			d.Apps.Available = append(d.Apps.Available, title)
 		}
 	}
+}
+
+// appVersion is the app's own version from TrueNAS's human version, which
+// adds the package's: "1.41.3_1.0.1" is 1.41.3.
+func appVersion(human string) string {
+	if i := strings.IndexByte(human, '_'); i > 0 {
+		return human[:i]
+	}
+	return human
 }
 
 // ----- the headline and the facts ------------------------------------------------
@@ -415,7 +441,7 @@ func bad(d Digest) []string {
 	}
 	for _, group := range [][]Item{d.Scrubs, d.Backups.Failed, d.Alerts.Notable, d.Security} {
 		for _, item := range group {
-			if item.Bad {
+			if item.Bad && !(item.Pool != "" && diskPools[item.Pool]) {
 				out = append(out, item.Title)
 			}
 		}

@@ -152,3 +152,16 @@ func TestReadyClosesWhenListeningOrDisabled(t *testing.T) {
 		t.Fatal("never ready")
 	}
 }
+
+func TestTheDigestsPushNamesTheDigest(t *testing.T) {
+	ev := events.Event{ID: "e1", Kind: events.KindJob, Severity: events.SeverityInfo,
+		Title: "Your NAS this week", DedupeKey: events.DigestKeyPrefix + "abc123"}
+	p := buildPayload(ev, false)
+	if p.Payload.Data["digest_id"] != "abc123" || p.Payload.Data["event_id"] != "e1" ||
+		p.Payload.ThreadID != "digest" || p.Payload.Category != "DIGEST" || p.Payload.InterruptionLevel != "" {
+		t.Errorf("payload = %+v", p.Payload)
+	}
+	if other := buildPayload(events.Event{ID: "e2", Kind: events.KindAlert, Severity: events.SeverityCritical}, false); other.Payload.Data["digest_id"] != nil {
+		t.Errorf("an alert's push named a digest: %+v", other.Payload.Data)
+	}
+}
