@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -66,9 +67,22 @@ func (a *Anthropic) NewSession(system string, tools []Tool) Session {
 	}
 }
 
+// Anthropic's limits on strict tools in one request. Past any of them it
+// refuses the request (400): a chat with actions on sent 30 strict tools,
+// and every message failed.
+const (
+	maxStrictTools    = 20
+	maxStrictOptional = 24
+	maxStrictUnions   = 16
+)
+
 // anthropicTools converts the tool definitions. Strict mode guarantees the
 // model's arguments match each schema; the helper's schemas already meet
-// its rules (additionalProperties false, no numeric or length limits).
+// its rules (additionalProperties false, no numeric or length limits). It
+// only checks arguments, so it's on for the tools that take some, as far as
+// Anthropic's limits allow; the rest go without it. Tools come sorted, so
+// which are strict stays the same from request to request, as the prompt
+// cache needs.
 func anthropicTools(tools []Tool) []anthropic.ToolUnionParam {
 	// None (the digest's summary) sends no tools field, rather than an
 	// empty one.
@@ -76,6 +90,7 @@ func anthropicTools(tools []Tool) []anthropic.ToolUnionParam {
 		return nil
 	}
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
+	var strictTools, optional, unions int
 	for _, t := range tools {
 		var schema struct {
 			Properties map[string]any `json:"properties"`
@@ -95,7 +110,14 @@ func anthropicTools(tools []Tool) []anthropic.ToolUnionParam {
 				Required:    schema.Required,
 				ExtraFields: map[string]any{"additionalProperties": false},
 			},
-			Strict: anthropic.Bool(true),
+		}
+		if n := len(schema.Properties); n > 0 {
+			opt := n - len(schema.Required)
+			uni := unionParameters(schema.Properties)
+			if strictTools < maxStrictTools && optional+opt <= maxStrictOptional && unions+uni <= maxStrictUnions {
+				tool.Strict = anthropic.Bool(true)
+				strictTools, optional, unions = strictTools+1, optional+opt, unions+uni
+			}
 		}
 		out = append(out, anthropic.ToolUnionParam{OfTool: &tool})
 	}
@@ -225,6 +247,35 @@ func AnthropicModels(ctx context.Context, apiKey, baseURL string) ([]ModelInfo, 
 	return out, nil
 }
 
+// unionParameters counts the parameters that take more than one type
+// (anyOf, or a list of types), which Anthropic limits in strict tools.
+func unionParameters(properties map[string]any) int {
+	n := 0
+	for _, p := range properties {
+		prop, _ := p.(map[string]any)
+		if _, ok := prop["anyOf"]; ok {
+			n++
+		} else if _, ok := prop["type"].([]any); ok {
+			n++
+		}
+	}
+	return n
+}
+
+// anthropicMessage is the explanation in an API error's body, if any:
+// {"type":"error","error":{"type":"invalid_request_error","message":"…"}}.
+func anthropicMessage(apiErr *anthropic.Error) string {
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(apiErr.RawJSON()), &body) != nil {
+		return ""
+	}
+	return strings.TrimSpace(body.Error.Message)
+}
+
 // describeAnthropicError turns an API failure into something the person in
 // the chat can act on, logging the details for the helper's logs.
 func describeAnthropicError(err error, model string) error {
@@ -257,6 +308,11 @@ func describeAnthropicError(err error, model string) error {
 	}
 	if apiErr.StatusCode >= 500 {
 		return Problem("Anthropic is having trouble right now. Try again shortly.")
+	}
+	// Anthropic says why it refused a request: pass that on, rather than
+	// a bare status nobody can act on.
+	if msg := anthropicMessage(apiErr); msg != "" {
+		return Problem(fmt.Sprintf("Anthropic refused the request (%d): %s", apiErr.StatusCode, msg))
 	}
 	return Problem(fmt.Sprintf("Anthropic returned an error (%d).", apiErr.StatusCode))
 }

@@ -20,6 +20,7 @@ type fakeClaude struct {
 	mu       sync.Mutex
 	replies  []string // SSE bodies, one per request
 	status   int      // non-zero: fail every request with this status
+	body     string   // with status, the error body (default: a bad key)
 	requests []map[string]any
 	models   []string
 }
@@ -30,6 +31,10 @@ func (f *fakeClaude) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if f.status != 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(f.status)
+		if f.body != "" {
+			fmt.Fprint(w, f.body)
+			return
+		}
 		fmt.Fprintf(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
 		return
 	}
@@ -209,10 +214,15 @@ func TestClaudeSendsStrictToolsInTheGivenOrder(t *testing.T) {
 	if len(tools) != 2 {
 		t.Fatalf("tools = %v", tools)
 	}
-	for i, name := range []string{"pool_status", "list_pools"} {
+	// Strict only checks arguments: pool_status takes one, list_pools none.
+	for i, want := range []struct {
+		name   string
+		strict any
+	}{{"pool_status", true}, {"list_pools", nil}} {
+		name := want.name
 		tool := tools[i].(map[string]any)
-		if tool["name"] != name || tool["strict"] != true {
-			t.Errorf("tool %d = %v, want %s with strict", i, tool, name)
+		if tool["name"] != name || tool["strict"] != want.strict {
+			t.Errorf("tool %d = %v, want %s with strict %v", i, tool, name, want.strict)
 		}
 		schema := tool["input_schema"].(map[string]any)
 		if schema["additionalProperties"] != false || schema["type"] != "object" {
@@ -322,5 +332,71 @@ func TestAnthropicModels(t *testing.T) {
 	fake.status = http.StatusUnauthorized
 	if _, err := AnthropicModels(context.Background(), "bad", srv.URL); err == nil {
 		t.Error("a rejected key should fail the listing")
+	}
+}
+
+// strictCount marshals the tools as they'd be sent and counts the strict
+// ones, and the optional parameters among them.
+func strictCount(t *testing.T, tools []Tool) (strict, optional int, parameterless bool) {
+	t.Helper()
+	data, err := json.Marshal(anthropicTools(tools))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent []struct {
+		Strict      bool `json:"strict"`
+		InputSchema struct {
+			Properties map[string]any `json:"properties"`
+			Required   []string       `json:"required"`
+		} `json:"input_schema"`
+	}
+	if err := json.Unmarshal(data, &sent); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range sent {
+		if !tool.Strict {
+			continue
+		}
+		strict++
+		optional += len(tool.InputSchema.Properties) - len(tool.InputSchema.Required)
+		parameterless = parameterless || len(tool.InputSchema.Properties) == 0
+	}
+	return strict, optional, parameterless
+}
+
+// A chat with actions on sent 30 strict tools, and Anthropic refused every
+// message: it takes at most 20, with 24 optional parameters between them.
+func TestStrictToolsStayWithinAnthropicsLimits(t *testing.T) {
+	var tools []Tool
+	for i := 0; i < 17; i++ {
+		tools = append(tools, Tool{Name: fmt.Sprintf("list_%02d", i), Parameters: json.RawMessage(`{"type":"object","properties":{}}`)})
+	}
+	for i := 0; i < 13; i++ {
+		tools = append(tools, Tool{Name: fmt.Sprintf("act_%02d", i), Parameters: json.RawMessage(
+			`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"},"c":{"type":"string"}},"required":["a"]}`)})
+	}
+	strict, optional, parameterless := strictCount(t, tools)
+	if strict != 12 || optional != 24 || parameterless {
+		t.Errorf("strict %d, optional %d, parameterless strict %v", strict, optional, parameterless)
+	}
+
+	var many []Tool
+	for i := 0; i < 25; i++ {
+		many = append(many, Tool{Name: fmt.Sprintf("act_%02d", i), Parameters: json.RawMessage(
+			`{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}`)})
+	}
+	if strict, _, _ := strictCount(t, many); strict != 20 {
+		t.Errorf("%d strict of 25", strict)
+	}
+}
+
+func TestARefusedRequestSaysWhy(t *testing.T) {
+	fake := &fakeClaude{status: http.StatusBadRequest,
+		body: `{"type":"error","error":{"type":"invalid_request_error","message":"Too many strict tools: 30 (maximum 20)."}}`}
+	session := newFakeSession(t, fake)
+	session.AddUserMessage("hi")
+	_, err := session.Step(context.Background(), func(string) error { return nil })
+	if err == nil || err.Error() != "Anthropic refused the request (400): Too many strict tools: 30 (maximum 20)." {
+		t.Errorf("err = %v", err)
 	}
 }
