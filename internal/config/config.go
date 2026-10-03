@@ -43,6 +43,10 @@ type Config struct {
 	UsageDBPath string
 	// ScheduleDBPath is the SQLite file holding what's booked for later.
 	ScheduleDBPath string
+	// DigestPath keeps the last weekly digests; DigestSettingsPath whether
+	// the digest is on.
+	DigestPath         string
+	DigestSettingsPath string
 	// ConversationsDBPath is the SQLite file holding the assistant's saved
 	// chats, readable only by the helper.
 	ConversationsDBPath string
@@ -122,6 +126,8 @@ func Load() (*Config, error) {
 	cfg.ConversationsDBPath = filepath.Join(cfg.DataDir, "conversations.db")
 	cfg.UsageDBPath = filepath.Join(cfg.DataDir, "usage.db")
 	cfg.ScheduleDBPath = filepath.Join(cfg.DataDir, "schedule.db")
+	cfg.DigestPath = filepath.Join(cfg.DataDir, "digests.json")
+	cfg.DigestSettingsPath = filepath.Join(cfg.DataDir, "digest-settings.json")
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,
 	// mint one and print it so the operator can pair by hand.

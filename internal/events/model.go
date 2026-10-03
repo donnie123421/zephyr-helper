@@ -45,6 +45,10 @@ const (
 // replaced. The resilver watcher (pollers.Resilvers) records them.
 const RebuiltKeyPrefix = "pool-rebuilt|"
 
+// DigestKeyPrefix starts the key of the weekly digest's event, with the
+// digest's id.
+const DigestKeyPrefix = "digest|"
+
 // The assistant's actions are recorded as job events, which every app
 // version can show: older apps reject a feed holding a kind they don't
 // know. Their dedupe keys start with AssistantKeyPrefix, which is how newer

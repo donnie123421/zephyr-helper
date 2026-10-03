@@ -114,6 +114,24 @@ ORDER BY day`,
 	return out, rows.Err()
 }
 
+// Pools lists the pools recorded since then, by name.
+func (s *Store) Pools(ctx context.Context, since time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT pool FROM pool_usage WHERE day >= ? ORDER BY pool`, dayOf(since))
+	if err != nil {
+		return nil, fmt.Errorf("pools: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 // Prune deletes days before cutoff and reports how many rows went.
 func (s *Store) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM pool_usage WHERE day < ?`, dayOf(cutoff))

@@ -268,6 +268,10 @@ func shouldPush(ev events.Event) bool {
 	if ev.Kind == events.KindResilver && strings.HasPrefix(ev.DedupeKey, events.RebuiltKeyPrefix) {
 		return true
 	}
+	// The weekly digest, which goes out after quiet hours.
+	if strings.HasPrefix(ev.DedupeKey, events.DigestKeyPrefix) {
+		return true
+	}
 	// Warning is push-worthy only for hardware / pool integrity kinds.
 	// Warning-level alerts and job failures stay feed-only — they're
 	// frequent enough that pushing each one trains the user to ignore

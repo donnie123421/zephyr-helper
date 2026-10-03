@@ -21,6 +21,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/chat"
 	"github.com/donnie123421/zephyr-helper/internal/config"
 	"github.com/donnie123421/zephyr-helper/internal/conversations"
+	"github.com/donnie123421/zephyr-helper/internal/digest"
 	"github.com/donnie123421/zephyr-helper/internal/events"
 	"github.com/donnie123421/zephyr-helper/internal/events/correlators"
 	eventshttp "github.com/donnie123421/zephyr-helper/internal/events/http"
@@ -180,6 +181,7 @@ func main() {
 	go snapshotCorrelator.Run(ctx)
 	slog.Info("snapshot correlator started")
 
+	var capacityStore *capacity.Store
 	if tnClient.Configured() {
 		alertsPoller := pollers.NewAlerts(tnClient, eventsStore, pollers.DefaultAlertInterval, pollers.DefaultAlertMergeWindow)
 		go alertsPoller.Run(ctx)
@@ -203,9 +205,11 @@ func main() {
 		// Capacity history for the pool-full forecast. Losing it only
 		// costs the forecast its history, so a failure here is logged
 		// rather than taking the rest of the helper down with it.
-		capacityStore, err := capacity.Open(cfg.CapacityDBPath)
-		if err != nil {
-			slog.Warn("capacity store open; not recording pool usage", "err", err, "path", cfg.CapacityDBPath)
+		var openErr error
+		capacityStore, openErr = capacity.Open(cfg.CapacityDBPath)
+		if openErr != nil {
+			capacityStore = nil
+			slog.Warn("capacity store open; not recording pool usage", "err", openErr, "path", cfg.CapacityDBPath)
 		} else {
 			defer capacityStore.Close()
 			go capacity.NewRecorder(tnClient, capacityStore, capacity.DefaultInterval).Run(ctx)
@@ -251,6 +255,32 @@ func main() {
 			slog.Info("scheduler started", "path", cfg.ScheduleDBPath)
 			scheduler.Run(ctx)
 		}()
+	}
+
+	// The weekly digest. It's off until the app turns it on: it's part of
+	// Zephyr Pro, which the helper can't see.
+	var digestHandler *digest.Handler
+	digestStore, storeErr := digest.OpenStore(cfg.DigestPath)
+	digestSettings, settingsErr := digest.OpenSettings(cfg.DigestSettingsPath)
+	if storeErr != nil || settingsErr != nil {
+		slog.Warn("digest unavailable", "store", storeErr, "settings", settingsErr)
+	} else {
+		sources := digest.Sources{NAS: tnClient, Events: eventsStore, Capacity: capacityStore,
+			Summarizer: chatHandler, Store: digestStore}
+		digestHandler = &digest.Handler{Sources: sources, Settings: digestSettings}
+		if tnClient.Configured() {
+			runner := &digest.Runner{Sources: sources, Settings: digestSettings,
+				Zone: digest.NASZone(tnClient), Quiet: pushPrefs.InQuietHours}
+			go func() {
+				select {
+				case <-pushNotifier.Ready():
+				case <-time.After(15 * time.Second):
+				case <-ctx.Done():
+					return
+				}
+				runner.Run(ctx)
+			}()
+		}
 	}
 
 	// Optional: join the user's tailnet so /remote-access can resolve
@@ -303,6 +333,14 @@ func main() {
 	(&schedule.Handler{Store: scheduleStore, Scheduler: scheduler}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
+	(&capacity.Handler{Store: capacityStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
+	if digestHandler != nil {
+		digestHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
+			return auth.Require(cfg.PairingToken, h)
+		})
+	}
 	(&usage.Handler{Store: usageStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})

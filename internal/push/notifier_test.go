@@ -32,6 +32,9 @@ func TestShouldPush(t *testing.T) {
 			DedupeKey: events.RebuiltKeyPrefix + "backup|1791090720000"}, true},
 		{"resilver started", events.Event{Kind: events.KindResilver, Severity: events.SeverityInfo,
 			DedupeKey: "resilver|backup|started"}, false},
+		// The weekly digest notifies.
+		{"weekly digest", events.Event{Kind: events.KindJob, Severity: events.SeverityInfo,
+			DedupeKey: events.DigestKeyPrefix + "abc123"}, true},
 
 		// Warning for noisy kinds stays feed-only.
 		{"warning alert", events.Event{Kind: events.KindAlert, Severity: events.SeverityWarning}, false},
