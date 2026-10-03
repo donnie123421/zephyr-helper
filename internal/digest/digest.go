@@ -68,11 +68,16 @@ type Item struct {
 	Detail string     `json:"detail,omitempty"`
 	Bad    bool       `json:"bad,omitempty"`
 	At     *time.Time `json:"at,omitempty"`
+	// Pool is the pool it's about, when it's about one.
+	Pool string `json:"pool,omitempty"`
 }
 
-// Alerts are the alerts raised this week, and how many are active now.
+// Alerts are the alerts raised this week, how many of those have
+// cleared, and how many are active now.
 type Alerts struct {
-	Raised    int    `json:"raised"`
+	Raised  int `json:"raised"`
+	Cleared int `json:"cleared"`
+	// Notable are the warnings and criticals raised, at most five.
 	Notable   []Item `json:"notable"`
 	ActiveNow int    `json:"active_now"`
 }
@@ -140,8 +145,11 @@ func (s Sources) Assemble(ctx context.Context, summary bool) (Digest, error) {
 	if err != nil {
 		return Digest{}, fmt.Errorf("events: %w", err)
 	}
-	addEvents(&d, evs)
-	s.addAlerts(ctx, &d)
+	active := s.activeAlerts(ctx)
+	if active != nil {
+		d.Alerts.ActiveNow = len(active)
+	}
+	addEvents(&d, evs, active)
 	s.addApps(ctx, &d)
 	d.Headline = headline(d)
 
@@ -211,26 +219,26 @@ func (s Sources) addPools(ctx context.Context, d *Digest, pools []poolRow, now t
 		d.Pools = append(d.Pools, week)
 
 		if week.Status != "" && week.Status != "ONLINE" {
-			d.Disks = append(d.Disks, Item{Title: fmt.Sprintf("%s is %s", p.Name, strings.ToLower(week.Status)), Bad: true})
+			d.Disks = append(d.Disks, Item{Title: fmt.Sprintf("%s is %s", p.Name, strings.ToLower(week.Status)), Bad: true, Pool: p.Name})
 		}
 		ended := timeOf(p.Scan.EndTime)
 		inWeek := !ended.IsZero() && ended.After(d.WeekStart)
 		switch fn, state := strings.ToUpper(p.Scan.Function), strings.ToUpper(p.Scan.State); {
 		case fn == "SCRUB" && state == "SCANNING":
-			d.Scrubs = append(d.Scrubs, Item{Title: fmt.Sprintf("%s is being scrubbed now (%.0f%%)", p.Name, p.Scan.Percentage)})
+			d.Scrubs = append(d.Scrubs, Item{Title: fmt.Sprintf("%s is being scrubbed now (%.0f%%)", p.Name, p.Scan.Percentage), Pool: p.Name})
 		case fn == "SCRUB" && state == "FINISHED" && inWeek:
-			item := Item{Title: p.Name + " was scrubbed, with no errors", At: &ended}
+			item := Item{Title: p.Name + " was scrubbed, with no errors", At: &ended, Pool: p.Name}
 			if p.Scan.Errors > 0 {
-				item = Item{Title: fmt.Sprintf("%s's scrub found %d errors", p.Name, p.Scan.Errors), Bad: true, At: &ended}
+				item = Item{Title: fmt.Sprintf("%s's scrub found %d errors", p.Name, p.Scan.Errors), Bad: true, At: &ended, Pool: p.Name}
 			}
 			d.Scrubs = append(d.Scrubs, item)
 		case fn == "SCRUB" && !ended.IsZero() && now.Sub(ended) > 35*24*time.Hour:
 			d.Scrubs = append(d.Scrubs, Item{Title: fmt.Sprintf("%s hasn't been scrubbed for %d weeks", p.Name, int(now.Sub(ended).Hours()/24/7)),
-				Detail: "A monthly scrub finds problems while there's still redundancy to fix them."})
+				Detail: "A monthly scrub finds problems while there's still redundancy to fix them.", Pool: p.Name})
 		case fn == "RESILVER" && state == "SCANNING":
-			d.Disks = append(d.Disks, Item{Title: fmt.Sprintf("%s is rebuilding onto a new disk (%.0f%%)", p.Name, p.Scan.Percentage)})
+			d.Disks = append(d.Disks, Item{Title: fmt.Sprintf("%s is rebuilding onto a new disk (%.0f%%)", p.Name, p.Scan.Percentage), Pool: p.Name})
 		case fn == "RESILVER" && state == "FINISHED" && inWeek:
-			item := Item{Title: p.Name + " finished rebuilding onto a new disk", At: &ended}
+			item := Item{Title: p.Name + " finished rebuilding onto a new disk", At: &ended, Pool: p.Name}
 			if p.Scan.Errors > 0 {
 				item.Detail, item.Bad = fmt.Sprintf("It found %d errors.", p.Scan.Errors), true
 			}
@@ -247,7 +255,9 @@ var backupMethods = map[string]bool{
 	"cloud_backup.sync": true, "rsynctask.run": true,
 }
 
-func addEvents(d *Digest, evs []events.Event) {
+// addEvents adds the week's events. active is the uuids of the alerts
+// active now, or nil when they couldn't be read.
+func addEvents(d *Digest, evs []events.Event, active map[string]bool) {
 	// Oldest first reads as the week went.
 	sort.Slice(evs, func(i, j int) bool { return evs[i].OccurredAt.Before(evs[j].OccurredAt) })
 	for _, ev := range evs {
@@ -267,11 +277,23 @@ func addEvents(d *Digest, evs []events.Event) {
 				d.Assistant.Failed++
 			}
 		case ev.Kind == events.KindDisk:
-			d.Disks = append(d.Disks, Item{Title: ev.Title, Detail: ev.Summary, Bad: true, At: &at})
+			d.Disks = append(d.Disks, Item{Title: ev.Title, Detail: ev.Summary, Bad: true, At: &at, Pool: diskEventPool(ev.DedupeKey)})
 		case ev.Kind == events.KindAlert:
 			d.Alerts.Raised++
+			var alert struct {
+				UUID string `json:"uuid"`
+			}
+			_ = json.Unmarshal(ev.Body, &alert)
+			cleared := active != nil && alert.UUID != "" && !active[alert.UUID]
+			if cleared {
+				d.Alerts.Cleared++
+			}
 			if (ev.Severity == events.SeverityCritical || ev.Severity == events.SeverityWarning) && len(d.Alerts.Notable) < 5 {
-				d.Alerts.Notable = append(d.Alerts.Notable, Item{Title: ev.Title, Bad: ev.Severity == events.SeverityCritical, At: &at})
+				item := Item{Title: ev.Title, Bad: ev.Severity == events.SeverityCritical && !cleared, At: &at}
+				if cleared {
+					item.Detail = "Since cleared"
+				}
+				d.Alerts.Notable = append(d.Alerts.Notable, item)
 			}
 		case ev.Kind == events.KindSecurity:
 			if len(d.Security) < 5 {
@@ -297,22 +319,36 @@ func addEvents(d *Digest, evs []events.Event) {
 
 // ----- alerts and apps -----------------------------------------------------------
 
-func (s Sources) addAlerts(ctx context.Context, d *Digest) {
+// activeAlerts is the uuids of the alerts active now (not dismissed), or
+// nil when TrueNAS doesn't say.
+func (s Sources) activeAlerts(ctx context.Context) map[string]bool {
 	raw, err := s.NAS.Call(ctx, "alert.list")
 	if err != nil {
-		return
+		return nil
 	}
 	var alerts []struct {
-		Dismissed bool `json:"dismissed"`
+		UUID      string `json:"uuid"`
+		Dismissed bool   `json:"dismissed"`
 	}
 	if json.Unmarshal(raw, &alerts) != nil {
-		return
+		return nil
 	}
+	active := map[string]bool{}
 	for _, a := range alerts {
 		if !a.Dismissed {
-			d.Alerts.ActiveNow++
+			active[a.UUID] = true
 		}
 	}
+	return active
+}
+
+// diskEventPool reads the pool from a disk event's key: "disk|<pool>|...".
+func diskEventPool(key string) string {
+	parts := strings.Split(key, "|")
+	if len(parts) >= 3 && parts[0] == "disk" {
+		return parts[1]
+	}
+	return ""
 }
 
 func (s Sources) addApps(ctx context.Context, d *Digest) {
@@ -363,7 +399,21 @@ func (s Sources) addApps(ctx context.Context, d *Digest) {
 // bad are the things that want a look, worst first.
 func bad(d Digest) []string {
 	var out []string
-	for _, group := range [][]Item{d.Disks, d.Scrubs, d.Backups.Failed, d.Alerts.Notable, d.Security} {
+	// A pool's disk trouble is one thing, however many events it made.
+	diskPools := map[string]bool{}
+	for _, item := range d.Disks {
+		if !item.Bad {
+			continue
+		}
+		if item.Pool != "" {
+			if diskPools[item.Pool] {
+				continue
+			}
+			diskPools[item.Pool] = true
+		}
+		out = append(out, item.Title)
+	}
+	for _, group := range [][]Item{d.Scrubs, d.Backups.Failed, d.Alerts.Notable, d.Security} {
 		for _, item := range group {
 			if item.Bad {
 				out = append(out, item.Title)
@@ -423,9 +473,13 @@ func Facts(d Digest) string {
 	if d.Backups.Succeeded > 0 {
 		line("%d backup runs succeeded", d.Backups.Succeeded)
 	}
-	line("%d alerts raised this week, %d active now", d.Alerts.Raised, d.Alerts.ActiveNow)
+	line("%d alerts raised this week, %d of them since cleared; %d active now", d.Alerts.Raised, d.Alerts.Cleared, d.Alerts.ActiveNow)
 	for _, item := range d.Alerts.Notable {
-		line("Alert: %s", item.Title)
+		if item.Detail != "" {
+			line("Alert: %s (%s)", item.Title, strings.ToLower(item.Detail))
+		} else {
+			line("Alert: %s", item.Title)
+		}
 	}
 	for _, item := range d.Apps.Updated {
 		line("App updated: %s (%s)", item.Title, item.Detail)

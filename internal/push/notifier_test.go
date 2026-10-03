@@ -87,6 +87,8 @@ func TestCategoryFor(t *testing.T) {
 		{"critical disk", events.Event{Kind: events.KindDisk, Severity: events.SeverityCritical}, "ALERT_CRITICAL"},
 		{"warning pool", events.Event{Kind: events.KindPool, Severity: events.SeverityWarning}, "ALERT_WARNING"},
 		{"warning disk", events.Event{Kind: events.KindDisk, Severity: events.SeverityWarning}, "ALERT_WARNING"},
+		// Muting warnings doesn't mute the digest, which has its own switch.
+		{"weekly digest", events.Event{Kind: events.KindJob, Severity: events.SeverityInfo, DedupeKey: events.DigestKeyPrefix + "abc"}, "DIGEST"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

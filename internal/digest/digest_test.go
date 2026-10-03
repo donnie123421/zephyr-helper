@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -40,11 +41,13 @@ func (f *fakeNAS) Call(_ context.Context, method string, _ ...any) (json.RawMess
 
 type fakeSummarizer struct {
 	facts string
+	calls int
 	err   error
 }
 
 func (f *fakeSummarizer) Summarize(_ context.Context, facts string) (string, error) {
 	f.facts = facts
+	f.calls++
 	if f.err != nil {
 		return "", f.err
 	}
@@ -88,7 +91,7 @@ func newRig(t *testing.T) *rig {
 		map[string]any{"name": "backup", "status": "DEGRADED", "size": 4 * tb, "allocated": 1 * tb,
 			"scan": map[string]any{"function": "SCRUB", "state": "FINISHED", "end_time": ms(now.AddDate(0, 0, -60)), "errors": 0}},
 	})
-	nas.set("alert.list", []any{map[string]any{"dismissed": false}, map[string]any{"dismissed": true}})
+	nas.set("alert.list", []any{map[string]any{"uuid": "active-1", "dismissed": false}, map[string]any{"uuid": "dismissed-1", "dismissed": true}})
 	nas.set("app.query", []any{
 		map[string]any{"name": "plex", "version": "1.2.5", "human_version": "1.41.3", "upgrade_available": false, "metadata": map[string]any{"title": "Plex"}},
 		map[string]any{"name": "sonarr", "version": "2.0.0", "human_version": "4.0.9", "upgrade_available": true, "metadata": map[string]any{"title": "Sonarr"}},
@@ -122,7 +125,13 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	}
 	r.ingest(t, events.Event{Kind: events.KindJob, Severity: events.SeverityInfo, Title: "Replication finished", Body: job("replication.run", "SUCCESS"), DedupeKey: "a"})
 	r.ingest(t, events.Event{Kind: events.KindJob, Severity: events.SeverityWarning, Title: "Cloud sync failed", Summary: "Cloud sync failed: key revoked", Body: job("cloudsync.sync", "FAILED"), DedupeKey: "b"})
-	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Pool backup is DEGRADED", DedupeKey: "c"})
+	alert := func(uuid string) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"uuid": uuid})
+		return b
+	}
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityCritical, Title: "Pool backup is DEGRADED", Body: alert("active-1"), DedupeKey: "c"})
+	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityWarning, Title: "Replication of tank failed", Body: alert("gone-1"), DedupeKey: "e"})
+	r.ingest(t, events.Event{Kind: events.KindDisk, Severity: events.SeverityCritical, Title: "Disk sdb failed in backup", DedupeKey: "disk|backup|fault"})
 	r.ingest(t, events.Event{Kind: events.KindJob, Severity: events.SeverityInfo, Title: "Started a scrub", DedupeKey: events.AssistantKey("x", events.AssistantRan)})
 	r.ingest(t, events.Event{Kind: events.KindAlert, Severity: events.SeverityInfo, Title: "Old", DedupeKey: "d", OccurredAt: now.AddDate(0, 0, -9)})
 	_ = r.store.Add(Digest{ID: "last", CreatedAt: now.AddDate(0, 0, -7), AppVersions: map[string]string{"plex": "1.40.5", "sonarr": "4.0.9"}})
@@ -140,11 +149,15 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	if len(d.Scrubs) != 2 || d.Scrubs[0].Title != "tank was scrubbed, with no errors" || !strings.HasPrefix(d.Scrubs[1].Title, "backup hasn't been scrubbed for 8 weeks") {
 		t.Errorf("scrubs = %+v", d.Scrubs)
 	}
-	if len(d.Disks) != 1 || d.Disks[0].Title != "backup is degraded" {
+	if len(d.Disks) != 2 || d.Disks[0].Title != "backup is degraded" || d.Disks[1].Pool != "backup" {
 		t.Errorf("disks = %+v", d.Disks)
 	}
-	if d.Backups.Succeeded != 1 || len(d.Backups.Failed) != 1 || d.Alerts.Raised != 1 || d.Alerts.ActiveNow != 1 || len(d.Alerts.Notable) != 1 {
-		t.Errorf("backups %+v, alerts %+v", d.Backups, d.Alerts)
+	if d.Backups.Succeeded != 1 || len(d.Backups.Failed) != 1 {
+		t.Errorf("backups %+v", d.Backups)
+	}
+	if a := d.Alerts; a.Raised != 2 || a.Cleared != 1 || a.ActiveNow != 1 || len(a.Notable) != 2 ||
+		!a.Notable[0].Bad || a.Notable[1].Bad || a.Notable[1].Detail != "Since cleared" {
+		t.Errorf("alerts %+v", d.Alerts)
 	}
 	if len(d.Apps.Updated) != 1 || d.Apps.Updated[0].Detail != "1.40.5 → 1.41.3" || fmt.Sprint(d.Apps.Available) != "[Sonarr]" {
 		t.Errorf("apps = %+v", d.Apps)
@@ -152,8 +165,13 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	if d.Assistant.Actions != 1 {
 		t.Errorf("assistant = %+v", d.Assistant)
 	}
+	// backup's trouble counts once with its disk event; the cleared
+	// warning doesn't count.
 	if !strings.HasPrefix(d.Headline, "3 things worth a look, first: backup is degraded") {
 		t.Errorf("headline = %q", d.Headline)
+	}
+	if !strings.Contains(r.sum.facts, "2 alerts raised this week, 1 of them since cleared; 1 active now") {
+		t.Errorf("facts:\n%s", r.sum.facts)
 	}
 	if d.Summary != "A quiet week. tank is filling steadily." || !strings.Contains(r.sum.facts, "Pool tank: online, 60% full, +350.0 GB this week") {
 		t.Errorf("summary %q from facts:\n%s", d.Summary, r.sum.facts)
@@ -182,7 +200,7 @@ func TestTheDigestGoesOutOnSundayMorningOnce(t *testing.T) {
 	if _, ok := r.store.Latest(); ok {
 		t.Fatal("went out while it was off")
 	}
-	_ = r.settings.Set(Settings{Enabled: true, Summary: false})
+	_, _ = r.settings.Set(Settings{Enabled: true, Summary: false}, at.AddDate(0, 0, -3))
 	quiet = true
 	runner.check(context.Background())
 	if _, ok := r.store.Latest(); ok {
@@ -207,7 +225,7 @@ func TestTheDigestGoesOutOnSundayMorningOnce(t *testing.T) {
 
 	// A Sunday's digest missed by more than a day waits for the next.
 	r2 := newRig(t)
-	_ = r2.settings.Set(Settings{Enabled: true})
+	_, _ = r2.settings.Set(Settings{Enabled: true}, at.AddDate(0, 0, -3))
 	r2.sources.Now = func() time.Time { return time.Date(2026, 10, 6, 10, 0, 0, 0, sydney) }
 	(&Runner{Sources: r2.sources, Settings: r2.settings, Zone: func(context.Context) *time.Location { return sydney }}).check(context.Background())
 	if _, ok := r2.store.Latest(); ok {
@@ -242,8 +260,11 @@ func TestTheDigestRoutes(t *testing.T) {
 	if code, body := do("GET", "/digest/settings", ""); code != 200 || !strings.Contains(body, `"enabled":false`) || !strings.Contains(body, `"summary":true`) {
 		t.Errorf("settings = %d %s", code, body)
 	}
-	if code, _ := do("PUT", "/digest/settings", `{"enabled":true,"summary":false}`); code != 200 || !r.settings.Get().Enabled {
-		t.Errorf("put = %d", code)
+	if code, body := do("PUT", "/digest/settings", `{"enabled":true,"summary":false}`); code != 200 || !r.settings.Get().Enabled || !strings.Contains(body, `"enabled_at"`) {
+		t.Errorf("put = %d %s", code, body)
+	}
+	if code, _ := do("PUT", "/digest/settings", `{"enabled":true}`); code != 400 {
+		t.Errorf("put without summary = %d", code)
 	}
 	if code, _ := do("GET", "/digest/latest", ""); code != 404 {
 		t.Errorf("latest with none = %d", code)
@@ -257,5 +278,54 @@ func TestTheDigestRoutes(t *testing.T) {
 	}
 	if len(r.store.List()) != 0 {
 		t.Error("a preview was kept")
+	}
+}
+
+func TestTheFirstDigestIsTheSundayAfterItsSwitchedOn(t *testing.T) {
+	r := newRig(t)
+	sydney, _ := time.LoadLocation("Australia/Sydney")
+	sunday := time.Date(2026, 10, 4, 9, 30, 0, 0, sydney)
+	now := sunday
+	r.sources.Now = func() time.Time { return now }
+	runner := &Runner{Sources: r.sources, Settings: r.settings, Zone: func(context.Context) *time.Location { return sydney }}
+
+	// Switched on at 9:10, after this Sunday's was due.
+	settings, _ := r.settings.Set(Settings{Enabled: true, Summary: true}, sunday.Add(-20*time.Minute))
+	runner.check(context.Background())
+	if _, ok := r.store.Latest(); ok {
+		t.Fatal("the digest went out the moment it was switched on")
+	}
+	// Changing the summary setting keeps when it was switched on.
+	if again, _ := r.settings.Set(Settings{Enabled: true, Summary: false}, sunday); !again.EnabledAt.Equal(*settings.EnabledAt) {
+		t.Errorf("switched on at %v, then %v", settings.EnabledAt, again.EnabledAt)
+	}
+	now = sunday.AddDate(0, 0, 7)
+	runner.check(context.Background())
+	if _, ok := r.store.Latest(); !ok {
+		t.Error("no digest the Sunday after")
+	}
+}
+
+func TestADigestThatCouldntBeKeptIsRetriedWithoutTheModel(t *testing.T) {
+	r := newRig(t)
+	dir := filepath.Join(t.TempDir(), "later")
+	store, _ := OpenStore(filepath.Join(dir, "digests.json"))
+	r.sources.Store = store
+	sydney, _ := time.LoadLocation("Australia/Sydney")
+	at := time.Date(2026, 10, 4, 9, 30, 0, 0, sydney)
+	r.sources.Now = func() time.Time { return at }
+	_, _ = r.settings.Set(Settings{Enabled: true, Summary: true}, at.AddDate(0, 0, -3))
+	runner := &Runner{Sources: r.sources, Settings: r.settings, Zone: func(context.Context) *time.Location { return sydney }}
+
+	runner.check(context.Background()) // the directory isn't there
+	if _, ok := store.Latest(); ok || r.sum.calls != 1 {
+		t.Fatalf("kept %v, model asked %d times", ok, r.sum.calls)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner.check(context.Background())
+	if _, ok := store.Latest(); !ok || r.sum.calls != 1 {
+		t.Errorf("kept %v, model asked %d times", ok, r.sum.calls)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // keep is how many weeks are kept.
@@ -111,6 +112,9 @@ func writeFile(path string, data []byte) error {
 type Settings struct {
 	Enabled bool `json:"enabled"`
 	Summary bool `json:"summary"`
+	// EnabledAt is when it was switched on: the first digest is the
+	// Sunday after.
+	EnabledAt *time.Time `json:"enabled_at,omitempty"`
 }
 
 // SettingsStore keeps Settings in a JSON file.
@@ -144,17 +148,27 @@ func (s *SettingsStore) Get() Settings {
 	return s.settings
 }
 
-// Set saves new settings.
-func (s *SettingsStore) Set(next Settings) error {
-	data, err := json.Marshal(next)
-	if err != nil {
-		return err
-	}
+// Set saves new settings, noting when the digest is switched on, and
+// returns them.
+func (s *SettingsStore) Set(next Settings, now time.Time) (Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	switch {
+	case !next.Enabled:
+		next.EnabledAt = nil
+	case s.settings.Enabled && s.settings.EnabledAt != nil:
+		next.EnabledAt = s.settings.EnabledAt
+	default:
+		at := now.UTC().Truncate(time.Second)
+		next.EnabledAt = &at
+	}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return Settings{}, err
+	}
 	if err := writeFile(s.path, data); err != nil {
-		return err
+		return Settings{}, err
 	}
 	s.settings = next
-	return nil
+	return next, nil
 }

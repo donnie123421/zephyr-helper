@@ -28,6 +28,9 @@ type Runner struct {
 	// Quiet reports quiet hours, when the digest waits.
 	Quiet func(time.Time) bool
 	tick  time.Duration
+	// unsaved is a digest put together that couldn't be kept, so a retry
+	// doesn't ask the model again.
+	unsaved *Digest
 }
 
 // Run checks every minute until ctx ends.
@@ -69,21 +72,32 @@ func (r *Runner) check(ctx context.Context) {
 	if now.Sub(due) > lateBy {
 		return
 	}
+	// Switched on after this Sunday's: the first is next Sunday's.
+	if settings.EnabledAt != nil && settings.EnabledAt.After(due) {
+		return
+	}
 	if last, ok := r.Sources.Store.Latest(); ok && !last.CreatedAt.Before(due) {
 		return
 	}
 	if r.Quiet != nil && r.Quiet(now) {
 		return
 	}
-	d, err := r.Sources.Assemble(ctx, settings.Summary)
-	if err != nil {
-		slog.Warn("digest: couldn't put it together", "err", err)
-		return
+	var d Digest
+	if r.unsaved != nil && !r.unsaved.CreatedAt.Before(due) {
+		d = *r.unsaved
+	} else {
+		var err error
+		if d, err = r.Sources.Assemble(ctx, settings.Summary); err != nil {
+			slog.Warn("digest: couldn't put it together", "err", err)
+			return
+		}
 	}
 	if err := r.Sources.Store.Add(d); err != nil {
 		slog.Error("digest: couldn't keep it", "err", err)
+		r.unsaved = &d
 		return
 	}
+	r.unsaved = nil
 	r.announce(ctx, d)
 }
 

@@ -27,17 +27,21 @@ func (h *Handler) getSettings(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
-	var next Settings
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&next); err != nil {
+	var body struct {
+		Enabled *bool `json:"enabled"`
+		Summary *bool `json:"summary"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil || body.Enabled == nil || body.Summary == nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Send enabled and summary."})
 		return
 	}
-	if err := h.Settings.Set(next); err != nil {
+	saved, err := h.Settings.Set(Settings{Enabled: *body.Enabled, Summary: *body.Summary}, h.Sources.now())
+	if err != nil {
 		slog.Error("digest: settings", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "The helper couldn't save that."})
 		return
 	}
-	writeJSON(w, http.StatusOK, next)
+	writeJSON(w, http.StatusOK, saved)
 }
 
 func (h *Handler) latest(w http.ResponseWriter, _ *http.Request) {

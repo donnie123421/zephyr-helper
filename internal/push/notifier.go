@@ -295,6 +295,9 @@ func buildPayload(ev events.Event, quiet bool) pushPayload {
 	// (all pool events for one pool stack, etc.). Refinement later: hash
 	// per-pool, per-app, etc.
 	thread := string(ev.Kind)
+	if strings.HasPrefix(ev.DedupeKey, events.DigestKeyPrefix) {
+		thread = "digest"
+	}
 	return pushPayload{
 		SubscriptionID: "", // filled by Notifier.send
 		InstallToken:   "",
@@ -329,6 +332,10 @@ func interruptionLevelFor(ev events.Event, quiet bool) string {
 }
 
 func categoryFor(ev events.Event) string {
+	// The digest has its own switch, so no notification setting mutes it.
+	if strings.HasPrefix(ev.DedupeKey, events.DigestKeyPrefix) {
+		return "DIGEST"
+	}
 	if ev.Severity == events.SeverityCritical {
 		switch ev.Kind {
 		case events.KindPool:
