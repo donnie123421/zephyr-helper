@@ -176,3 +176,9 @@ func TestAlertsMarkedSeenOnSuccess(t *testing.T) {
 		t.Fatalf("got %d events, want 1", len(list))
 	}
 }
+
+func TestTheJobsPollerAsksForTheNewest(t *testing.T) {
+	if jobsPath != "/core/get_jobs?limit=100&order_by=-id" {
+		t.Errorf("jobsPath = %q", jobsPath)
+	}
+}

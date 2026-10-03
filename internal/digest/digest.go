@@ -45,9 +45,11 @@ type Digest struct {
 	Assistant Assistant  `json:"assistant"`
 	Security  []Item     `json:"security"`
 	System    []Item     `json:"system"`
-	// AppVersions are the apps' versions as of this digest, for the next
-	// one to see what was updated in between.
-	AppVersions map[string]string `json:"app_versions,omitempty"`
+	// AppVersions are the apps' versions as of this digest, and
+	// TrueNASVersion TrueNAS's, for the next one to see what was updated
+	// in between.
+	AppVersions    map[string]string `json:"app_versions,omitempty"`
+	TrueNASVersion string            `json:"truenas_version,omitempty"`
 }
 
 // PoolWeek is a pool's space, how it changed this week, and its forecast.
@@ -199,6 +201,10 @@ func (s Sources) Assemble(ctx context.Context, summary bool) (Digest, error) {
 	w.addStandingAlerts(alerts)
 	w.finish()
 	s.addApps(ctx, &d, kept)
+	s.addTrueNASUpdate(ctx, &d, kept)
+	if w.updatedAt != nil && len(d.System) == 0 {
+		d.System = append(d.System, Item{Title: "TrueNAS was updated", Good: true, At: w.updatedAt})
+	}
 	w.addPoolIssues()
 	d.Issues = len(w.issues)
 	d.Headline = headline(w.issues)
@@ -232,6 +238,8 @@ type week struct {
 	diskIndex map[string]int
 	// raised are the uuids of the alerts raised this week.
 	raised map[string]bool
+	// updatedAt is when an update job was seen to finish.
+	updatedAt *time.Time
 }
 
 // issue is one thing that wants a look. key makes a pool's trouble one
@@ -596,7 +604,9 @@ func (w *week) addEvents(evs []events.Event, alerts map[string]alertRow) {
 		case ev.Kind == events.KindJob:
 			var job jobBody
 			_ = json.Unmarshal(ev.Body, &job)
-			runs := max(ev.Count, 1)
+			// One run per row: a row's count isn't runs, as a helper
+			// restart merges the finished jobs it sees again into it.
+			const runs = 1
 			switch {
 			case backupTasks[job.Method] != "":
 				key, name := taskOf(job)
@@ -623,7 +633,9 @@ func (w *week) addEvents(evs []events.Event, alerts map[string]alertRow) {
 					t.lastError = firstLine(job.Error)
 				}
 			case (job.Method == "update.run" || job.Method == "update.update") && strings.EqualFold(job.State, "SUCCESS"):
-				d.System = append(d.System, Item{Title: "TrueNAS was updated", Good: true, At: &at})
+				// Rarely seen: the job reboots TrueNAS ten seconds after it
+				// finishes. addTrueNASUpdate compares versions instead.
+				w.updatedAt = &at
 			}
 		}
 	}
@@ -795,6 +807,7 @@ func (s Sources) addApps(ctx context.Context, d *Digest, kept []Digest) {
 		Version          string `json:"version"`
 		HumanVersion     string `json:"human_version"`
 		UpgradeAvailable bool   `json:"upgrade_available"`
+		CustomApp        bool   `json:"custom_app"`
 		Metadata         struct {
 			Title string `json:"title"`
 		} `json:"metadata"`
@@ -810,8 +823,9 @@ func (s Sources) addApps(ctx context.Context, d *Digest, kept []Digest) {
 			version = a.Version
 		}
 		d.AppVersions[a.Name] = version
+		// Every custom app's title is "Custom App": its name is its own.
 		title := a.Metadata.Title
-		if title == "" {
+		if title == "" || a.CustomApp {
 			title = a.Name
 		}
 		if was, ok := before[a.Name]; ok && was != version && version != "" {
@@ -828,12 +842,41 @@ func (s Sources) addApps(ctx context.Context, d *Digest, kept []Digest) {
 }
 
 // appVersion is the app's own version from TrueNAS's human version, which
-// adds the package's: "1.41.3_1.0.1" is 1.41.3.
+// adds the package's after the last underscore: "1.41.3_1.0.1" is 1.41.3.
+// The app's own can have underscores of its own.
 func appVersion(human string) string {
-	if i := strings.IndexByte(human, '_'); i > 0 {
+	if i := strings.LastIndexByte(human, '_'); i > 0 {
 		return human[:i]
 	}
 	return human
+}
+
+// addTrueNASUpdate notes TrueNAS updated since the last digest, from its
+// version: the update job reboots TrueNAS seconds after it finishes, so
+// it's rarely seen. Without system.info, the version carries forward.
+func (s Sources) addTrueNASUpdate(ctx context.Context, d *Digest, kept []Digest) {
+	var before string
+	for _, k := range kept {
+		if k.TrueNASVersion != "" {
+			before = k.TrueNASVersion
+			break
+		}
+	}
+	d.TrueNASVersion = before
+	raw, err := s.NAS.Call(ctx, "system.info")
+	if err != nil {
+		return
+	}
+	var info struct {
+		Version string `json:"version"`
+	}
+	if json.Unmarshal(raw, &info) != nil || info.Version == "" {
+		return
+	}
+	d.TrueNASVersion = info.Version
+	if before != "" && before != info.Version {
+		d.System = append(d.System, Item{Title: "TrueNAS was updated", Detail: before + " → " + info.Version, Good: true})
+	}
 }
 
 // ----- the headline and the facts ------------------------------------------------

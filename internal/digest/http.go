@@ -87,7 +87,7 @@ func (h *Handler) preview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.Preview = true
-	d.AppVersions = nil
+	d.AppVersions, d.TrueNASVersion = nil, ""
 	writeJSON(w, http.StatusOK, d)
 }
 

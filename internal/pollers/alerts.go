@@ -127,16 +127,23 @@ func (a *Alerts) poll(ctx context.Context) {
 	}
 }
 
-// fingerprintAlert returns a string that changes when the alert
-// re-fires. Keyed on last_occurrence, falling back to datetime.
+// fingerprintAlert returns a string that changes when the alert really
+// changes: raised anew, or its level or text changed. Not last_occurrence,
+// which TrueNAS moves to now every time the alert's source runs: keyed on
+// that, an alert standing all week made a new event every hour (once the
+// hour's merge window passed), and a critical one a push every hour.
 func fingerprintAlert(a map[string]any) string {
-	if t := parseTrueNASTime(a["last_occurrence"]); !t.IsZero() {
-		return t.Format(time.RFC3339Nano)
+	raised := parseTrueNASTime(a["datetime"])
+	if raised.IsZero() {
+		raised = parseTrueNASTime(a["last_occurrence"])
 	}
-	if t := parseTrueNASTime(a["datetime"]); !t.IsZero() {
-		return t.Format(time.RFC3339Nano)
+	level, _ := a["level"].(string)
+	formatted, _ := a["formatted"].(string)
+	stamp := ""
+	if !raised.IsZero() {
+		stamp = raised.Format(time.RFC3339Nano)
 	}
-	return ""
+	return stamp + "|" + level + "|" + formatted
 }
 
 // alertToEvent converts a TrueNAS /alert/list entry into an Event ready
@@ -158,9 +165,12 @@ func alertToEvent(a map[string]any) (events.Event, bool) {
 		title = title[:117] + "…"
 	}
 
-	occurred := parseTrueNASTime(a["last_occurrence"])
+	// When it was raised: TrueNAS moves last_occurrence to now every time
+	// the alert's source runs (most run every minute), while datetime
+	// stays put as long as the alert does.
+	occurred := parseTrueNASTime(a["datetime"])
 	if occurred.IsZero() {
-		occurred = parseTrueNASTime(a["datetime"])
+		occurred = parseTrueNASTime(a["last_occurrence"])
 	}
 	if occurred.IsZero() {
 		occurred = time.Now().UTC()

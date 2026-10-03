@@ -1,8 +1,10 @@
 package pollers
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/donnie123421/zephyr-helper/internal/events"
 )
@@ -136,20 +138,67 @@ func TestParseTrueNASTime(t *testing.T) {
 	}
 }
 
-func TestFingerprintDetectsRefire(t *testing.T) {
-	a1 := map[string]any{
-		"last_occurrence": map[string]any{"$date": float64(1714000000000)},
+func TestFingerprintIgnoresTheMinutelyTouch(t *testing.T) {
+	alert := func(lastMs float64, level, text string) map[string]any {
+		return map[string]any{
+			"datetime":        map[string]any{"$date": float64(1714000000000)},
+			"last_occurrence": map[string]any{"$date": lastMs},
+			"level":           level, "formatted": text,
+		}
 	}
-	a2 := map[string]any{
-		"last_occurrence": map[string]any{"$date": float64(1714000000000)},
+	a1 := alert(1714000000000, "WARNING", "Pool tank is 85% full")
+	if fingerprintAlert(a1) != fingerprintAlert(alert(1714003600000, "WARNING", "Pool tank is 85% full")) {
+		t.Error("an hour's later last_occurrence counted as a change")
 	}
-	if fingerprintAlert(a1) != fingerprintAlert(a2) {
-		t.Error("same last_occurrence should match")
+	if fingerprintAlert(a1) == fingerprintAlert(alert(1714000000000, "CRITICAL", "Pool tank is 85% full")) {
+		t.Error("a new level wasn't a change")
 	}
-	a3 := map[string]any{
-		"last_occurrence": map[string]any{"$date": float64(1714000060000)},
+	if fingerprintAlert(a1) == fingerprintAlert(alert(1714000000000, "WARNING", "Pool tank is 91% full")) {
+		t.Error("new text wasn't a change")
 	}
-	if fingerprintAlert(a1) == fingerprintAlert(a3) {
-		t.Error("different last_occurrence should differ")
+	raisedAgain := alert(1714100000000, "WARNING", "Pool tank is 85% full")
+	raisedAgain["datetime"] = map[string]any{"$date": float64(1714100000000)}
+	if fingerprintAlert(a1) == fingerprintAlert(raisedAgain) {
+		t.Error("raised again wasn't a change")
+	}
+}
+
+// A standing alert is one event however long it stands, and a helper
+// restart merges into it rather than starting another (which would push a
+// critical again).
+func TestAStandingAlertIsOneEvent(t *testing.T) {
+	store, err := events.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	raised := float64(time.Now().Add(-3 * time.Hour).UnixMilli())
+	list := func(last time.Time) map[string]any {
+		return map[string]any{"alert.list": []any{map[string]any{
+			"uuid": "u-1", "level": "CRITICAL", "klass": "VolumeStatus", "formatted": "Pool backup state is DEGRADED",
+			"datetime": map[string]any{"$date": raised}, "last_occurrence": map[string]any{"$date": float64(last.UnixMilli())},
+			"dismissed": false,
+		}}}
+	}
+	p := NewAlerts(testClient(t, list(time.Now().Add(-3*time.Hour))), store, time.Minute, time.Hour)
+	p.poll(context.Background())
+	// Three hours of TrueNAS touching it every minute, polled hourly here.
+	for h := 2; h >= 0; h-- {
+		p.tn = testClient(t, list(time.Now().Add(-time.Duration(h)*time.Hour)))
+		p.poll(context.Background())
+	}
+	// A restart forgets what it saw.
+	restarted := NewAlerts(testClient(t, list(time.Now())), store, time.Minute, time.Hour)
+	restarted.poll(context.Background())
+
+	evs, err := store.List(context.Background(), events.ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("%d events for one standing alert: %+v", len(evs), evs)
+	}
+	if !evs[0].OccurredAt.Equal(time.UnixMilli(int64(raised)).UTC()) {
+		t.Errorf("occurred %v, raised %v", evs[0].OccurredAt, time.UnixMilli(int64(raised)).UTC())
 	}
 }

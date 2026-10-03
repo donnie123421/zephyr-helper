@@ -367,3 +367,31 @@ func TestPlainText(t *testing.T) {
 		t.Errorf("plainText = %q", got)
 	}
 }
+
+func TestTrueNASUpdatesAreSeenFromItsVersion(t *testing.T) {
+	r := newRig(t)
+	r.nas.set("system.info", map[string]any{"version": "25.04.2.1"})
+	first, _ := r.sources.Assemble(context.Background(), false)
+	if first.TrueNASVersion != "25.04.2.1" || len(first.System) != 0 {
+		t.Fatalf("first: %q %+v", first.TrueNASVersion, first.System)
+	}
+	_ = r.store.Add(first)
+	r.nas.set("system.info", map[string]any{"version": "25.10.0"})
+	next, _ := r.sources.Assemble(context.Background(), false)
+	if len(next.System) != 1 || next.System[0].Detail != "25.04.2.1 → 25.10.0" {
+		t.Errorf("system = %+v", next.System)
+	}
+}
+
+func TestCustomAppsGoByName(t *testing.T) {
+	r := newRig(t)
+	r.nas.set("app.query", []any{map[string]any{"name": "zephyr-helper", "custom_app": true, "human_version": "1.0.0_custom",
+		"upgrade_available": true, "metadata": map[string]any{"title": "Custom App"}}})
+	d, _ := r.sources.Assemble(context.Background(), false)
+	if fmt.Sprint(d.Apps.Available) != "[zephyr-helper]" {
+		t.Errorf("available = %v", d.Apps.Available)
+	}
+	if appVersion("2024_10_1_1.2.3") != "2024_10_1" {
+		t.Errorf("appVersion = %q", appVersion("2024_10_1_1.2.3"))
+	}
+}

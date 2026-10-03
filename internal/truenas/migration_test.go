@@ -91,6 +91,13 @@ func TestMapREST(t *testing.T) {
 			wantParams: []any{[]any{}, map[string]any{"limit": 100}},
 		},
 		{
+			name:       "the jobs poller asks for the newest jobs",
+			httpMethod: "GET",
+			path:       "/core/get_jobs?limit=100&order_by=-id",
+			wantMethod: "core.get_jobs",
+			wantParams: []any{[]any{}, map[string]any{"limit": 100, "order_by": []any{"-id"}}},
+		},
+		{
 			name:       "single-record GET adds id filter and get:true",
 			httpMethod: "GET",
 			path:       "/pool/id/tank",

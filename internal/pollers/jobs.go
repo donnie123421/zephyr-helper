@@ -74,10 +74,14 @@ func (j *Jobs) Run(ctx context.Context) {
 	}
 }
 
+// jobsPath asks for the newest 100 jobs. TrueNAS keeps up to 1,000, oldest
+// first, so without order_by the limit took the oldest: once 100 jobs had
+// run since TrueNAS started, a day or two on most NASes, no new job was
+// ever seen. NASes don't finish 100 jobs in a 2-minute poll.
+const jobsPath = "/core/get_jobs?limit=100&order_by=-id"
+
 func (j *Jobs) poll(ctx context.Context) {
-	// limit=100 bounds a single poll; NASes don't normally finish 100
-	// jobs in a 2-minute window, so this is generous padding.
-	raw, err := j.tn.GetRaw(ctx, "/core/get_jobs?limit=100")
+	raw, err := j.tn.GetRaw(ctx, jobsPath)
 	if err != nil {
 		slog.Warn("jobs: poll", "err", err)
 		return
