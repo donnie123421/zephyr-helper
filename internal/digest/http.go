@@ -12,14 +12,25 @@ type Handler struct {
 	Settings *SettingsStore
 }
 
-// RegisterMux adds the routes, each wrapped (in auth).
+// RegisterMux adds the routes, each wrapped (in auth). Without its files
+// (Settings or Sources.Store nil), every route answers 503 rather than
+// going missing, which the app would read as a helper too old for them.
 func (h *Handler) RegisterMux(mux *http.ServeMux, wrap func(http.Handler) http.Handler) {
-	mux.Handle("GET /digest/settings", wrap(http.HandlerFunc(h.getSettings)))
-	mux.Handle("PUT /digest/settings", wrap(http.HandlerFunc(h.putSettings)))
-	mux.Handle("GET /digest/latest", wrap(http.HandlerFunc(h.latest)))
-	mux.Handle("GET /digests", wrap(http.HandlerFunc(h.list)))
-	mux.Handle("GET /digests/{id}", wrap(http.HandlerFunc(h.get)))
-	mux.Handle("POST /digest/preview", wrap(http.HandlerFunc(h.preview)))
+	route := func(pattern string, f http.HandlerFunc) {
+		mux.Handle(pattern, wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if h.Settings == nil || h.Sources.Store == nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "The helper couldn't open its digest files. Its log says why."})
+				return
+			}
+			f(w, r)
+		})))
+	}
+	route("GET /digest/settings", h.getSettings)
+	route("PUT /digest/settings", h.putSettings)
+	route("GET /digest/latest", h.latest)
+	route("GET /digests", h.list)
+	route("GET /digests/{id}", h.get)
+	route("POST /digest/preview", h.preview)
 }
 
 func (h *Handler) getSettings(w http.ResponseWriter, _ *http.Request) {

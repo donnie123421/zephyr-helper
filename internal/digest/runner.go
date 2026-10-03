@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/donnie123421/zephyr-helper/internal/events"
 )
@@ -17,6 +18,8 @@ const (
 	// lateBy is how long after its time a digest still goes out, as when
 	// the helper was down at 9 am, or quiet hours ran late.
 	lateBy = 24 * time.Hour
+	// minGap is the least time between two digests.
+	minGap = 6 * 24 * time.Hour
 )
 
 // Runner puts the digest together each week, keeps it and announces it.
@@ -31,6 +34,9 @@ type Runner struct {
 	// unsaved is a digest put together that couldn't be kept, so a retry
 	// doesn't ask the model again.
 	unsaved *Digest
+	// unannounced is a digest kept whose notification waits for quiet
+	// hours to end.
+	unannounced *Digest
 }
 
 // Run checks every minute until ctx ends.
@@ -63,12 +69,26 @@ func lastDue(now time.Time, loc *time.Location) time.Time {
 }
 
 func (r *Runner) check(ctx context.Context) {
+	now := r.Sources.now()
+	quiet := r.Quiet != nil && r.Quiet(now)
+	if r.unannounced != nil {
+		if !quiet {
+			r.announce(ctx, *r.unannounced)
+			r.unannounced = nil
+		}
+		return
+	}
 	settings := r.Settings.Get()
 	if !settings.Enabled {
 		return
 	}
-	now := r.Sources.now()
-	due := lastDue(now, r.Zone(ctx))
+	// Without the NAS's time zone there's no knowing when Sunday 9 am is:
+	// wait for it, rather than guess.
+	loc := r.Zone(ctx)
+	if loc == nil {
+		return
+	}
+	due := lastDue(now, loc)
 	if now.Sub(due) > lateBy {
 		return
 	}
@@ -76,10 +96,11 @@ func (r *Runner) check(ctx context.Context) {
 	if settings.EnabledAt != nil && settings.EnabledAt.After(due) {
 		return
 	}
-	if last, ok := r.Sources.Store.Latest(); ok && !last.CreatedAt.Before(due) {
+	// One a week, even if the time zone changes under it.
+	if last, ok := r.Sources.Store.Latest(); ok && (!last.CreatedAt.Before(due) || now.Sub(last.CreatedAt) < minGap) {
 		return
 	}
-	if r.Quiet != nil && r.Quiet(now) {
+	if quiet {
 		return
 	}
 	var d Digest
@@ -93,11 +114,20 @@ func (r *Runner) check(ctx context.Context) {
 		}
 	}
 	if err := r.Sources.Store.Add(d); err != nil {
-		slog.Error("digest: couldn't keep it", "err", err)
+		// Logged once, not every minute of the day it's retried.
+		if r.unsaved == nil || r.unsaved.ID != d.ID {
+			slog.Error("digest: couldn't keep it", "err", err)
+		}
 		r.unsaved = &d
 		return
 	}
 	r.unsaved = nil
+	// Putting it together can take a couple of minutes, with a model: if
+	// quiet hours began meanwhile, the notification waits for them.
+	if r.Quiet != nil && r.Quiet(r.Sources.now()) {
+		r.unannounced = &d
+		return
+	}
 	r.announce(ctx, d)
 }
 
@@ -122,19 +152,24 @@ func (r *Runner) announce(ctx context.Context, d Digest) {
 	}
 }
 
+// firstSentence is the summary's first sentence, for the notification: it
+// ends at a full stop, question or exclamation mark followed by a space
+// or the end, so "grew 350.0 GB" and "1.41.3" stay whole.
 func firstSentence(text string) string {
-	for i, r := range text {
-		if (r == '.' || r == '!' || r == '?') && i > 20 {
-			return text[:i+1]
+	runes := []rune(text)
+	for i, r := range runes {
+		if (r == '.' || r == '!' || r == '?') && i > 20 && (i+1 == len(runes) || unicode.IsSpace(runes[i+1])) {
+			return string(runes[:i+1])
 		}
 	}
-	if len([]rune(text)) > 160 {
-		return string([]rune(text)[:159]) + "…"
+	if len(runes) > 160 {
+		return string(runes[:159]) + "…"
 	}
 	return text
 }
 
-// NASZone reads the NAS's time zone, at most hourly; UTC when it can't.
+// NASZone reads the NAS's time zone, at most hourly. It keeps the last
+// one read when TrueNAS doesn't answer, and is nil until one has been.
 func NASZone(nas Caller) func(context.Context) *time.Location {
 	var (
 		mu   sync.Mutex
@@ -147,8 +182,6 @@ func NASZone(nas Caller) func(context.Context) *time.Location {
 		if loc != nil && time.Since(read) < time.Hour {
 			return loc
 		}
-		read = time.Now()
-		loc = time.UTC
 		raw, err := nas.Call(ctx, "system.general.config")
 		if err != nil {
 			return loc
@@ -156,11 +189,15 @@ func NASZone(nas Caller) func(context.Context) *time.Location {
 		var general struct {
 			Timezone string `json:"timezone"`
 		}
-		if json.Unmarshal(raw, &general) == nil && general.Timezone != "" {
-			if zone, err := time.LoadLocation(general.Timezone); err == nil {
-				loc = zone
-			}
+		if json.Unmarshal(raw, &general) != nil || general.Timezone == "" {
+			return loc
 		}
+		zone, err := time.LoadLocation(general.Timezone)
+		if err != nil {
+			slog.Warn("digest: unknown time zone", "zone", general.Timezone, "err", err)
+			return loc
+		}
+		loc, read = zone, time.Now()
 		return loc
 	}
 }

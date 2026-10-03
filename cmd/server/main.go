@@ -258,29 +258,27 @@ func main() {
 	}
 
 	// The weekly digest. It's off until the app turns it on: it's part of
-	// Zephyr Pro, which the helper can't see.
-	var digestHandler *digest.Handler
+	// Zephyr Pro, which the helper can't see. Without its files, its routes
+	// still answer, with 503.
 	digestStore, storeErr := digest.OpenStore(cfg.DigestPath)
 	digestSettings, settingsErr := digest.OpenSettings(cfg.DigestSettingsPath)
+	digestSources := digest.Sources{NAS: tnClient, Events: eventsStore, Capacity: capacityStore,
+		Summarizer: chatHandler, Store: digestStore}
+	digestHandler := &digest.Handler{Sources: digestSources, Settings: digestSettings}
 	if storeErr != nil || settingsErr != nil {
 		slog.Warn("digest unavailable", "store", storeErr, "settings", settingsErr)
-	} else {
-		sources := digest.Sources{NAS: tnClient, Events: eventsStore, Capacity: capacityStore,
-			Summarizer: chatHandler, Store: digestStore}
-		digestHandler = &digest.Handler{Sources: sources, Settings: digestSettings}
-		if tnClient.Configured() {
-			runner := &digest.Runner{Sources: sources, Settings: digestSettings,
-				Zone: digest.NASZone(tnClient), Quiet: pushPrefs.InQuietHours}
-			go func() {
-				select {
-				case <-pushNotifier.Ready():
-				case <-time.After(15 * time.Second):
-				case <-ctx.Done():
-					return
-				}
-				runner.Run(ctx)
-			}()
-		}
+	} else if tnClient.Configured() {
+		runner := &digest.Runner{Sources: digestSources, Settings: digestSettings,
+			Zone: digest.NASZone(tnClient), Quiet: pushPrefs.InQuietHours}
+		go func() {
+			select {
+			case <-pushNotifier.Ready():
+			case <-time.After(15 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+			runner.Run(ctx)
+		}()
 	}
 
 	// Optional: join the user's tailnet so /remote-access can resolve
@@ -336,11 +334,9 @@ func main() {
 	(&capacity.Handler{Store: capacityStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
-	if digestHandler != nil {
-		digestHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
-			return auth.Require(cfg.PairingToken, h)
-		})
-	}
+	digestHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
 	(&usage.Handler{Store: usageStore}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})

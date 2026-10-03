@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -248,6 +249,41 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Event, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// BetweenMax bounds Between, far above a busy week.
+const BetweenMax = 20000
+
+// Between returns the events that occurred after since and by until,
+// oldest first, for a digest of that time. Unlike List it isn't capped at
+// a page: at most BetweenMax, and if it ever comes to that, warnings and
+// criticals are kept ahead of routine events.
+func (s *Store) Between(ctx context.Context, since, until time.Time) ([]Event, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT id, occurred_at, first_seen, last_seen, count, kind, severity,
+               title, summary, body, dedupe_key, correlates_to, acked_at
+        FROM events WHERE occurred_at > ? AND occurred_at <= ?
+        ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, occurred_at DESC
+        LIMIT ?
+    `, since.UnixMilli(), until.UnixMilli(), BetweenMax)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Event
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].OccurredAt.Before(out[j].OccurredAt) })
+	return out, nil
 }
 
 // Get returns a single event by id, or ErrNotFound.

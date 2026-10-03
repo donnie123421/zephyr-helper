@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,7 +21,8 @@ type Store struct {
 	digests []Digest
 }
 
-// OpenStore reads the file at path; a missing one is an empty store.
+// OpenStore reads the file at path. A missing one is an empty store; an
+// unreadable one is set aside, so the digest carries on without it.
 func OpenStore(path string) (*Store, error) {
 	s := &Store{path: path}
 	data, err := os.ReadFile(path)
@@ -31,9 +33,21 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	if err := json.Unmarshal(data, &s.digests); err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		setAside(path, err)
+		s.digests = nil
 	}
 	return s, nil
+}
+
+// setAside renames a file that can't be read, keeping it for a look, and
+// logs why.
+func setAside(path string, why error) {
+	aside := fmt.Sprintf("%s.unreadable-%d", path, time.Now().Unix())
+	if err := os.Rename(path, aside); err != nil {
+		slog.Error("digest: couldn't set aside an unreadable file", "path", path, "err", err)
+		return
+	}
+	slog.Warn("digest: set aside an unreadable file, starting afresh", "path", path, "aside", aside, "err", why)
 }
 
 // Add keeps a digest, dropping the oldest past keep.
@@ -65,11 +79,12 @@ func (s *Store) Latest() (Digest, bool) {
 	return s.digests[0], true
 }
 
-// List is the digests kept, newest first.
+// List is the digests kept, newest first: empty, not nil, when there are
+// none.
 func (s *Store) List() []Digest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]Digest(nil), s.digests...)
+	return append([]Digest{}, s.digests...)
 }
 
 // Get finds one by id.
@@ -124,8 +139,9 @@ type SettingsStore struct {
 	settings Settings
 }
 
-// OpenSettings reads the file at path; a missing one is off, with the
-// summary on for when it's turned on.
+// OpenSettings reads the file at path. A missing one is off, with the
+// summary on for when it's switched on; an unreadable one is set aside, and
+// off.
 func OpenSettings(path string) (*SettingsStore, error) {
 	s := &SettingsStore{path: path, settings: Settings{Summary: true}}
 	data, err := os.ReadFile(path)
@@ -136,7 +152,8 @@ func OpenSettings(path string) (*SettingsStore, error) {
 		return nil, err
 	}
 	if err := json.Unmarshal(data, &s.settings); err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		setAside(path, err)
+		s.settings = Settings{Summary: true}
 	}
 	return s, nil
 }

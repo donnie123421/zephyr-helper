@@ -29,6 +29,13 @@ func (f *fakeNAS) set(method string, v any) {
 	f.replies[method] = v
 }
 
+// fail makes a method fail, as when TrueNAS doesn't answer.
+func (f *fakeNAS) fail(method string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.replies, method)
+}
+
 func (f *fakeNAS) Call(_ context.Context, method string, _ ...any) (json.RawMessage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -156,11 +163,16 @@ func TestADigestGathersTheWeek(t *testing.T) {
 	if len(d.Disks) != 2 || d.Disks[0].Title != "backup is degraded" || d.Disks[1].Pool != "backup" {
 		t.Errorf("disks = %+v", d.Disks)
 	}
-	if d.Backups.Succeeded != 1 || len(d.Backups.Failed) != 1 {
+	if d.Backups.Succeeded != 1 || len(d.Backups.Failed) != 1 || d.Backups.Failed[0].Title != "Cloud sync failed" || !d.Backups.Failed[0].Bad {
 		t.Errorf("backups %+v", d.Backups)
 	}
-	if a := d.Alerts; a.Raised != 3 || a.Cleared != 1 || a.ActiveNow != 2 || len(a.Notable) != 3 ||
-		a.Notable[0].Pool != "backup" || !a.Notable[1].Bad || a.Notable[2].Bad || a.Notable[2].Warn || a.Notable[2].Detail != "Since cleared" {
+	if d.Issues != 3 {
+		t.Errorf("issues = %d", d.Issues)
+	}
+	// Criticals still active first, newest first; then the cleared one.
+	if a := d.Alerts; a.Raised != 3 || a.Cleared != 1 || a.ActiveNow == nil || *a.ActiveNow != 2 || len(a.Notable) != 3 ||
+		a.Notable[0].Title != "Pool backup is DEGRADED" || !a.Notable[0].Bad || a.Notable[1].Pool != "backup" ||
+		a.Notable[2].Bad || a.Notable[2].Warn || a.Notable[2].Detail != "Since cleared" {
 		t.Errorf("alerts %+v", d.Alerts)
 	}
 	if len(d.Apps.Updated) != 1 || d.Apps.Updated[0].Detail != "1.40.5 → 1.41.3" || fmt.Sprint(d.Apps.Available) != "[Sonarr]" {
@@ -170,7 +182,8 @@ func TestADigestGathersTheWeek(t *testing.T) {
 		t.Errorf("assistant = %+v", d.Assistant)
 	}
 	// backup's trouble counts once with its disk event and its state
-	// alert; the cleared warning doesn't count.
+	// alert; the cleared warning doesn't count; the failing cloud sync
+	// does.
 	if !strings.HasPrefix(d.Headline, "3 things worth a look, first: backup is degraded") {
 		t.Errorf("headline = %q", d.Headline)
 	}

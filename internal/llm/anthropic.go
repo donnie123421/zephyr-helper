@@ -70,6 +70,11 @@ func (a *Anthropic) NewSession(system string, tools []Tool) Session {
 // model's arguments match each schema; the helper's schemas already meet
 // its rules (additionalProperties false, no numeric or length limits).
 func anthropicTools(tools []Tool) []anthropic.ToolUnionParam {
+	// None (the digest's summary) sends no tools field, rather than an
+	// empty one.
+	if len(tools) == 0 {
+		return nil
+	}
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
 	for _, t := range tools {
 		var schema struct {

@@ -2,6 +2,7 @@ package capacity
 
 import (
 	"math"
+	"sort"
 	"time"
 )
 
@@ -21,8 +22,8 @@ type Point struct {
 	Size      int64  `json:"size"`
 }
 
-// Forecast says when a pool will fill, from a straight line through its
-// recent daily history. No model is involved.
+// Forecast says when a pool will fill, from the trend in its recent daily
+// history. No model is involved.
 type Forecast struct {
 	Pool      string  `json:"pool"`
 	Size      int64   `json:"size"`
@@ -46,6 +47,8 @@ type Forecast struct {
 // ForecastFrom reads a forecast from a pool's samples, oldest first, as of
 // now.
 func ForecastFrom(pool string, samples []Sample, now time.Time) Forecast {
+	// The samples are kept by UTC day, so today is too.
+	now = now.UTC()
 	f := Forecast{Pool: pool, Status: "collecting", History: []Point{}}
 	if len(samples) == 0 {
 		return f
@@ -66,30 +69,38 @@ func ForecastFrom(pool string, samples []Sample, now time.Time) Forecast {
 		return f
 	}
 
-	// Least squares over (days since the first sample, allocated bytes).
-	first, err := time.Parse("2006-01-02", samples[0].Day)
-	if err != nil {
-		return f
-	}
-	var n, sx, sy, sxx, sxy float64
+	// The trend is the median of the slopes between every pair of days
+	// (Theil–Sen): unlike least squares, a one-off batch of new files or
+	// a big delete barely moves it. x is in real days, so a missed day
+	// doesn't matter.
+	type reading struct{ day, used float64 }
+	var readings []reading
 	for _, s := range samples {
 		day, err := time.Parse("2006-01-02", s.Day)
 		if err != nil {
 			continue
 		}
-		x := day.Sub(first).Hours() / 24
-		y := float64(s.Allocated)
-		n++
-		sx += x
-		sy += y
-		sxx += x * x
-		sxy += x * y
+		readings = append(readings, reading{float64(day.Unix()) / 86400, float64(s.Allocated)})
 	}
-	denominator := n*sxx - sx*sx
-	if n < MinDays || denominator == 0 {
+	if len(readings) < MinDays {
 		return f
 	}
-	slope := (n*sxy - sx*sy) / denominator
+	slopes := make([]float64, 0, len(readings)*(len(readings)-1)/2)
+	for i := range readings {
+		for j := i + 1; j < len(readings); j++ {
+			if dx := readings[j].day - readings[i].day; dx != 0 {
+				slopes = append(slopes, (readings[j].used-readings[i].used)/dx)
+			}
+		}
+	}
+	if len(slopes) == 0 {
+		return f
+	}
+	sort.Float64s(slopes)
+	slope := slopes[len(slopes)/2]
+	if len(slopes)%2 == 0 {
+		slope = (slopes[len(slopes)/2-1] + slope) / 2
+	}
 	f.PerDay = slope
 
 	// Under 0.01% of the pool a day is a year to fill 3.65%: steady.

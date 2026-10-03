@@ -105,3 +105,29 @@ func TestNoHistoryIsAnEmptyListNotNull(t *testing.T) {
 		t.Errorf("forecast = %s", data)
 	}
 }
+
+func TestABigDeleteBarelyMovesTheTrend(t *testing.T) {
+	// 50 GB a day for 60 days, with 3 TB deleted 20 days ago: least
+	// squares made that about 15 GB a day.
+	f := ForecastFrom("tank", days(60, today, 20*tb, func(i int) int64 {
+		used := 5*tb + int64(i)*50_000_000_000
+		if i >= 40 {
+			used -= 3 * tb
+		}
+		return used
+	}), today)
+	if f.Status != "growing" || f.PerDay < 45e9 || f.PerDay > 55e9 {
+		t.Errorf("per day = %.0f, status %s", f.PerDay, f.Status)
+	}
+}
+
+func TestTheForecastIsTheSameInAnyZone(t *testing.T) {
+	sydney, _ := time.LoadLocation("Australia/Sydney")
+	samples := days(30, today, 10*tb, func(i int) int64 { return 5*tb + int64(i)*tb/20 })
+	inUTC := ForecastFrom("tank", samples, today)
+	// 12:00 UTC is 10 pm in Sydney, still the 3rd; 15:00 UTC is 1 am on the 4th.
+	inSydney := ForecastFrom("tank", samples, today.Add(3*time.Hour).In(sydney))
+	if inUTC.At100 == nil || inSydney.At100 == nil || !inUTC.At100.Equal(*inSydney.At100) {
+		t.Errorf("UTC %v, Sydney %v", inUTC.At100, inSydney.At100)
+	}
+}
