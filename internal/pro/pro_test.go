@@ -78,6 +78,21 @@ func TestOnlySoManyPhonesAreRemembered(t *testing.T) {
 	}
 }
 
+// With the file unwritable (a full /data, say), what a phone says takes
+// effect anyway, until the helper restarts; the error has the phone say it
+// again.
+func TestAnUnwritableFileStillTakesEffect(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(filepath.Join(dir, "pro.json"))
+	now := time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC)
+	_, _ = s.Set("phone", Lapsed, now)
+	s.path = filepath.Join(dir, "missing", "pro.json")
+	state, err := s.Set("phone", Active, now.Add(time.Minute))
+	if err == nil || state.Lapsed || s.Lapsed() {
+		t.Errorf("back with the file unwritable: lapsed %v (now %v), %v", state.Lapsed, s.Lapsed(), err)
+	}
+}
+
 // What's booked runs rather than staying held on a file nobody can read.
 func TestAnUnreadableFileIsntLapsed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pro.json")
@@ -97,14 +112,13 @@ type fakeBookings struct {
 	released time.Time
 }
 
-func (f *fakeBookings) Hold(context.Context) (int, error) {
-	f.held = true
-	return 3, nil
-}
-
-func (f *fakeBookings) Release(_ context.Context, now time.Time) (int, int, error) {
+func (f *fakeBookings) Converge(_ context.Context, lapsed func() bool, now time.Time) (int, int, int, error) {
+	if lapsed() {
+		f.held = true
+		return 3, 0, 0, nil
+	}
 	f.held, f.released = false, now
-	return 2, 1, nil
+	return 0, 2, 1, nil
 }
 
 func TestTheAppsRequests(t *testing.T) {

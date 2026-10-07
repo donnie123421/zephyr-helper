@@ -53,7 +53,7 @@ func TestALapseHoldsWhatsBookedAndItsReturnCarriesOn(t *testing.T) {
 		t.Fatalf("released %d carrying on, %d done with, %v", resumed, expired, err)
 	}
 	if got, _ := r.store.Get(ctx, once.ID); got.NextRun != nil || got.Paused || got.Held || got.LastStatus != "skipped" ||
-		got.LastMessage != passedWhileHeld {
+		got.LastMessage != passedWhileHeld || got.LastRun == nil || !got.LastRun.Equal(r.now) {
 		t.Errorf("the one-off whose time passed: %+v", got)
 	}
 	sydney, _ := time.LoadLocation("Australia/Sydney")
@@ -97,6 +97,46 @@ func TestTheSchedulerCatchesUpWithAReturn(t *testing.T) {
 	r.sched.runDue(ctx)
 	if got, _ := r.store.Get(ctx, job.ID); got.Paused || got.Held {
 		t.Errorf("still held: %+v", got)
+	}
+}
+
+// Deciding and doing happen under one lock: a word that Pro is back,
+// arriving while a tick holds, waits for it, and then releases.
+func TestATickCantUndoARelease(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+	job := r.book(t, Job{Kind: KindAction, Tool: "scrub_pool", Title: "Start a scrub on tank every day at 2:00 pm",
+		When: When{Repeat: "daily", Time: "14:00"}, NextRun: at(r.now.Add(time.Hour))})
+	lapsed := true
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	slowRead := func() bool {
+		v := lapsed
+		close(entered)
+		<-proceed // the word that Pro is back arrives now
+		return v
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _, _, _ = r.store.Converge(ctx, slowRead, r.now)
+		close(done)
+	}()
+	<-entered
+	released := make(chan struct{})
+	go func() {
+		lapsed = false
+		_, _, _, _ = r.store.Converge(ctx, func() bool { return lapsed }, r.now)
+		close(released)
+	}()
+	select {
+	case <-released:
+		t.Fatal("released while a tick was holding")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(proceed)
+	waitFor(t, done)
+	waitFor(t, released)
+	if got, _ := r.store.Get(ctx, job.ID); got.Paused || got.Held {
+		t.Errorf("after the release: %+v", got)
 	}
 }
 

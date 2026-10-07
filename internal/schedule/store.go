@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -66,6 +67,10 @@ type Job struct {
 // Store keeps the jobs in their own SQLite file.
 type Store struct {
 	db *sql.DB
+	// holding serialises deciding whether Zephyr Pro has lapsed and
+	// holding or releasing to match (Converge), so a change made between
+	// the two isn't undone.
+	holding sync.Mutex
 }
 
 // Open prepares the SQLite file at path. Pass ":memory:" for tests.
@@ -224,8 +229,8 @@ func (s *Store) Release(ctx context.Context, now time.Time) (resumed, expired in
 				next.UnixMilli(), job.ID)
 		} else {
 			res, err = s.db.ExecContext(ctx, `
-UPDATE jobs SET paused = 0, held = 0, next_run = NULL, last_status = 'skipped', last_message = ? WHERE id = ? AND held = 1`,
-				passedWhileHeld, job.ID)
+UPDATE jobs SET paused = 0, held = 0, next_run = NULL, last_run = ?, last_status = 'skipped', last_message = ?
+WHERE id = ? AND held = 1`, now.UnixMilli(), passedWhileHeld, job.ID)
 		}
 		if err != nil {
 			return resumed, expired, err
@@ -239,6 +244,25 @@ UPDATE jobs SET paused = 0, held = 0, next_run = NULL, last_status = 'skipped', 
 		}
 	}
 	return resumed, expired, nil
+}
+
+// Converge holds everything booked while lapsed() says Zephyr Pro has
+// lapsed, and releases the lapse's pauses once it doesn't, reading it and
+// acting under one lock: the scheduler's tick and the app's word that Pro
+// is back can't undo each other. It says how many it paused, let carry on,
+// and found done with.
+func (s *Store) Converge(ctx context.Context, lapsed func() bool, now time.Time) (paused, resumed, expired int, err error) {
+	s.holding.Lock()
+	defer s.holding.Unlock()
+	if lapsed() {
+		paused, err = s.Hold(ctx)
+		return paused, 0, 0, err
+	}
+	if n, err := s.HeldCount(ctx); err != nil || n == 0 {
+		return 0, 0, 0, err
+	}
+	resumed, expired, err = s.Release(ctx, now)
+	return 0, resumed, expired, err
 }
 
 // HeldCount is how many jobs the lapse has paused.

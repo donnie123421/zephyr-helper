@@ -105,7 +105,9 @@ func (s *Store) Get() State {
 }
 
 // Set records what a phone says of Pro (Active, Lapsed or Never), and
-// whether that leaves Pro lapsed here, keeping when it first did.
+// whether that leaves Pro lapsed here, keeping when it first did. It holds
+// even when the file can't be written, until the helper restarts: the error
+// says so, so the phone says it again.
 func (s *Store) Set(device, pro string, now time.Time) (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,15 +133,12 @@ func (s *Store) Set(device, pro string, now time.Time) (State, error) {
 			next.Since = &at
 		}
 	}
-	data, err := json.Marshal(next)
-	if err != nil {
-		return State{}, err
-	}
-	if err := writeFile(s.path, data); err != nil {
-		return State{}, err
-	}
 	s.state = next
-	return next, nil
+	data, err := json.Marshal(next)
+	if err == nil {
+		err = writeFile(s.path, data)
+	}
+	return next, err
 }
 
 // writeFile replaces path with data, readable only by the helper, so a
@@ -166,11 +165,11 @@ func writeFile(path string, data []byte) error {
 
 // Bookings is what a lapse holds in the schedule. *schedule.Store is one.
 type Bookings interface {
-	// Hold pauses everything booked, as the lapse's, and says how many.
-	Hold(ctx context.Context) (int, error)
-	// Release lifts the lapse's pauses: how many carry on, and how many
-	// one-offs' times passed meanwhile.
-	Release(ctx context.Context, now time.Time) (resumed, expired int, err error)
+	// Converge holds everything booked while lapsed() says so, and lets
+	// the lapse's pauses go when it doesn't, deciding and doing it under
+	// the one lock the scheduler uses too. It says how many it paused, let
+	// carry on, or found done with (a one-off whose time passed).
+	Converge(ctx context.Context, lapsed func() bool, now time.Time) (paused, resumed, expired int, err error)
 }
 
 // Handler serves the state to the app: GET /pro, and PUT /pro, which the
@@ -235,26 +234,25 @@ func (h *Handler) put(w http.ResponseWriter, r *http.Request) {
 	if h.now != nil {
 		now = h.now
 	}
-	state, err := h.Store.Set(body.Device, body.Pro, now())
-	if err != nil {
-		slog.Error("pro: couldn't save", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "The helper couldn't save that."})
-		return
-	}
+	state, saveErr := h.Store.Set(body.Device, body.Pro, now())
 	result := putResult{view: view{Lapsed: state.Lapsed, Since: state.Since}}
 	if h.Bookings != nil {
 		// The scheduler does the same on its next tick, so a failure here
 		// is caught up with in half a minute.
-		if state.Lapsed {
-			result.Paused, err = h.Bookings.Hold(r.Context())
-		} else {
-			result.Resumed, result.Expired, err = h.Bookings.Release(r.Context(), now())
-		}
+		var err error
+		result.Paused, result.Resumed, result.Expired, err = h.Bookings.Converge(r.Context(), h.Store.Lapsed, now())
 		if err != nil {
 			slog.Error("pro: couldn't change what's booked; the scheduler will", "lapsed", state.Lapsed, "err", err)
 		}
 	}
 	slog.Info("pro: a phone says", "pro", body.Pro, "lapsed", state.Lapsed, "paused", result.Paused, "resumed", result.Resumed, "expired", result.Expired)
+	if saveErr != nil {
+		// In effect until the helper restarts; failing, the phone says it
+		// again later.
+		slog.Error("pro: couldn't save", "err", saveErr)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "The helper couldn't save that."})
+		return
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 

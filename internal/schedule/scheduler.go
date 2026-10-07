@@ -135,17 +135,17 @@ func (s *Scheduler) interrupted(ctx context.Context) {
 func (s *Scheduler) runDue(ctx context.Context) {
 	now := s.now()
 	// The request that changes it holds or releases what's booked; this
-	// catches up with anything it didn't get to.
-	if s.Held != nil && s.Held() {
-		if _, err := s.store.Hold(ctx); err != nil {
-			slog.Error("schedule: couldn't hold what's booked", "err", err)
-		}
-		return
+	// catches up with anything it didn't get to, including what's booked
+	// while held.
+	held := s.Held
+	if held == nil {
+		held = func() bool { return false }
 	}
-	if n, err := s.store.HeldCount(ctx); err == nil && n > 0 {
-		if _, _, err := s.store.Release(ctx, now); err != nil {
-			slog.Error("schedule: couldn't release what was held", "err", err)
-		}
+	if _, _, _, err := s.store.Converge(ctx, held, now); err != nil {
+		slog.Error("schedule: couldn't hold or release what's booked", "err", err)
+	}
+	if held() {
+		return
 	}
 	due, err := s.store.Due(ctx, now)
 	if err != nil {
