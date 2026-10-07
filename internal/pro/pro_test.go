@@ -3,6 +3,7 @@ package pro
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,11 +20,11 @@ func TestTheStateLastsAcrossARestart(t *testing.T) {
 		t.Fatalf("a new helper: lapsed %v, %v", s.Lapsed(), err)
 	}
 	first := time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC)
-	if _, err := s.Set(true, first); err != nil {
+	if _, err := s.Set("phone", Lapsed, first); err != nil {
 		t.Fatal(err)
 	}
 	// Said again, it keeps when Pro first lapsed.
-	state, _ := s.Set(true, first.Add(time.Hour))
+	state, _ := s.Set("phone", Lapsed, first.Add(time.Hour))
 	if !state.Lapsed || state.Since == nil || !state.Since.Equal(first) {
 		t.Errorf("state = %+v", state)
 	}
@@ -31,11 +32,49 @@ func TestTheStateLastsAcrossARestart(t *testing.T) {
 	if got := again.Get(); !got.Lapsed || !got.Since.Equal(first) {
 		t.Errorf("after a restart: %+v", got)
 	}
-	if state, _ := again.Set(false, first.Add(2*time.Hour)); state.Lapsed || state.Since != nil {
+	if state, _ := again.Set("phone", Active, first.Add(2*time.Hour)); state.Lapsed || state.Since != nil {
 		t.Errorf("back: %+v", state)
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 		t.Errorf("mode %v", info.Mode().Perm())
+	}
+}
+
+// One household member's lapsed trial doesn't pause what another pays
+// for: it's lapsed while some phone says so and none says it's active.
+func TestEachPhoneSaysForItsOwnAccount(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "pro.json"))
+	now := time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC)
+	steps := []struct {
+		device, pro string
+		lapsed      bool
+	}{
+		{"never", Never, false},
+		{"trial", Lapsed, true},
+		{"payer", Active, false},
+		{"trial", Lapsed, false},
+		{"payer", Lapsed, true},
+		{"never", Never, true},
+		{"payer", Active, false},
+	}
+	for i, step := range steps {
+		state, err := s.Set(step.device, step.pro, now.Add(time.Duration(i)*time.Minute))
+		if err != nil || state.Lapsed != step.lapsed {
+			t.Errorf("step %d (%s says %s): lapsed %v, %v", i, step.device, step.pro, state.Lapsed, err)
+		}
+	}
+}
+
+func TestOnlySoManyPhonesAreRemembered(t *testing.T) {
+	s, _ := Open(filepath.Join(t.TempDir(), "pro.json"))
+	now := time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC)
+	_, _ = s.Set("first", Lapsed, now)
+	for i := 0; i < maxDevices; i++ {
+		_, _ = s.Set(fmt.Sprint("phone", i), Never, now.Add(time.Duration(i+1)*time.Minute))
+	}
+	state := s.Get()
+	if len(state.Devices) != maxDevices || state.Lapsed {
+		t.Errorf("%d phones, lapsed %v: the oldest goes first", len(state.Devices), state.Lapsed)
 	}
 }
 
@@ -88,18 +127,21 @@ func TestTheAppsRequests(t *testing.T) {
 		return resp.StatusCode, got
 	}
 
-	if code, got := do("PUT", `{"lapsed": true}`); code != 200 || got["lapsed"] != true || got["paused"] != 3.0 || !bookings.held {
+	if code, got := do("PUT", `{"device": "phone", "pro": "lapsed"}`); code != 200 || got["lapsed"] != true || got["paused"] != 3.0 || !bookings.held {
 		t.Errorf("lapsed = %d %v", code, got)
 	}
-	if code, got := do("GET", ""); code != 200 || got["lapsed"] != true || got["since"] == nil {
+	if code, got := do("GET", ""); code != 200 || got["lapsed"] != true || got["since"] == nil || got["devices"] != nil {
 		t.Errorf("get = %d %v", code, got)
 	}
-	if code, got := do("PUT", `{"lapsed": false}`); code != 200 || got["lapsed"] != false || got["resumed"] != 2.0 ||
+	if code, got := do("PUT", `{"device": "phone", "pro": "active"}`); code != 200 || got["lapsed"] != false || got["resumed"] != 2.0 ||
 		got["expired"] != 1.0 || bookings.held || !bookings.released.Equal(now) {
 		t.Errorf("back = %d %v", code, got)
 	}
-	if code, _ := do("PUT", `{}`); code != 400 {
-		t.Errorf("no lapsed = %d", code)
+	for _, bad := range []string{`{}`, `{"device": "phone"}`, `{"device": "phone", "pro": "maybe"}`, `{"pro": "active"}`,
+		`{"device": "` + strings.Repeat("x", 65) + `", "pro": "active"}`} {
+		if code, _ := do("PUT", bad); code != 400 {
+			t.Errorf("%s = %d", bad, code)
+		}
 	}
 
 	// Without its file the routes answer, with 503, rather than going
