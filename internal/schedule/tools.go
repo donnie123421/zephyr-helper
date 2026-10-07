@@ -89,19 +89,7 @@ func (a approved) card() tools.Card {
 
 // book books an approved card of the kind.
 func (b Booking) book(ctx context.Context, raw json.RawMessage, kind Kind) (tools.Outcome, error) {
-	var a approved
-	if err := strict(raw, &a); err != nil || a.Kind != kind || a.Title == "" {
-		return tools.Outcome{}, errors.New("that isn't a booking card")
-	}
-	if err := a.When.Validate(); err != nil {
-		return tools.Outcome{}, err
-	}
-	first, err := within(a.When, b.Now())
-	if err != nil {
-		return tools.Outcome{}, err
-	}
-	job, err := b.Store.Add(ctx, Job{Kind: a.Kind, Tool: a.Tool, Arguments: a.Arguments, Title: a.Title,
-		Detail: a.Detail, Risk: string(a.Risk), When: a.When, NextRun: &first})
+	job, err := b.bookJob(ctx, raw, kind)
 	if err != nil {
 		return tools.Outcome{}, err
 	}
@@ -109,6 +97,56 @@ func (b Booking) book(ctx context.Context, raw json.RawMessage, kind Kind) (tool
 		return tools.Outcome{Message: "Booked: " + job.Title + "."}, nil
 	}
 	return tools.Outcome{Message: "Set up: " + job.Title + "."}, nil
+}
+
+// bookJob books an approved card of the kind, and returns it booked.
+func (b Booking) bookJob(ctx context.Context, raw json.RawMessage, kind Kind) (Job, error) {
+	job, err := b.jobFor(raw, kind)
+	if err != nil {
+		return Job{}, err
+	}
+	return b.Store.Add(ctx, job)
+}
+
+// jobFor is the job an approved card of the kind books, its first run
+// worked out now.
+func (b Booking) jobFor(raw json.RawMessage, kind Kind) (Job, error) {
+	var a approved
+	if err := strict(raw, &a); err != nil || a.Kind != kind || a.Title == "" {
+		return Job{}, errors.New("that isn't a booking card")
+	}
+	if err := a.When.Validate(); err != nil {
+		return Job{}, err
+	}
+	first, err := within(a.When, b.Now())
+	if err != nil {
+		return Job{}, err
+	}
+	return Job{Kind: a.Kind, Tool: a.Tool, Arguments: a.Arguments, Title: a.Title,
+		Detail: a.Detail, Risk: string(a.Risk), When: a.When, NextRun: &first}, nil
+}
+
+// bookingKinds are the booking tools, by name, and the kind each books:
+// what the app's own booking (Handler) can ask for.
+var bookingKinds = map[string]Kind{
+	"schedule_action":    KindAction,
+	"create_update_rule": KindUpdateRule,
+	"create_checkin":     KindCheckIn,
+}
+
+// describe writes the card a booking tool would, for its arguments.
+func (b Booking) describe(ctx context.Context, name string, raw json.RawMessage) (tools.Card, Kind, error) {
+	kind, ok := bookingKinds[name]
+	if !ok {
+		return tools.Card{}, "", fmt.Errorf("%s isn't a way to book something", name)
+	}
+	for _, tool := range b.Tools() {
+		if tool.Def.Name == name && tool.Action != nil {
+			card, err := tool.Action.Describe(ctx, raw)
+			return card, kind, err
+		}
+	}
+	return tools.Card{}, "", fmt.Errorf("%s isn't available", name)
 }
 
 // strict decodes JSON into v, refusing fields v doesn't have.

@@ -130,16 +130,19 @@ func main() {
 	// update rule and check-ins. Booking takes the same approval cards as
 	// actions, so its tools come with them.
 	var scheduler *schedule.Scheduler
+	var booking *schedule.Booking
 	scheduleStore, err := schedule.Open(cfg.ScheduleDBPath)
 	if err != nil {
 		slog.Warn("schedule store open; nothing can be booked", "err", err, "path", cfg.ScheduleDBPath)
 	} else {
 		defer scheduleStore.Close()
 		if actionLog != nil {
-			toolRegistry.Add(schedule.Booking{
+			// The same booking for a chat's cards and the app's own.
+			booking = &schedule.Booking{
 				Store: scheduleStore, Registry: toolRegistry, NAS: tnClient,
 				Model: func() (string, bool) { return modelLabel(llmSwitch.Current()) },
-			}.Tools()...)
+			}
+			toolRegistry.Add(booking.Tools()...)
 			scheduler = schedule.New(scheduleStore, toolRegistry, actionLog, eventsStore, tnClient, chatHandler)
 			scheduler.Held = proState.Lapsed
 		}
@@ -338,7 +341,7 @@ func main() {
 		return auth.Require(cfg.PairingToken, h)
 	})
 	// The same goes for the month's token counts.
-	(&schedule.Handler{Store: scheduleStore, Scheduler: scheduler}).RegisterMux(mux, func(h http.Handler) http.Handler {
+	(&schedule.Handler{Store: scheduleStore, Scheduler: scheduler, Booking: booking}).RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
 	(&capacity.Handler{Store: capacityStore}).RegisterMux(mux, func(h http.Handler) http.Handler {

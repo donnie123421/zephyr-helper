@@ -5,15 +5,22 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/donnie123421/zephyr-helper/internal/tools"
 )
 
 // Handler serves what's booked to the app's Scheduled screen: the list,
-// and pause, resume, run now and remove. Nothing is booked here; that
-// takes a card approved in a chat.
+// and pause, resume, run now and remove. It books and edits too, through
+// the same tools a chat does: the app asks for the card (preview), shows
+// it, and books it only as it was shown.
 type Handler struct {
 	Store     *Store
 	Scheduler *Scheduler
+	// Booking is nil when the helper can't book: it isn't connected to
+	// TrueNAS.
+	Booking *Booking
 }
 
 // RegisterMux adds the routes, each wrapped (in auth).
@@ -23,6 +30,9 @@ func (h *Handler) RegisterMux(mux *http.ServeMux, wrap func(http.Handler) http.H
 	mux.Handle("POST /schedules/{id}/resume", wrap(http.HandlerFunc(h.resume)))
 	mux.Handle("POST /schedules/{id}/run", wrap(http.HandlerFunc(h.runNow)))
 	mux.Handle("DELETE /schedules/{id}", wrap(http.HandlerFunc(h.remove)))
+	mux.Handle("POST /schedules/preview", wrap(http.HandlerFunc(h.preview)))
+	mux.Handle("POST /schedules", wrap(http.HandlerFunc(h.create)))
+	mux.Handle("PUT /schedules/{id}", wrap(http.HandlerFunc(h.edit)))
 }
 
 // jobView is a job as the app shows it.
@@ -45,6 +55,11 @@ type jobView struct {
 	LastStatus  string     `json:"last_status,omitempty"`
 	LastMessage string     `json:"last_message,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
+	// Tool, Arguments and When are what it does and when, for the app's
+	// editor.
+	Tool      string          `json:"tool,omitempty"`
+	Arguments json.RawMessage `json:"arguments,omitempty"`
+	When      When            `json:"when"`
 }
 
 func (h *Handler) view(job Job) jobView {
@@ -67,7 +82,126 @@ func (h *Handler) view(job Job) jobView {
 		NextRun: trunc(job.NextRun), Paused: job.Paused, Held: job.Held, Running: running,
 		LastRun: trunc(job.LastRun), LastStatus: job.LastStatus, LastMessage: job.LastMessage,
 		CreatedAt: job.CreatedAt.UTC().Truncate(time.Second),
+		Tool:      job.Tool, Arguments: job.Arguments, When: job.When,
 	}
+}
+
+// bookingRequest is what the app asks to book: one of the booking tools,
+// with what a chat would send it. Title and Detail are the card the app
+// showed, for create and edit: it's booked only if the card is the same
+// now.
+type bookingRequest struct {
+	Tool      string          `json:"tool"`
+	Arguments json.RawMessage `json:"arguments"`
+	Title     string          `json:"title"`
+	Detail    string          `json:"detail"`
+}
+
+// cardView is a booking's card as the app shows it, with the NAS's time
+// zone, which its times are in, and its first run.
+type cardView struct {
+	Title    string     `json:"title"`
+	Detail   string     `json:"detail"`
+	Risk     string     `json:"risk"`
+	Zone     string     `json:"zone"`
+	FirstRun *time.Time `json:"first_run,omitempty"`
+}
+
+// card reads the request and writes its card, or answers why it can't.
+func (h *Handler) card(w http.ResponseWriter, r *http.Request) (bookingRequest, tools.Card, Kind, cardView, bool) {
+	var req bookingRequest
+	if h.Booking == nil || h.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "The helper can't book anything: it isn't connected to TrueNAS."})
+		return req, tools.Card{}, "", cardView{}, false
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil || req.Tool == "" || len(req.Arguments) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Send tool and arguments."})
+		return req, tools.Card{}, "", cardView{}, false
+	}
+	b := *h.Booking
+	if b.Now == nil {
+		b.Now = time.Now
+	}
+	card, kind, err := b.describe(r.Context(), req.Tool, req.Arguments)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": upperFirst(strings.TrimSuffix(err.Error(), ".")) + "."})
+		return req, tools.Card{}, "", cardView{}, false
+	}
+	view := cardView{Title: card.Title, Detail: card.Detail, Risk: string(card.Risk)}
+	if job, err := b.jobFor(card.Args, kind); err == nil {
+		view.Zone, view.FirstRun = job.When.Zone, job.NextRun
+	}
+	return req, card, kind, view, true
+}
+
+// preview is the card a booking would be approved on.
+func (h *Handler) preview(w http.ResponseWriter, r *http.Request) {
+	if _, _, _, view, ok := h.card(w, r); ok {
+		writeJSON(w, http.StatusOK, view)
+	}
+}
+
+// shown says whether the card is the one the app showed. It's 409 with
+// the card as it is now when it isn't: the NAS, or the day, changed.
+func shown(w http.ResponseWriter, req bookingRequest, view cardView) bool {
+	if req.Title == view.Title && req.Detail == view.Detail {
+		return true
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{"error": "It's changed since you looked. Check it again.", "card": view})
+	return false
+}
+
+func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
+	req, card, kind, view, ok := h.card(w, r)
+	if !ok || !shown(w, req, view) {
+		return
+	}
+	b := *h.Booking
+	if b.Now == nil {
+		b.Now = time.Now
+	}
+	job, err := b.bookJob(r.Context(), card.Args, kind)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": upperFirst(strings.TrimSuffix(err.Error(), ".")) + "."})
+		return
+	}
+	writeJSON(w, http.StatusCreated, h.view(job))
+}
+
+// edit replaces what a booking does and when, approved on its new card.
+func (h *Handler) edit(w http.ResponseWriter, r *http.Request) {
+	if h.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "The helper couldn't open its schedule."})
+		return
+	}
+	old, err := h.Store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		h.failed(w, err)
+		return
+	}
+	req, card, kind, view, ok := h.card(w, r)
+	if !ok || !shown(w, req, view) {
+		return
+	}
+	b := *h.Booking
+	if b.Now == nil {
+		b.Now = time.Now
+	}
+	job, err := b.jobFor(card.Args, kind)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": upperFirst(strings.TrimSuffix(err.Error(), ".")) + "."})
+		return
+	}
+	if err := h.Store.Replace(r.Context(), old.ID, job); err != nil {
+		h.failed(w, err)
+		return
+	}
+	edited, err := h.Store.Get(r.Context(), old.ID)
+	if err != nil {
+		h.failed(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, h.view(edited))
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {

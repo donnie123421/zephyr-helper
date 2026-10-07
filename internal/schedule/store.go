@@ -272,6 +272,23 @@ func (s *Store) HeldCount(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// Replace changes what a job does and when, as an edit approved on a new
+// card does. It runs next at job.NextRun, keeping its history and whether
+// it's paused.
+func (s *Store) Replace(ctx context.Context, id string, job Job) error {
+	if len(job.Arguments) == 0 {
+		job.Arguments = json.RawMessage(`{}`)
+	}
+	when, err := json.Marshal(job.When)
+	if err != nil {
+		return err
+	}
+	return s.exec(ctx, `
+UPDATE jobs SET kind = ?, tool = ?, arguments = ?, title = ?, detail = ?, risk = ?, when_json = ?, next_run = ?
+WHERE id = ?`, string(job.Kind), job.Tool, string(job.Arguments), job.Title, job.Detail, job.Risk, string(when),
+		millis(job.NextRun), id)
+}
+
 // Delete removes a job.
 func (s *Store) Delete(ctx context.Context, id string) error {
 	return s.exec(ctx, `DELETE FROM jobs WHERE id = ?`, id)
