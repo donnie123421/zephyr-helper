@@ -70,6 +70,10 @@ type Scheduler struct {
 	base context.Context
 	// timing for the update rule; shortened in tests.
 	ruleTiming ruleTiming
+
+	// Held says Zephyr Pro has lapsed, as the app reported: nothing booked
+	// runs, and whatever is booked meanwhile is held too. Nil: never.
+	Held func() bool
 }
 
 // New builds a scheduler. checkIns may be nil, when there's no model to
@@ -130,6 +134,19 @@ func (s *Scheduler) interrupted(ctx context.Context) {
 
 func (s *Scheduler) runDue(ctx context.Context) {
 	now := s.now()
+	// The request that changes it holds or releases what's booked; this
+	// catches up with anything it didn't get to.
+	if s.Held != nil && s.Held() {
+		if _, err := s.store.Hold(ctx); err != nil {
+			slog.Error("schedule: couldn't hold what's booked", "err", err)
+		}
+		return
+	}
+	if n, err := s.store.HeldCount(ctx); err == nil && n > 0 {
+		if _, _, err := s.store.Release(ctx, now); err != nil {
+			slog.Error("schedule: couldn't release what was held", "err", err)
+		}
+	}
 	due, err := s.store.Due(ctx, now)
 	if err != nil {
 		slog.Error("schedule: couldn't read due jobs", "err", err)
@@ -172,6 +189,9 @@ func (s *Scheduler) startDue(ctx context.Context, job Job, now time.Time) {
 // RunNow runs a job straight away, as the app's Run Now does, leaving its
 // schedule as it is.
 func (s *Scheduler) RunNow(ctx context.Context, id string) error {
+	if s.Held != nil && s.Held() {
+		return errors.New("Zephyr Pro has ended, so nothing booked runs until it's back")
+	}
 	job, err := s.store.Get(ctx, id)
 	if err != nil {
 		return err

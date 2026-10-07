@@ -47,6 +47,8 @@ type Config struct {
 	// the digest is on.
 	DigestPath         string
 	DigestSettingsPath string
+	// ProStatePath keeps whether Zephyr Pro has lapsed, as the app said.
+	ProStatePath string
 	// ConversationsDBPath is the SQLite file holding the assistant's saved
 	// chats, readable only by the helper.
 	ConversationsDBPath string
@@ -128,6 +130,7 @@ func Load() (*Config, error) {
 	cfg.ScheduleDBPath = filepath.Join(cfg.DataDir, "schedule.db")
 	cfg.DigestPath = filepath.Join(cfg.DataDir, "digests.json")
 	cfg.DigestSettingsPath = filepath.Join(cfg.DataDir, "digest-settings.json")
+	cfg.ProStatePath = filepath.Join(cfg.DataDir, "pro.json")
 
 	// The in-app install always supplies PAIRING_TOKEN. For manual installs,
 	// mint one and print it so the operator can pair by hand.

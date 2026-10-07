@@ -10,6 +10,19 @@ import (
 type Handler struct {
 	Sources  Sources
 	Settings *SettingsStore
+	// Held says Zephyr Pro has lapsed: the digest is on, but none goes out.
+	Held func() bool
+}
+
+// settingsView is the settings as the app sees them: with whether the
+// digest is on but held, as it is while Zephyr Pro has lapsed.
+type settingsView struct {
+	Settings
+	Held bool `json:"held"`
+}
+
+func (h *Handler) view(s Settings) settingsView {
+	return settingsView{Settings: s, Held: s.Enabled && h.Held != nil && h.Held()}
 }
 
 // RegisterMux adds the routes, each wrapped (in auth). Without its files
@@ -34,7 +47,7 @@ func (h *Handler) RegisterMux(mux *http.ServeMux, wrap func(http.Handler) http.H
 }
 
 func (h *Handler) getSettings(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.Settings.Get())
+	writeJSON(w, http.StatusOK, h.view(h.Settings.Get()))
 }
 
 func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +65,7 @@ func (h *Handler) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "The helper couldn't save that."})
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, h.view(saved))
 }
 
 func (h *Handler) latest(w http.ResponseWriter, _ *http.Request) {

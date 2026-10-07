@@ -35,9 +35,11 @@ type jobView struct {
 	Repeats  bool   `json:"repeats"`
 	Schedule string `json:"schedule"`
 	// Zone is the time zone Schedule is in: the NAS's when it was booked.
-	Zone        string     `json:"zone"`
-	NextRun     *time.Time `json:"next_run,omitempty"`
-	Paused      bool       `json:"paused"`
+	Zone    string     `json:"zone"`
+	NextRun *time.Time `json:"next_run,omitempty"`
+	Paused  bool       `json:"paused"`
+	// Held: paused because Zephyr Pro has lapsed, until it's back.
+	Held        bool       `json:"held"`
 	Running     bool       `json:"running"`
 	LastRun     *time.Time `json:"last_run,omitempty"`
 	LastStatus  string     `json:"last_status,omitempty"`
@@ -62,7 +64,7 @@ func (h *Handler) view(job Job) jobView {
 	return jobView{
 		ID: job.ID, Kind: job.Kind, Title: job.Title, Detail: job.Detail, Risk: job.Risk,
 		Repeats: job.When.Repeat != "once", Schedule: job.When.Phrase(), Zone: job.When.Zone,
-		NextRun: trunc(job.NextRun), Paused: job.Paused, Running: running,
+		NextRun: trunc(job.NextRun), Paused: job.Paused, Held: job.Held, Running: running,
 		LastRun: trunc(job.LastRun), LastStatus: job.LastStatus, LastMessage: job.LastMessage,
 		CreatedAt: job.CreatedAt.UTC().Truncate(time.Second),
 	}

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -52,6 +53,9 @@ type Job struct {
 	// NextRun is nil once a one-off has run, or been missed.
 	NextRun *time.Time `json:"next_run,omitempty"`
 	Paused  bool       `json:"paused"`
+	// Held is a pause Zephyr Pro lapsing made (Hold), lifted when it's
+	// back (Release). A pause made by hand isn't, and outlasts it.
+	Held    bool       `json:"held"`
 	LastRun *time.Time `json:"last_run,omitempty"`
 	// LastStatus is running, done, started, failed, skipped, missed or
 	// interrupted (the helper stopped partway through a run).
@@ -92,12 +96,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at   INTEGER NOT NULL,
     next_run     INTEGER,
     paused       INTEGER NOT NULL DEFAULT 0,
+    held         INTEGER NOT NULL DEFAULT 0,
     last_run     INTEGER,
     last_status  TEXT NOT NULL DEFAULT '',
     last_message TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS jobs_next_run ON jobs(next_run);`
 	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("schema: %w", err)
+	}
+	// Files from before held (0.3.0-rc.13) gain it.
+	if _, err := db.Exec(`ALTER TABLE jobs ADD COLUMN held INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
 		_ = db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
@@ -145,7 +156,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	return job, nil
 }
 
-const columns = `id, kind, tool, arguments, title, detail, risk, when_json, created_at, next_run, paused, last_run, last_status, last_message`
+const columns = `id, kind, tool, arguments, title, detail, risk, when_json, created_at, next_run, paused, last_run, last_status, last_message, held`
 
 // List is every job, the next to run first, then those done.
 func (s *Store) List(ctx context.Context) ([]Job, error) {
@@ -170,14 +181,71 @@ func (s *Store) Get(ctx context.Context, id string) (Job, error) {
 	return jobs[0], nil
 }
 
-// Pause stops a job running until it's resumed.
+// Pause stops a job running until it's resumed. A pause made by hand
+// outlasts a lapse of Zephyr Pro, so it's no longer the lapse's.
 func (s *Store) Pause(ctx context.Context, id string) error {
-	return s.exec(ctx, `UPDATE jobs SET paused = 1 WHERE id = ?`, id)
+	return s.exec(ctx, `UPDATE jobs SET paused = 1, held = 0 WHERE id = ?`, id)
 }
 
 // Resume lets a job run again, next at next.
 func (s *Store) Resume(ctx context.Context, id string, next time.Time) error {
-	return s.exec(ctx, `UPDATE jobs SET paused = 0, next_run = ? WHERE id = ?`, next.UnixMilli(), id)
+	return s.exec(ctx, `UPDATE jobs SET paused = 0, held = 0, next_run = ? WHERE id = ?`, next.UnixMilli(), id)
+}
+
+// passedWhileHeld is why a one-off held past its time didn't run.
+const passedWhileHeld = "It was due while Zephyr Pro was off, so it didn't run."
+
+// Hold pauses everything booked that isn't paused already, as Zephyr Pro
+// lapsing does, marking the pauses as the lapse's so that Release lifts
+// those and not a pause made by hand. It says how many it paused.
+func (s *Store) Hold(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET paused = 1, held = 1 WHERE paused = 0 AND next_run IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// Release lifts the lapse's pauses, each job carrying on from its next
+// time after now: a repeating one skips the runs the lapse kept from it,
+// and a one-off whose time passed meanwhile is done with, as skipped. It
+// says how many carry on, and how many were done with.
+func (s *Store) Release(ctx context.Context, now time.Time) (resumed, expired int, err error) {
+	jobs, err := s.query(ctx, `SELECT `+columns+` FROM jobs WHERE held = 1`)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, job := range jobs {
+		var res sql.Result
+		next, due := job.When.Next(now)
+		if due {
+			res, err = s.db.ExecContext(ctx, `UPDATE jobs SET paused = 0, held = 0, next_run = ? WHERE id = ? AND held = 1`,
+				next.UnixMilli(), job.ID)
+		} else {
+			res, err = s.db.ExecContext(ctx, `
+UPDATE jobs SET paused = 0, held = 0, next_run = NULL, last_status = 'skipped', last_message = ? WHERE id = ? AND held = 1`,
+				passedWhileHeld, job.ID)
+		}
+		if err != nil {
+			return resumed, expired, err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			if due {
+				resumed++
+			} else {
+				expired++
+			}
+		}
+	}
+	return resumed, expired, nil
+}
+
+// HeldCount is how many jobs the lapse has paused.
+func (s *Store) HeldCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE held = 1`).Scan(&n)
+	return n, err
 }
 
 // Delete removes a job.
@@ -257,7 +325,7 @@ func (s *Store) query(ctx context.Context, query string, args ...any) ([]Job, er
 			next, last       sql.NullInt64
 		)
 		if err := rows.Scan(&job.ID, &kind, &job.Tool, &args, &job.Title, &job.Detail, &job.Risk, &when,
-			&created, &next, &job.Paused, &last, &job.LastStatus, &job.LastMessage); err != nil {
+			&created, &next, &job.Paused, &last, &job.LastStatus, &job.LastMessage, &job.Held); err != nil {
 			return nil, err
 		}
 		job.Kind = Kind(kind)

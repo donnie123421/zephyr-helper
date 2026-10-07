@@ -29,6 +29,7 @@ import (
 	"github.com/donnie123421/zephyr-helper/internal/models"
 	"github.com/donnie123421/zephyr-helper/internal/ollama"
 	"github.com/donnie123421/zephyr-helper/internal/pollers"
+	"github.com/donnie123421/zephyr-helper/internal/pro"
 	"github.com/donnie123421/zephyr-helper/internal/push"
 	"github.com/donnie123421/zephyr-helper/internal/remoteaccess"
 	"github.com/donnie123421/zephyr-helper/internal/schedule"
@@ -117,6 +118,14 @@ func main() {
 	}
 	chatHandler := chat.NewHandler(llmSwitch, toolRegistry, conversationStore, usageStore, actionLog)
 
+	// Whether Zephyr Pro has lapsed, as the app last said: while it has,
+	// nothing booked runs and no digest goes out. Without its file, Pro
+	// is taken as not lapsed, and its routes answer 503.
+	proState, err := pro.Open(cfg.ProStatePath)
+	if err != nil {
+		slog.Warn("pro state unavailable; taking Pro as not lapsed", "err", err, "path", cfg.ProStatePath)
+	}
+
 	// What's booked for later through the assistant: actions, the app
 	// update rule and check-ins. Booking takes the same approval cards as
 	// actions, so its tools come with them.
@@ -132,6 +141,7 @@ func main() {
 				Model: func() (string, bool) { return modelLabel(llmSwitch.Current()) },
 			}.Tools()...)
 			scheduler = schedule.New(scheduleStore, toolRegistry, actionLog, eventsStore, tnClient, chatHandler)
+			scheduler.Held = proState.Lapsed
 		}
 	}
 
@@ -264,12 +274,12 @@ func main() {
 	digestSettings, settingsErr := digest.OpenSettings(cfg.DigestSettingsPath)
 	digestSources := digest.Sources{NAS: tnClient, Events: eventsStore, Capacity: capacityStore,
 		Summarizer: chatHandler, Store: digestStore}
-	digestHandler := &digest.Handler{Sources: digestSources, Settings: digestSettings}
+	digestHandler := &digest.Handler{Sources: digestSources, Settings: digestSettings, Held: proState.Lapsed}
 	if storeErr != nil || settingsErr != nil {
 		slog.Warn("digest unavailable", "store", storeErr, "settings", settingsErr)
 	} else if tnClient.Configured() {
 		runner := &digest.Runner{Sources: digestSources, Settings: digestSettings,
-			Zone: digest.NASZone(tnClient), Quiet: pushPrefs.InQuietHours}
+			Zone: digest.NASZone(tnClient), Quiet: pushPrefs.InQuietHours, Held: proState.Lapsed}
 		go func() {
 			select {
 			case <-pushNotifier.Ready():
@@ -335,6 +345,13 @@ func main() {
 		return auth.Require(cfg.PairingToken, h)
 	})
 	digestHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
+		return auth.Require(cfg.PairingToken, h)
+	})
+	proHandler := &pro.Handler{Store: proState}
+	if scheduleStore != nil {
+		proHandler.Bookings = scheduleStore
+	}
+	proHandler.RegisterMux(mux, func(h http.Handler) http.Handler {
 		return auth.Require(cfg.PairingToken, h)
 	})
 	(&usage.Handler{Store: usageStore}).RegisterMux(mux, func(h http.Handler) http.Handler {

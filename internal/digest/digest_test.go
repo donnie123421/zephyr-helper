@@ -204,6 +204,40 @@ func TestADigestWithoutAModelIsJustTheFacts(t *testing.T) {
 	}
 }
 
+// While Zephyr Pro has lapsed the digest stays on but none goes out, and
+// the app is told it's held.
+func TestNoDigestWhileProHasLapsed(t *testing.T) {
+	r := newRig(t)
+	sydney, _ := time.LoadLocation("Australia/Sydney")
+	at := time.Date(2026, 10, 4, 9, 30, 0, 0, sydney) // a Sunday
+	r.sources.Now = func() time.Time { return at }
+	_, _ = r.settings.Set(Settings{Enabled: true, Summary: false}, at.AddDate(0, 0, -3))
+	lapsed := true
+	held := func() bool { return lapsed }
+	runner := &Runner{Sources: r.sources, Settings: r.settings,
+		Zone: func(context.Context) *time.Location { return sydney }, Held: held}
+	runner.check(context.Background())
+	if _, ok := r.store.Latest(); ok {
+		t.Fatal("went out while Pro had lapsed")
+	}
+
+	mux := http.NewServeMux()
+	(&Handler{Sources: r.sources, Settings: r.settings, Held: held}).RegisterMux(mux, func(h http.Handler) http.Handler { return h })
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/digest/settings", nil))
+	var got map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&got)
+	if got["enabled"] != true || got["held"] != true {
+		t.Errorf("settings = %v", got)
+	}
+
+	lapsed = false
+	runner.check(context.Background())
+	if _, ok := r.store.Latest(); !ok {
+		t.Error("didn't go out once Pro was back")
+	}
+}
+
 func TestTheDigestGoesOutOnSundayMorningOnce(t *testing.T) {
 	r := newRig(t)
 	sydney, _ := time.LoadLocation("Australia/Sydney")

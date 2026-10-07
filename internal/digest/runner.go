@@ -30,7 +30,10 @@ type Runner struct {
 	Zone func(ctx context.Context) *time.Location
 	// Quiet reports quiet hours, when the digest waits.
 	Quiet func(time.Time) bool
-	tick  time.Duration
+	// Held says Zephyr Pro has lapsed, as the app reported: no digest goes
+	// out until it's back. Nil: never.
+	Held func() bool
+	tick time.Duration
 	// unsaved is a digest put together that couldn't be kept, so a retry
 	// doesn't ask the model again.
 	unsaved *Digest
@@ -67,7 +70,7 @@ func lastDue(now time.Time, loc *time.Location) time.Time {
 
 func (r *Runner) check(ctx context.Context) {
 	settings := r.Settings.Get()
-	if !settings.Enabled {
+	if !settings.Enabled || (r.Held != nil && r.Held()) {
 		return
 	}
 	now := r.Sources.now()
