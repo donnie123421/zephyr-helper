@@ -372,7 +372,8 @@ func scrubPool(tn *truenas.Client) Tool {
 					detail += " (" + bytesText(used) + ")"
 				}
 				detail += "."
-				if last := lastScrub(p.scan, time.Now()); last != "" {
+				// Not on a booking's card: kept, "2 days ago" goes stale.
+				if last := lastScrub(p.scan, time.Now()); last != "" && !isForLater(ctx) {
 					detail += " " + last
 				}
 				if healthy, ok := p.pool["healthy"].(bool); ok && !healthy {
@@ -615,7 +616,9 @@ func runBackupTask(tn *truenas.Client) Tool {
 				noun := backupKinds[p.kind].noun
 				name := quoted(taskName(p.kind, p.task))
 				detail := taskRoute(p.kind, p.task)
-				if last := lastRun(p.task, time.Now()); last != "" {
+				// Not on a booking's card: kept, "12 minutes ago" goes stale,
+				// and the card the app showed would no longer match it.
+				if last := lastRun(p.task, time.Now()); last != "" && !isForLater(ctx) {
 					detail += " " + last
 				}
 				if enabled, ok := p.task["enabled"].(bool); ok && !enabled {

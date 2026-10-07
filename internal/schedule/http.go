@@ -124,7 +124,7 @@ func (h *Handler) card(w http.ResponseWriter, r *http.Request) (bookingRequest, 
 	}
 	card, kind, err := b.describe(r.Context(), req.Tool, req.Arguments)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": upperFirst(strings.TrimSuffix(err.Error(), ".")) + "."})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": forPeople(err)})
 		return req, tools.Card{}, "", cardView{}, false
 	}
 	view := cardView{Title: card.Title, Detail: card.Detail, Risk: string(card.Risk)}
@@ -132,6 +132,17 @@ func (h *Handler) card(w http.ResponseWriter, r *http.Request) (bookingRequest, 
 		view.Zone, view.FirstRun = job.When.Zone, job.NextRun
 	}
 	return req, card, kind, view, true
+}
+
+// forPeople is a booking tool's refusal for the app: the tools write for
+// the model, and point it at the tool that lists what there is ("; call
+// list_apps for their names"), which isn't for people.
+func forPeople(err error) string {
+	text := err.Error()
+	if i := strings.Index(text, "; call "); i >= 0 {
+		text = text[:i]
+	}
+	return upperFirst(strings.TrimSuffix(text, ".")) + "."
 }
 
 // preview is the card a booking would be approved on.
@@ -162,7 +173,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := b.bookJob(r.Context(), card.Args, kind)
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": upperFirst(strings.TrimSuffix(err.Error(), ".")) + "."})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": forPeople(err)})
 		return
 	}
 	writeJSON(w, http.StatusCreated, h.view(job))
@@ -179,6 +190,11 @@ func (h *Handler) edit(w http.ResponseWriter, r *http.Request) {
 		h.failed(w, err)
 		return
 	}
+	// Done with, it's not brought back: that's booking it again.
+	if old.NextRun == nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "It's already done. Book it again instead."})
+		return
+	}
 	req, card, kind, view, ok := h.card(w, r)
 	if !ok || !shown(w, req, view) {
 		return
@@ -189,7 +205,7 @@ func (h *Handler) edit(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := b.jobFor(card.Args, kind)
 	if err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": upperFirst(strings.TrimSuffix(err.Error(), ".")) + "."})
+		writeJSON(w, http.StatusConflict, map[string]string{"error": forPeople(err)})
 		return
 	}
 	if err := h.Store.Replace(r.Context(), old.ID, job); err != nil {

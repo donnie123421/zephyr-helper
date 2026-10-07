@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -84,6 +85,12 @@ func TestTheAppBooksAndEditsThroughTheSameCards(t *testing.T) {
 	if code, _ := do("PUT", "/schedules/nope", daily); code != 404 {
 		t.Errorf("edit a booking that's gone = %d", code)
 	}
+	// Done with, it isn't brought back by an edit.
+	done := r.book(t, Job{Kind: KindAction, Tool: "scrub_pool", Title: "Start a scrub on tank at 2:00 am on Thu 1 Oct",
+		When: When{Repeat: "once", Date: "2026-10-01", Time: "02:00"}})
+	if code, got := do("PUT", "/schedules/"+done.ID, daily); code != 409 || !strings.Contains(fmt.Sprint(got["error"]), "already done") {
+		t.Errorf("edit a one-off that's done = %d %v", code, got)
+	}
 
 	// A rule and a check-in, as the presets book them.
 	for tool, want := range map[string]string{
@@ -99,7 +106,13 @@ func TestTheAppBooksAndEditsThroughTheSameCards(t *testing.T) {
 		}
 	}
 
-	// Why it can't, in words.
+	// Why it can't, in words: for people, not the model.
+	r.nas.returns("app.query", []any{map[string]any{"name": "plex", "metadata": map[string]any{"title": "Plex"}}})
+	if code, got := do("POST", "/schedules/preview", map[string]any{"tool": "create_update_rule",
+		"arguments": map[string]any{"apps": []string{"ghost"}, "repeat": "daily", "time": "03:00"}}); code != 400 ||
+		got["error"] != `There's no app named "ghost".` {
+		t.Errorf("an app that isn't there = %d %v", code, got)
+	}
 	for body, want := range map[string]string{
 		`{"tool": "list_schedules", "arguments": {}}`: "isn't a way to book",
 		`{"tool": "schedule_action", "arguments": {"action": "scrub_pool", "arguments_json": "{}", "repeat": "once", "date": "2026-09-30", "time": "02:00"}}`: "That time has already passed",

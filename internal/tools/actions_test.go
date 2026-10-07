@@ -185,6 +185,10 @@ func TestScrubBefore26UsesPoolScrubScrubAndSaysWhenTheLastOneFinished(t *testing
 		card.Detail != "tank will be slower for a few hours while ZFS reads and checks every block (12.0 TiB). Its last scrub finished 34 days ago and found no errors." {
 		t.Errorf("card = %+v", card)
 	}
+	if later, err := action.Describe(ForLater(context.Background()), json.RawMessage(`{"pool":"tank"}`)); err != nil ||
+		strings.Contains(later.Detail, "ago") {
+		t.Errorf("for later: %+v, %v", later, err)
+	}
 	var name, verb string
 	scrub := nas.called("pool.scrub.scrub")[0]
 	decodeParam(t, scrub, 0, &name)
@@ -352,6 +356,11 @@ func TestBackupRunsNowAndIsFollowedWhenItTakesAWhile(t *testing.T) {
 	if card.Title != "Run the cloud sync “Offsite” now" ||
 		card.Detail != "Copies /mnt/tank/documents to Backblaze B2. Its last run, 2 days ago, succeeded." {
 		t.Errorf("card = %+v", card)
+	}
+	// A booking's card is kept: "2 days ago" would go stale.
+	if later, err := action.Describe(ForLater(context.Background()), json.RawMessage(`{"kind":"cloud_sync","id":3}`)); err != nil ||
+		later.Detail != "Copies /mnt/tank/documents to Backblaze B2." {
+		t.Errorf("for later: %+v, %v", later, err)
 	}
 	if outcome.Message != "Started the cloud sync “Offsite”." || outcome.Job == nil ||
 		outcome.Job.Done != "The cloud sync “Offsite” finished" {
