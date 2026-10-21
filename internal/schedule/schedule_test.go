@@ -183,13 +183,15 @@ func newRig(t *testing.T) *rig {
 	t.Cleanup(func() { _ = evs.Close() })
 	r := &rig{store: store, events: evs, nas: newFakeNAS(), action: &fakeAction{}}
 	r.nas.returns("system.general.config", map[string]any{"timezone": "Australia/Sydney"})
+	r.nas.job("catalog.sync", "SUCCESS", "", nil)
 	reg := tools.NewWith(r.action.tool("scrub_pool"))
 	log := actions.New(context.Background(), evs, r.nas)
 	sydney, _ := time.LoadLocation("Australia/Sydney")
 	r.now = time.Date(2026, 10, 1, 14, 30, 0, 0, sydney)
 	r.sched = New(store, reg, log, evs, r.nas, fakeCheckIns{})
 	r.sched.now = func() time.Time { return r.now }
-	r.sched.ruleTiming = ruleTiming{upgradeFor: time.Second, runningFor: 50 * time.Millisecond, settle: 10 * time.Millisecond, poll: 5 * time.Millisecond}
+	r.sched.ruleTiming = ruleTiming{upgradeFor: time.Second, runningFor: 50 * time.Millisecond, settle: 10 * time.Millisecond,
+		poll: 5 * time.Millisecond, catalogFor: time.Second}
 	return r
 }
 
@@ -426,6 +428,45 @@ func standardApps() []*fakeApp {
 		{name: "mine", title: "mine", state: "RUNNING", version: "1.0.0", custom: true},
 		{name: "plex", title: "Plex", state: "RUNNING", version: "1.2.0"},
 		{name: "sonarr", title: "Sonarr", state: "RUNNING", version: "2.0.0"},
+	}
+}
+
+// TrueNAS only knows of a new version once its catalog is refreshed,
+// which it does once a day: the rule refreshes it first, so a run at 3 am
+// finds what Run Now later in the day would.
+func TestTheUpdateRuleRefreshesTheCatalogFirst(t *testing.T) {
+	r := newRig(t)
+	r.nas.returns("pool.query", []any{map[string]any{"name": "tank", "status": "ONLINE", "healthy": true}})
+	plex := &fakeApp{name: "plex", title: "Plex", state: "RUNNING", version: "9.9.9"} // no update known yet
+	updated, _ := r.apps(plex)
+	r.nas.job("catalog.sync", "SUCCESS", "", func() { plex.version = "1.2.0" }) // the refresh shows one
+	job := r.book(t, Job{Kind: KindUpdateRule, Title: "Update apps automatically every day at 3:00 am",
+		Arguments: json.RawMessage(`{"apps":[]}`), When: When{Repeat: "daily", Time: "03:00"}, NextRun: at(r.now.Add(-time.Minute))})
+	r.sched.runDue(context.Background())
+	r.sched.Wait()
+	if got := updated(); len(got) != 1 || got[0] != "plex" {
+		t.Errorf("updated %v, want plex, which the refreshed catalog showed", got)
+	}
+	if r.nas.called("catalog.sync") != 1 {
+		t.Errorf("catalog.sync called %d times", r.nas.called("catalog.sync"))
+	}
+	if got, _ := r.store.Get(context.Background(), job.ID); got.LastStatus != "done" {
+		t.Errorf("job = %+v", got)
+	}
+}
+
+// A refresh that fails doesn't stop the run: it goes by what TrueNAS knows.
+func TestARefreshThatFailsStillUpdatesWhatsKnown(t *testing.T) {
+	r := newRig(t)
+	r.nas.returns("pool.query", []any{map[string]any{"name": "tank", "status": "ONLINE", "healthy": true}})
+	updated, _ := r.apps(&fakeApp{name: "plex", title: "Plex", state: "RUNNING", version: "1.2.0"})
+	r.nas.job("catalog.sync", "FAILED", "[EFAULT] No internet", nil)
+	r.book(t, Job{Kind: KindUpdateRule, Title: "Update apps automatically every day at 3:00 am",
+		Arguments: json.RawMessage(`{"apps":[]}`), When: When{Repeat: "daily", Time: "03:00"}, NextRun: at(r.now.Add(-time.Minute))})
+	r.sched.runDue(context.Background())
+	r.sched.Wait()
+	if got := updated(); len(got) != 1 {
+		t.Errorf("updated %v, want plex", got)
 	}
 }
 

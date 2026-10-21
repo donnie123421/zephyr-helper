@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -23,9 +24,12 @@ type ruleTiming struct {
 	// crashes as it starts shows as running at first.
 	settle time.Duration
 	poll   time.Duration
+	// catalogFor bounds refreshing TrueNAS's app catalog.
+	catalogFor time.Duration
 }
 
-var defaultRuleTiming = ruleTiming{upgradeFor: 15 * time.Minute, runningFor: 5 * time.Minute, settle: 30 * time.Second, poll: 5 * time.Second}
+var defaultRuleTiming = ruleTiming{upgradeFor: 15 * time.Minute, runningFor: 5 * time.Minute, settle: 30 * time.Second,
+	poll: 5 * time.Second, catalogFor: 5 * time.Minute}
 
 // UpdateRule is an update rule's scope, fixed when it was approved: the
 // apps it may update, or all of them.
@@ -57,6 +61,7 @@ func (s *Scheduler) runUpdateRule(ctx context.Context, job Job, runID string) (s
 		return s.ruleSkipped(ctx, job, runID, fmt.Sprintf("Pool %s is %s, and nothing is updated while a pool isn't healthy.", pool, strings.ToLower(status)))
 	}
 
+	s.refreshCatalog(ctx)
 	apps, unchecked, err := s.updatable(ctx, rule)
 	switch {
 	case ctx.Err() != nil:
@@ -112,6 +117,17 @@ func (s *Scheduler) runUpdateRule(ctx context.Context, job Job, runID string) (s
 	}
 	s.note(ctx, runID, events.AssistantRule, severity, title, summary, job, status, nil)
 	return status, title
+}
+
+// refreshCatalog has TrueNAS refresh its app catalog, which is how it
+// learns of new versions. On its own it refreshes once a day, counted from
+// when it started, so at 3 am it can be most of a day behind, and a run then
+// finds nothing to update that Run Now later in the day would. If the
+// refresh fails, the run goes by what TrueNAS already knows.
+func (s *Scheduler) refreshCatalog(ctx context.Context) {
+	if end := s.runJob(ctx, s.ruleTiming.catalogFor, "catalog.sync"); !end.ok() && !end.stopped {
+		slog.Warn("schedule: couldn't refresh the app catalog; going by what TrueNAS knows", "why", end.reason())
+	}
 }
 
 func titles(apps []ruleApp) []string {

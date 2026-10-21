@@ -273,6 +273,11 @@ func (s *Scheduler) runAction(ctx context.Context, job Job, runID string) (strin
 	if action == nil {
 		return s.skipped(ctx, job, runID, "This helper can't do that any more.")
 	}
+	// An update booked for later goes to the newest version then, which
+	// TrueNAS only knows of once its catalog is refreshed.
+	if job.Tool == "update_app" {
+		s.refreshCatalog(ctx)
+	}
 	card, err := action.Describe(ctx, job.Arguments)
 	if err != nil {
 		if ctx.Err() != nil {
