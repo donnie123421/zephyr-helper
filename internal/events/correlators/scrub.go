@@ -26,6 +26,10 @@ const DefaultScrubMergeWindow = 5 * time.Minute
 // The original Kind=Job row is linked via correlates_to so the default
 // feed can show just the scrub narrative and keep the underlying job as
 // a detail-view child.
+//
+// pool.scrub's job is transient, though: TrueNAS drops it as it ends, so
+// the jobs poller seldom if ever sees one finish. Scrubs finishing are
+// noted from the pools' scans instead, by pollers.Scans.
 type ScrubOutcome struct {
 	store *events.Store
 	merge time.Duration

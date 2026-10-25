@@ -42,7 +42,7 @@ const (
 
 // RebuiltKeyPrefix starts the key of a resilver-finished event, keyed by
 // pool and end time: the news worth a notification after a disk is
-// replaced. The resilver watcher (pollers.Resilvers) records them.
+// replaced. The scan watcher (pollers.Scans) records them.
 const RebuiltKeyPrefix = "pool-rebuilt|"
 
 // DigestKeyPrefix starts the key of the weekly digest's event, with the

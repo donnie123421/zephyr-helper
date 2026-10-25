@@ -236,6 +236,9 @@ func jobSuccessIsSurfaceworthy(method string) bool {
 	// (a) Correlator-consumed methods. These must keep flowing or the scrub /
 	// snapshot / disk correlators never see their child event and can't emit
 	// the narrative parent. Keep in sync with internal/events/correlators/*.
+	// (The jobs scrubs run as now, zpool.scrub.run and pool.scrub.scrub, stay
+	// out: one also ends in success when a scheduled scrub wasn't due, and
+	// Scans notes scrubs finishing from the pools' scans.)
 	if method == "pool.scrub" ||
 		strings.HasPrefix(method, "pool.snapshottask.") ||
 		strings.HasPrefix(method, "zettarepl.") ||
